@@ -172,20 +172,36 @@ def fetch_bars_bulk(codes: list, start: str) -> dict:
 
 
 def fetch_index_bars(start: str) -> list:
-    """沪深300 (sh000300) 长历史日线 -> [(d,o,h,l,c,v), ...]。"""
+    """沪深300 (sh000300) 长历史日线 -> [(d,o,h,l,c,v), ...]。
+    三源顺序: 腾讯 -> 东财直连 -> 新浪 (每页失败才降级, 失败原因进日志, 每源根数进日志)。
+    2026-09-03 教训: 单源静默 `except: kl = []` 让指数表卡在 09-01 四天无人知, lab 连败。
+    三源口径已对齐 (成交量 "手", 见 datasource._em_index_chunk/_sina_index_chunk)。"""
     from . import datasource as ds
+    from .config import CONFIG
+    sym = CONFIG["source"].get("benchmark_index", "sh000300")
+    sources = (("腾讯", ds._tencent_chunk), ("东财", ds._em_index_chunk), ("新浪", ds._sina_index_chunk))
     skip_day = _drop_partial_today()
     today = dt.date.today()
     d0 = dt.date.fromisoformat(start)
     rows, seen = [], set()
+    got = {name: 0 for name, _ in sources}
     cur = d0
     while cur < today:
         nxt = min(cur + dt.timedelta(days=700), today)
-        try:
-            kl = ds.call_with_retry(ds._tencent_chunk, "sh000300",
-                                    cur.isoformat(), nxt.isoformat())
-        except Exception:
-            kl = []
+        kl, used = [], None
+        for name, fn in sources:
+            try:
+                kl = ds.call_with_retry(fn, sym, cur.isoformat(), nxt.isoformat()) or []
+            except Exception as e:  # noqa: BLE001
+                log.warning("基准指数 %s [%s..%s] %s 失败: %s", sym, cur, nxt, name, str(e)[:120])
+                kl = []
+            if kl:
+                used = name
+                break
+            log.warning("基准指数 %s [%s..%s] %s 返回空, 尝试下一源", sym, cur, nxt, name)
+        if not kl:
+            log.error("基准指数 %s [%s..%s] 三源全部失败, 本页无数据", sym, cur, nxt)
+        n_page = 0
         for k in (kl or []):
             if not k or len(k) < 6:
                 continue
@@ -199,8 +215,13 @@ def fetch_index_bars(start: str) -> list:
                 continue
             seen.add(d1)
             rows.append((d1, o, h, l, c, v))
+            n_page += 1
+        if used:
+            got[used] += n_page
         cur = nxt + dt.timedelta(days=1)
     rows.sort()
+    log.info("基准指数 %s: %d 根 (%s), 末日 %s", sym, len(rows),
+             " / ".join(f"{k} {v}" for k, v in got.items()), rows[-1][0] if rows else "无")
     return rows
 
 

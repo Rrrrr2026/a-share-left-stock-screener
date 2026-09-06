@@ -181,25 +181,84 @@ def _cache_save(key: str, obj) -> None:
 #  通用: 带重试的调用 + 字段映射
 # ===========================================================================
 _HARD_DEADLINE_SEC = 150     # akshare 单次调用硬期限 (墙钟)
+_POOL_PROBE_SEC = 90         # 新建进程池的就绪探针上限 (spawn 启动 + 导入主模块, 正常 3-10s)
+_POOL_DOA_WAIT_SEC = 2.0     # 建池后先等这么久看首批工作进程是否"一出生就死"
 _POOL = None
 _POOL_LOCK = None
+_POOL_DISABLED = False       # True = 本进程余下调用全部改走线程版 (进程池基础设施不可用, 只告警一次)
+# 父进程侧可能抛出的"基础设施"错误 (与 fn 本身的业务异常无关 —— 业务异常只会从 res.get 抛出):
+# Windows 计划任务下 DuplicateHandle 拒绝访问 (PermissionError), 管道断裂 (BrokenPipeError /
+# EOFError), multiprocessing 自身的 RuntimeError (spawn 未经 __main__ 守卫的 bootstrap 错误等)。
+_POOL_INFRA_ERRORS = (OSError, EOFError, RuntimeError)
+
+
+class _PoolUnavailable(RuntimeError):
+    """进程池起不来 / 起来就死 (就绪探针失败) —— 由 _pool() 抛出, 调用方转线程版。"""
+
+
+def _pool_lock():
+    global _POOL_LOCK
+    if _POOL_LOCK is None:
+        _POOL_LOCK = threading.RLock()
+    return _POOL_LOCK
+
+
+def _make_pool(ctx):
+    """真正建池的一行, 单独拆出便于测试注入 (如让工作进程一启动就死)。"""
+    return ctx.Pool(processes=2)
+
+
+def _disable_pool(where, exc):
+    """进程池基础设施不可用 → 本进程余下全部走线程版硬期限; 只告警一次。"""
+    global _POOL_DISABLED
+    with _pool_lock():
+        first = not _POOL_DISABLED
+        _POOL_DISABLED = True
+    if first:
+        log.warning("进程池不可用 (%s: %s: %s) — 本进程余下 akshare 调用改走线程版硬期限 "
+                    "(线程无法强杀, 失控分配类挂死将不再被隔离; 仅告警一次)",
+                    where, type(exc).__name__, exc)
+    _pool_reset()
 
 
 def _pool():
-    """惰性创建的独立工作进程池 (POSIX 用 forkserver, Windows 用 spawn — 两者都与
-    主进程的多线程安全共存)。超时时整池 terminate 并置空, 下次调用重建。"""
-    global _POOL, _POOL_LOCK
+    """惰性创建的独立工作进程池 (全平台统一 spawn, 与主进程多线程安全共存)。
+    超时时整池 terminate 并置空, 下次调用重建。
+
+    建池后必须做一次就绪探针 (2026-09-03..05 PC 计划任务事故): Windows 计划任务下 spawn
+    出来的子进程在 bootstrap 阶段就死于 `reduction.duplicate → DuplicateHandle` 的
+    PermissionError [WinError 5] —— 异常发生在**子进程**, 父进程的 Pool()/apply_async 都不
+    报错, 池的 worker-handler 线程只会不断补活→再死, 任务永远不返回, 父进程要等满 150s
+    硬期限才把它当"源站挂死"处理 (还会误标东财不可用)。先看首批工作进程是否一出生就死,
+    再探一次 os.getpid; 拿不到结果即判定池不可用: terminate、置 _POOL_DISABLED, 抛
+    _PoolUnavailable 让调用方改走线程版。"""
+    global _POOL
     import multiprocessing as _mp
-    import threading as _th
-    if _POOL_LOCK is None:
-        _POOL_LOCK = _th.Lock()
-    with _POOL_LOCK:
+    with _pool_lock():
+        if _POOL_DISABLED:
+            raise _PoolUnavailable("进程池已判定不可用 (本进程余下走线程版)")
         if _POOL is None:
             # 统一 spawn: forkserver 在服务器 (systemd/journald 管道环境) 崩于
             # BlockingIOError EAGAIN (2026-09-03 实测, 池反复重建反复崩); spawn 起全新
             # 解释器, 与主进程多线程安全共存, 代价是每个工作进程启动多 ~3s (池常驻, 仅首次)
             ctx = _mp.get_context("spawn")
-            _POOL = ctx.Pool(processes=2)
+            p = _make_pool(ctx)
+            try:
+                first_gen = list(getattr(p, "_pool", None) or [])
+                time.sleep(_POOL_DOA_WAIT_SEC)
+                if first_gen and all(w.exitcode is not None for w in first_gen):
+                    raise _PoolUnavailable(
+                        f"首批工作进程全部立即退出 (exitcode={[w.exitcode for w in first_gen]})")
+                p.apply_async(os.getpid).get(timeout=_POOL_PROBE_SEC)
+            except Exception as e:          # noqa: BLE001  (含 mp.TimeoutError = 子进程起不来)
+                try:
+                    p.terminate()
+                    p.join()
+                except Exception:           # noqa: BLE001
+                    pass
+                _disable_pool("就绪探针", e)
+                raise _PoolUnavailable(f"进程池就绪探针失败: {type(e).__name__}: {e}") from e
+            _POOL = p
         return _POOL
 
 
@@ -216,7 +275,7 @@ def _pool_reset():
 
 
 def _call_in_thread(fn, args, kwargs, deadline_sec):
-    """线程版兜底 (仅用于不可序列化的调用): 超时的线程无法强杀, 弃之为守护线程。"""
+    """线程版兜底 (不可序列化的调用, 或进程池已判定不可用): 超时的线程无法强杀, 弃之为守护线程。"""
     import queue as _q
     import threading as _th
     box = _q.Queue(maxsize=1)
@@ -245,7 +304,13 @@ def _call_with_deadline(fn, args, kwargs, deadline_sec):
        导出后段三次挂死 25min+ 被看门狗杀;
     ② 线程版硬期限 (同日下午) 更糟: 被弃的 stock_margin_detail_sse 线程不是在等网络,
        是在死循环分配内存, 主线程继续跑心跳正常, 它在后台把进程吃到 3.5GB 直到 OOM。
-    Python 杀不死线程, 只有进程能被真正终止。不可序列化的 fn/参数退回线程版。"""
+    Python 杀不死线程, 只有进程能被真正终止。不可序列化的 fn/参数退回线程版。
+
+    进程池基础设施本身坏掉时 (2026-09-03..05 Windows 计划任务 WinError 5): 建池/提交阶段的
+    父进程侧错误, 或 _pool() 的就绪探针失败, 都判定为"本进程余下不再用池" —— 告警一次、
+    置 _POOL_DISABLED、退回线程版; 绝不因此把源站误标为挂死。"""
+    if _POOL_DISABLED:
+        return _call_in_thread(fn, args, kwargs, deadline_sec)
     import pickle
     try:
         pickle.dumps((fn, args, kwargs))
@@ -254,11 +319,15 @@ def _call_with_deadline(fn, args, kwargs, deadline_sec):
     import multiprocessing as _mp
     try:
         res = _pool().apply_async(fn, args, kwargs)
+    except _POOL_INFRA_ERRORS as e:
+        # 建池/提交阶段的父进程侧基础设施错误 (fn 的业务异常不会在这里出现, 只会从 res.get 抛出)
+        _disable_pool("建池/提交", e)
+        return _call_in_thread(fn, args, kwargs, deadline_sec)
+    try:
         return res.get(timeout=deadline_sec)
     except _mp.TimeoutError:
         _pool_reset()
         raise TimeoutError(f"{getattr(fn, '__name__', fn)} 超过 {deadline_sec}s 硬期限 (工作进程已终止)")
-
 
 def call_with_retry(fn, *args, **kwargs):
     """对一个 akshare 调用做 限频sleep + 重试 + 超时容错。失败抛出最后一次异常。
@@ -705,6 +774,48 @@ def _tencent_chunk(sym: str, start: str, end: str) -> list:
     return sub.get("qfqday") or sub.get("day") or []
 
 
+# ---- 基准指数日线备源 (腾讯断连时 fetch_index_bars 用), 输出与 _tencent_chunk 同形
+#      [[date, open, close, high, low, volume], ...]; 单位必须与腾讯一致: 成交量 "手"。
+_EM_HIS_HOSTS = ("push2his.eastmoney.com", "19.push2his.eastmoney.com",
+                 "63.push2his.eastmoney.com")
+
+
+def _em_index_chunk(sym: str, start: str, end: str) -> list:
+    """东财直连指数日线 (push2his kline, 不经 akshare)。2026-09-06 逐根核对 sh000300
+    09-01..09-04: 价格 2 位小数、成交量 "手" 与腾讯完全一致, 可直接混入同一张 idx_bars。"""
+    secid = ("1." if sym.startswith("sh") else "0.") + sym[2:]
+    p = {"secid": secid, "fields1": "f1,f2,f3,f4,f5,f6",
+         "fields2": "f51,f52,f53,f54,f55,f56,f57", "klt": "101", "fqt": "0",
+         "beg": start.replace("-", ""), "end": end.replace("-", "")}
+    last = None
+    for h in _EM_HIS_HOSTS:
+        try:
+            r = _http().get(f"https://{h}/api/qt/stock/kline/get", params=p,
+                            headers={"User-Agent": _BROWSER_UA,
+                                     "Referer": "https://quote.eastmoney.com/"}, timeout=15)
+            j = r.json()
+            kl = ((j.get("data") or {}).get("klines")) or []
+            return [k.split(",")[:6] for k in kl if k]
+        except Exception as e:  # noqa: BLE001
+            last = e
+    raise RuntimeError(f"东财指数日线 {sym} 全部主机失败: {str(last)[:80]}")
+
+
+def _sina_index_chunk(sym: str, start: str, end: str) -> list:
+    """新浪指数日线 (akshare stock_zh_index_daily, 全量返回后按区间截取)。新浪成交量是
+    "股" (2026-09-06 实测 sh000300 09-01: 21486958100 vs 腾讯/东财 214869581), 除以 100
+    折成 "手" 与库内口径一致; 价格 3 位小数 (腾讯 2 位), 差异 <0.001 可忽略。"""
+    df = _ak().stock_zh_index_daily(symbol=sym)
+    if df is None or len(df) == 0:
+        return []
+    out = []
+    for _, r in df.iterrows():
+        d = str(r["date"])[:10]
+        if start <= d <= end:
+            out.append([d, r["open"], r["close"], r["high"], r["low"], float(r["volume"]) / 100.0])
+    return out
+
+
 def _long_hist_is_sane(df: pd.DataFrame, code: str = "") -> bool:
     """长历史数据体检。回测最怕"脏数据算出漂亮结论"(实测某些票会返回错乱行:
     单日 high/low 振幅 60%+、隔日跳变 40%+, 据此算出的 '历史涨过2142%' 是假的)。
@@ -1084,13 +1195,19 @@ def fetch_benchmark_close() -> pd.DataFrame | None:
             raw = None
     if raw is None or len(raw) == 0:
         return None
+    # 除 date/close 外顺带保留 OHLCV (若源有): 消费方只读 date/close, 多列无害;
+    # ingest_cache_to_pricestore 用它把当日指数补进 idx_bars (2026-09-06 A 指数双源)
     df = rename_normalize(raw, {
         "date":  ["date", "日期"],
         "close": ["close", "收盘"],
+        "open": ["open", "开盘"], "high": ["high", "最高"], "low": ["low", "最低"],
+        "volume": ["volume", "成交量"],
     })
     if "close" not in df.columns:
         return None
-    df["close"] = _to_num(df["close"])
+    for col in ("close", "open", "high", "low", "volume"):
+        if col in df.columns:
+            df[col] = _to_num(df[col])
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
     df = df.sort_values("date").reset_index(drop=True)
     _cache_save(key, df)
