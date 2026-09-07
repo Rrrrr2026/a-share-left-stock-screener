@@ -605,8 +605,18 @@ def _spot_from_sina() -> pd.DataFrame | None:
     return df
 
 
+#: B 股代码前缀: 沪B 900xxx / 深B 200xxx。**与北交所的 920xxx 不冲突** ("900" vs "920"),
+#: 但顺序上要小心: 920 也以 '9' 开头, 所以判 B 股只能用三位前缀, 不能用 '9'。
+B_SHARE_PREFIXES = ("900", "200")
+
+
+def is_b_share(code) -> bool:
+    """沪B 900xxx / 深B 200xxx。**策略射程外** (GM 2026-09-08, 见 CONFIG.tech.exclude_b_share)。"""
+    return str(code).zfill(6).startswith(B_SHARE_PREFIXES)
+
+
 def build_universe(spot: pd.DataFrame | None = None) -> pd.DataFrame | None:
-    """从快照构造股票池 (剔除ST / 北交所), 返回 code,name。"""
+    """从快照构造股票池 (剔除 ST / 北交所 / B 股), 返回 code,name。"""
     if spot is None:
         spot = fetch_spot_snapshot()
     if spot is None or spot.empty:
@@ -618,6 +628,12 @@ def build_universe(spot: pd.DataFrame | None = None) -> pd.DataFrame | None:
     if t["exclude_bj"]:
         # 北交所: 8xx / 4xx, 以及 2024 年新增的 920xxx 段
         df = df[~df["code"].str.startswith(("8", "4", "920"))]
+    if t.get("exclude_b_share", True):
+        # B 股 (沪B 900xxx / 深B 200xxx): **策略射程外的显式规则** (GM 2026-09-08)。
+        # 在这里剔 (候选池构建阶段) 而不是留给裁池, 是为了让分母口径干净: B 股既不进
+        # 候选池, 也不出现在裁池的 uncovered 桶里 —— 否则"策略不做它"会被记成"库没覆盖它",
+        # 一个策略边界被写成数据缺口。价格库对 B 股确实 0 覆盖, 但那是**另一件事**。
+        df = df[~df["code"].str.startswith(B_SHARE_PREFIXES)]
     df = df.drop_duplicates(subset=["code"])   # 去重, 避免重复代码导致命中数虚高
     return df.reset_index(drop=True)
 
@@ -680,9 +696,16 @@ STORE_HIST_DAYS = 913               # ≈ fuyao years=2.5 的等效自然日数
 STORE_MIN_BARS = 60
 STORE_FRESH_TRADE_DAYS = 10
 
-#: 裁剪原因 -> 中文标签 (日志与留痕 json 共用)
+#: 裁剪原因 -> 中文标签 (日志与留痕 json 共用)。
+#: **uncovered 与 dead 是两回事, 09-08 拆开** (首版合成一桶叫 "absent", 注释还写着
+#: "历史遗留退市码" —— 那是把"库没听说过"当成"库说它死了", 正是设计 §3 明令禁止的那种混淆):
+#:   · dead      = 库**明说**的 status D/P (Tushare stock_basic 退市/暂停上市);
+#:   · uncovered = 库根本没覆盖这个码 (universe 表里没有这一行, bars 里也一根都没有)。
+#: 两者对"要不要扫"的结论一样 (都没数据可扫, 都裁), 但对"为什么没数据"的解释完全相反,
+#: 所以计数与日志必须分开 —— 混成一桶的那天, uncovered 涨到几百只也没人看得出来。
 STORE_DROP_REASON_CN = {
-    "absent": "退市/不在池(库内无此码)",
+    "dead": "库明说退市/暂停(status D/P)",
+    "uncovered": "库未覆盖(无此码且无K线)",
     "stale": "退市/长停(有K线但已过期)",
     "too_new": f"次新<{STORE_MIN_BARS}根",
     "gap": "在池但库内无K线",
@@ -820,16 +843,68 @@ def _store_pit_ctx() -> tuple:
     return _store_pit
 
 
+#: 库**明说**这只票不再交易的状态 (Tushare stock_basic: L 上市 / D 退市 / P 暂停上市)。
+#: 只有落进这个集合才算"库说它死了"。**"库内查无此码" 不在此列** —— 那是"库没听说过"。
+#: universe 来自 Tushare stock_basic, 实测它对北交所 (8xx/43x/92x) 与 B 股 (200x/900x)
+#: 各 0 行、bars 里也一根都没有 (**零覆盖**, 不是"退市")。
+_STORE_DEAD_STATUS = ("D", "P")
+
+# ===========================================================================
+#  两条读库链的口径对照 (**差异是有意的, 不是遗漏**)
+# ===========================================================================
+#  同一个价格库被两条链读, 对"库里查无此码"给出**相反**的处置。每次有人第一次读到这里
+#  都会以为其中一条写错了, 所以把它写死在代码里:
+#
+#    ┌────────────┬──────────────────────────────┬──────────────────────────────────┐
+#    │            │ 阶段A 扫描链 (本节)            │ 回测/模拟盘/双周 取价链           │
+#    │            │ store_universe_filter        │ price_series_from_store          │
+#    │            │ + fetch_hist                 │ (设计 §3 那张表)                  │
+#    ├────────────┼──────────────────────────────┼──────────────────────────────────┤
+#    │ 它在回答的  │ **今天的扫描分母是谁**         │ **一个已经存在的信号值多少钱**      │
+#    │ 问题       │ (n_scanned 对外公布)          │ (锚定/收益/持仓盯市)              │
+#    │ 库内查无此码│ 裁掉 (uncovered), **不联网**   │ **仅该码回落联网**                │
+#    │ status D/P │ 裁掉 (dead), 不联网            │ 直接判无数据, 不联网              │
+#    │ 联网预算   │ 5,200 只 × 每日, 退市码曾把    │ 只有已有信号的那几百只, 且是低频   │
+#    │            │ 阶段A 从 98 秒拖到 30 分钟+    │ 任务, 一只票回落一次不伤          │
+#    └────────────┴──────────────────────────────┴──────────────────────────────────┘
+#
+#  · 扫描链**不联网**, 是因为分母的定义就是"库覆盖到的在市 A 股"。一个库没覆盖的码,
+#    今天扫不了它 —— 为它每天发 200 次注定失败的请求, 换不来任何一个候选;
+#  · 取价链**要联网**, 是因为它面对的不是分母而是**既有的仓位/信号**: 那只票已经在账本里,
+#    不给它价就是静默丢一笔。设计 §3 记着实测代价: 把"查无此码"当"已退市"曾静默吞掉 4 只
+#    在市 B 股的 7 个信号实例 (深粮B 200019 / 一致Ｂ 200028 / 宁通信B 200468 / 安道麦B 200553,
+#    2026-08-10..08-27)。
+#  · **B 股/北交所在扫描链上从今天起根本不进候选池** (GM 2026-09-08 定的策略射程,
+#    见 CONFIG.tech.exclude_b_share / exclude_bj), 所以扫描链的 uncovered 桶里不该再有它们;
+#    但取价链**照旧为它们回落联网** —— 射程是"以后不再选它", 不是"把已经建的仓抹掉"。
+#
+#  一句话: 同一个"查无此码", 在分母口径里是"扫不了", 在定价口径里是"必须想办法拿到价"。
+#  改任何一边之前先回来看这张表, 别顺手把另一边"对齐"了。
+# ===========================================================================
+
+
 def store_verdict(n_bars: int, last_bar: str | None, in_universe: bool,
-                  fresh_after: str | None, min_bars: int = STORE_MIN_BARS) -> str:
+                  fresh_after: str | None, min_bars: int = STORE_MIN_BARS,
+                  status: str | None = None) -> str:
     """库对一只票的裁决 —— **纯函数, 无 I/O, 可离线单测**; 候选池裁剪与 fetch_hist 共用。
 
-    · keep     : 够 60 根, 且 (在点时股票池里 **或** 最后一根 bar 还新鲜) —— 可以扫;
-    · stale    : 够 60 根, 但既不在池、最后一根也过期 —— 退市/长停, 别扫;
-    · too_new  : 库内 1..59 根 —— 次新股, 联网也凑不出 module2 要的根数;
-    · gap      : 一根都没有但在池里 —— 真缺口, **留在候选池里** (见 STORE_KEEP_VERDICTS),
-                 由 fetch_hist 为它回落联网; 这是"库某天漏了一批码"时唯一的兜底;
-    · absent   : 一根都没有也不在池 —— 东财快照的历史遗留退市码 (09-07 实测 196 只)。
+    · keep      : 够 60 根, 且 (在点时股票池里 **或** 最后一根 bar 还新鲜) —— 可以扫;
+    · stale     : 够 60 根, 但既不在池、最后一根也过期 —— 退市/长停, 别扫;
+    · too_new   : 库内 1..59 根 —— 次新股, 联网也凑不出 module2 要的根数;
+    · gap       : 一根都没有但在池里 —— 真缺口, **留在候选池里** (见 STORE_KEEP_VERDICTS),
+                  由 fetch_hist 为它回落联网; 这是"库某天漏了一批码"时唯一的兜底;
+    · dead      : 一根都没有, 不在池, 且库**明说** status ∈ D/P —— 退市/暂停上市;
+    · uncovered : 一根都没有, 不在池, 库也没说它死 —— **库未覆盖**这个码。
+
+    `status` 是 universe 表里那一行的 status (没有这一行就传 None)。**dead 与 uncovered
+    必须分开**, 哪怕两者都裁: "库说它退市了" 与 "库根本没听说过它" 是两种完全不同的世界状态,
+    一个说明数据是对的、另一个说明数据缺了一块。09-08 首版把它们合成一桶 `absent` 并在注释里
+    统称"历史遗留退市码" —— 那样 uncovered 从 0 涨到几百只也没有任何人看得出来
+    (设计 design/backtest_price_from_store.md §3 为回测取价链写过同一条戒律, 这里补上扫描链)。
+
+    status='L' 却一根 bar 都没有、又不在点时股票池里的票, 归 **uncovered**: universe_at 把
+    "首根 bar 还没到" 的票排除在外, 而库里确实一根数据都没有 —— 对"能不能扫"来说就是没覆盖。
+    (pool_cut 留痕里逐只带着 status 字段, 想区分"表里有行但无数据"与"表里连行都没有"随时可查。)
 
     "在市证据以 K 线为准" 那一条 (in_universe=False 但 bar 新鲜也 keep) 是为库里有 K 线、
     universe 表却没有对应行的票留的口子 —— 09-07 实测 3 只改过代码的 (000022/000043/300114)。
@@ -840,7 +915,9 @@ def store_verdict(n_bars: int, last_bar: str | None, in_universe: bool,
         return "stale"
     if n_bars > 0:
         return "too_new"
-    return "gap" if in_universe else "absent"
+    if in_universe:
+        return "gap"
+    return "dead" if str(status or "").upper() in _STORE_DEAD_STATUS else "uncovered"
 
 
 def _store_probe_one(code: str, days: int) -> tuple:
@@ -857,20 +934,73 @@ def _store_probe_one(code: str, days: int) -> tuple:
 def _store_verdict_one(code: str, days: int) -> str:
     uni, fresh_after = _store_pit_ctx()
     n, last = _store_probe_one(code, days)
-    return store_verdict(n, last, uni is None or code in uni, fresh_after)
+    return store_verdict(n, last, uni is None or code in uni, fresh_after,
+                         status=_store_status_map().get(code))
 
 
-def store_pool_meta() -> dict:
+#: 尺子自己允许旧几个交易日。库末日落后当日"应到交易日"超过这个数, 裁池照裁, 但对外口径
+#: 从 'store_universe' 降成 'store_universe_stale' —— 分母仍然是按库算的, 只是那把库是旧的。
+STORE_RULER_STALE_TRADE_DAYS = 3
+
+
+def _weekdays_between(after: str, upto: str) -> int:
+    """(after, upto] 区间内的**工作日**数 (周一至周五)。零联网。
+
+    这是"错过了几个交易日"的**上界**: 真实交易日 ≤ 工作日 (节假日只会更少)。故意取上界 ——
+    宁可在"长假后第一天库又没更新"这种日子把 lag 说大 (方向是"尺子可能旧了, 别全信"),
+    也不要拿一个乐观的估计把真的旧了的尺子说成新的。想要精确值就得联网拉 trade_cal,
+    而裁池这一步**必须零联网** (它跑在阶段A 之前, 一次抖动就能拖垮整轮)。
+    """
+    try:
+        a = dt.date.fromisoformat(str(after)[:10])
+        b = dt.date.fromisoformat(str(upto)[:10])
+    except Exception:                                          # noqa: BLE001
+        return 0
+    n, cur = 0, a + dt.timedelta(days=1)
+    while cur <= b:
+        if cur.weekday() < 5:
+            n += 1
+        cur += dt.timedelta(days=1)
+    return n
+
+
+def store_ruler_freshness(asof: str | None = None) -> dict:
+    """**尺子自己有多旧** -> {store_max_d, asof, lag_weekdays, stale}。零联网。
+
+    裁池是拿价格库当尺子量东财候选池。尺子本身要是停在几天前 (Tushare 未就绪守卫就地停下、
+    `pricestore update` 连着几天失败), 裁出来的"库内在市股"仍然会得到一个看着正常的数字 ——
+    这正是 09-07 优质榜静默四天的形态: 产物还在、数字还在、没有任何一行字说它旧了。
+    所以这里把"尺子多旧"变成一个显式字段, 超过 STORE_RULER_STALE_TRADE_DAYS 就让 scan_basis
+    说真话 ('store_universe_stale')。**仍然照裁** —— 旧尺子好过没尺子, 但口径不许装新。
+
+    lag 用工作日上界 (见 `_weekdays_between`)。正常日子里 run_a.sh 会先跑
+    `pricestore update` 再进流水线, 库末日 = 当日, lag = 0, 长假也不会误报。
+    """
+    mx = _store_max_date()
+    today = str(asof or dt.date.today().isoformat())[:10]
+    if not mx:
+        return {"store_max_d": None, "asof": today, "lag_weekdays": None, "stale": False}
+    lag = _weekdays_between(mx, today)
+    return {"store_max_d": mx, "asof": today, "lag_weekdays": lag,
+            "stale": lag > STORE_RULER_STALE_TRADE_DAYS}
+
+
+def store_pool_meta(asof: str | None = None) -> dict:
     """裁池口径的留痕 (写进 data/pool_cut/*.json, 供事后核对是按什么尺子裁的)。"""
     uni, fresh_after = _store_pit_ctx()
-    return {"n_universe": (len(uni) if uni is not None else None),
+    meta = {"n_universe": (len(uni) if uni is not None else None),
             "fresh_after": fresh_after,
             "min_bars": STORE_MIN_BARS,
-            "fresh_trade_days": STORE_FRESH_TRADE_DAYS}
+            "fresh_trade_days": STORE_FRESH_TRADE_DAYS,
+            "ruler_stale_trade_days": STORE_RULER_STALE_TRADE_DAYS}
+    meta.update(store_ruler_freshness(asof))
+    return meta
 
 
 def store_universe_filter(codes, days: int | None = None) -> tuple:
-    """候选池 -> (库内在市的代码 list, {原因: [{code,n_bars,last_bar}, ...]}, 降级原因 str|None)。
+    """候选池 -> (留下的代码 list, {原因: [行]}, 降级原因 str|None, {留下的原因: [行]})。
+
+    行 = {code, n_bars, last_bar, status, note?}。
 
     东财快照给的候选池混着早已退市的老代码与次新股 (09-07 实测 5,180 只里 196 只退市);
     它们在取数层已经被判"无数据"跳过, 但仍然计进对外的 n_scanned —— 分母不诚实。这里在
@@ -884,6 +1014,16 @@ def store_universe_filter(codes, days: int | None = None) -> tuple:
     09-08 首版没有这个返回值, 两种情形都是 `(codes, {})`, 于是"库读不出来"那天一只没裁、
     n_pool_raw == n_scanned == 5180, scan_basis 却自称 'store_universe' —— 这个字段存在的
     唯一理由就是让事后对账的人分清新老口径, 那样等于恰恰在它最该说真话的那天说了假话。
+
+    **第四个返回值 (kept_detail) 是"留下的票里哪些其实没数据"**: keep (够根数) 与 gap
+    (在池但库内无 K 线) 混在同一个 list 里出去, 而 gap 是唯一一类"留在池里、库却给不出数据、
+    要靠 fetch_hist 逐只回落联网"的票 —— 它平时是 0 只 (09-07 实测), 一旦某天涨到几十上百只
+    就意味着库漏了一批码, 而阶段A 会为它们逐只发请求。**没有计数就没有人会发现**。
+    kept_detail 只装**不是 `keep`** 的那些留下裁决 (当前只有 gap): 留下的 4,900 只逐只留痕
+    没有价值, 它们的数目 = `len(keep) - Σ len(kept_detail[v])`。恒等式因此闭合:
+
+        len(codes) == len(keep) + Σ len(dropped[v])
+                   == (纯 keep 数 + Σ len(kept_detail[v])) + Σ len(dropped[v])
     """
     codes = [str(c) for c in (codes or [])]
     win = int(days or max(int(CONFIG["fetch"]["lookback_days"]), STORE_HIST_DAYS))
@@ -891,7 +1031,7 @@ def store_universe_filter(codes, days: int | None = None) -> tuple:
     if uni is None:
         log.warning("价格库点时股票池不可用, 候选池不裁 (%d 只原样进阶段A, 对外口径仍是老口径)",
                     len(codes))
-        return (codes, {}, "价格库点时股票池不可用(universe 表空/老库/读取失败)")
+        return (codes, {}, "价格库点时股票池不可用(universe 表空/老库/读取失败)", {})
     start = (dt.date.today() - dt.timedelta(days=win)).isoformat()
     probe: dict = {}
     try:
@@ -900,18 +1040,28 @@ def store_universe_filter(codes, days: int | None = None) -> tuple:
             "SELECT code, COUNT(*), MAX(d) FROM bars WHERE d>=? GROUP BY code", (start,))}
     except Exception as e:                                     # noqa: BLE001
         log.warning("价格库 bar 统计失败, 候选池不裁 (对外口径仍是老口径): %s", str(e)[:160])
-        return (codes, {}, f"价格库 bar 统计失败: {str(e)[:80]}")
-    keep, dropped = [], {}
+        return (codes, {}, f"价格库 bar 统计失败: {str(e)[:80]}", {})
+    status_map = _store_status_map()
+    keep, dropped, kept_detail = [], {}, {}
     for code in codes:
         n, last = probe.get(code, (0, None))
-        v = store_verdict(n, last, code in uni, fresh_after)
+        st = status_map.get(code) or None
+        v = store_verdict(n, last, code in uni, fresh_after, status=st)
+        if v == "keep":                     # 绝大多数; 不逐只留痕 (数目由恒等式反推)
+            keep.append(code)
+            continue
+        row = {"code": code, "n_bars": n, "last_bar": last, "status": st}
+        # B 股本该在候选池构建阶段就被剔掉 (CONFIG.tech.exclude_b_share, GM 09-08 的策略射程)。
+        # 万一开关被关掉、或候选池从别处进来, 它们会落进 uncovered (库对 B 股零覆盖) ——
+        # 那时留痕里必须一眼看出"这是策略不做它, 不是库丢了它"。
+        if v == "uncovered" and is_b_share(code):
+            row["note"] = "策略射程外(B股)"
         if v in STORE_KEEP_VERDICTS:
             keep.append(code)
+            kept_detail.setdefault(v, []).append(row)
         else:
-            dropped.setdefault(v, []).append(
-                {"code": code, "n_bars": n, "last_bar": last,
-                 "status": _store_status_map().get(code) or None})
-    return (keep, dropped, None)
+            dropped.setdefault(v, []).append(row)
+    return (keep, dropped, None, kept_detail)
 
 
 def backtest_prices_from_store_on() -> bool:
@@ -937,13 +1087,8 @@ def _store_max_date() -> str | None:
 #: 把 2,600 只票全推回腾讯, 那正是本卡要消灭的东西。
 STORE_STALE_MAX_DAYS = 7
 
-#: 库**明说**这只票不再交易的状态 (Tushare stock_basic: L 上市 / D 退市 / P 暂停上市)。
-#: 只有落进这个集合才算"联网也白跑"。**"库内查无此码" 不在此列** —— 那是"库没听说过",
-#: 不是"库说它死了": universe 来自 Tushare stock_basic, 实测它对北交所 (8xx/43x/92x) 与
-#: B 股 (200x/900x) 各 0 行, 把"没听说过"当"已退市"会让这些板块在回测链上永久静默无数据
-#: (历史快照里已有 4 只在市 B 股候选: 深粮B/一致Ｂ/宁通信B/安道麦B)。设计文档 §3 写的也是
-#: "库内无此码 -> 仅该码回落网络"; 09-08 首版实现写反了, 这里改回与文档一致。
-_STORE_DEAD_STATUS = ("D", "P")
+#  (`_STORE_DEAD_STATUS` 现在定义在上面 store_verdict 一带 —— 它是**两条链共用**的常量,
+#   放在两条链的口径对照表旁边, 见那里的注释。)
 
 
 def price_series_from_store(codes: list, start: str,
@@ -1042,8 +1187,10 @@ def fetch_hist(code: str) -> pd.DataFrame | None:
             return df
         # 判据与候选池裁剪**共用同一个** store_verdict: 只有 "在点时股票池里却一根 bar 都没有"
         # (gap) 才算真缺口, 值得回落联网。其余一律直接判无数据:
-        #   · 退市/不在池 -> 东财快照的历史遗留代码 (09-07 实测 196 只), 联网也只是白跑;
-        #   · 库里有 1..59 根 -> 这票历史本来就短 (次新股), 联网同样凑不出 module2 要的根数。
+        #   · dead (库明说 D/P) -> 东财快照的历史遗留退市码 (09-07 实测 196 只), 联网也白跑;
+        #   · uncovered (库未覆盖) -> 库里既没这一行也没这根 bar; 在**扫描分母**这条链上,
+        #     库覆盖不到的码今天就是扫不了 (取价链对它的处置相反, 见上面那张两链对照表);
+        #   · too_new (库里 1..59 根) -> 这票历史本来就短, 联网同样凑不出 module2 要的根数。
         if _store_verdict_one(code, win) != "gap":
             _store_note("skipped")
             return None

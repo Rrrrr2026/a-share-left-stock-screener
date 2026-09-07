@@ -113,6 +113,12 @@ def build_candidate_universe(spot, spot_map, ind_df, selected_inds=None):
                     continue
                 if CONFIG["tech"]["exclude_bj"] and str(code).startswith(("8", "4", "920")):
                     continue
+                # B 股 (沪B 900xxx / 深B 200xxx): **策略射程外** (GM 2026-09-08 口径决定,
+                # 见 CONFIG.tech.exclude_b_share 那段)。在这里剔 = 它们既不进候选池, 也不进
+                # 裁池的 uncovered 统计 —— 分母干净, 且"策略不做"不会被误记成"库没覆盖"。
+                # 全市场那条路由 ds.build_universe 剔同一批, 两条路必须同规则。
+                if CONFIG["tech"].get("exclude_b_share", True) and ds.is_b_share(code):
+                    continue
                 seen.add(code)
                 universe.append((code, name, ind_name))
         log.info("候选池: 全行业成分股 %d 只 (行业数 %d)", len(universe), len(ind_to_codes))
@@ -148,11 +154,23 @@ def trim_universe_by_store(universe, run_date):
     `git reset -q --hard origin/main`, 手改会在下一次 stock-a 起来的头几秒被丢弃, 而且
     日志里不会有任何异常, 值班的人会以为关掉了其实没关 (见 config.pool_by_store 那段)。
     无论被哪一层关掉, 日志都会打一行"已关闭 (被谁关的)", 不存在静默关闭。
+    **环境变量只认 0/1/true/false/on/off** (大小写不敏感; `yes`/`no` 09-08 起不再算数):
+    写了别的值 -> 忽略它按默认走, 但这里会先 log.warning 一行, 不许"按下去没反应还没人说"。
 
     安全阀: 裁后不足原池 60% (原池本身有 3000 只以上时再加一道 3000 只的绝对下限) 一律判为
     库/尺子出了问题, 原样放行不裁 —— 宁可多扫 200 只退市码, 也不能因为库没更新就把候选池清空。
+
+    **scan_basis 三个取值**: 'raw_spot' (没裁/没能裁, 老口径) | 'store_universe' (按库裁了,
+    尺子也新鲜) | 'store_universe_stale' (按库裁了, **但库末日已经落后当日应到交易日 >3 个
+    交易日**) —— 第三个是 09-08 复检补的: 尺子自己旧了的时候, 裁出来的数字照样长得很正常,
+    不给它一个字段说真话, 就又是一次"产物还在、数字还在、没人知道它旧了"。
     """
     raw_n = len(universe)
+    # 环境变量写了个不认识的值 (yes/no/拼错的) -> config 层已经把它忽略了, 这里必须响一声。
+    # 放在最前面: 无论下面走哪条分支 (关掉/没开库/降级/正常裁), 这行都得出现在日志里。
+    _sw_warn = CONFIG["tech"].get("pool_by_store_switch_warn")
+    if _sw_warn:
+        log.warning("候选池按库裁 · 回滚开关: %s", _sw_warn)
     if not CONFIG["tech"].get("pool_by_store", True):
         log.info("候选池按库裁: 已关闭 (%s), 沿用东财原池 %d 只",
                  CONFIG["tech"].get("pool_by_store_off_by") or "CONFIG.tech.pool_by_store=False",
@@ -161,7 +179,8 @@ def trim_universe_by_store(universe, run_date):
     if not ds.bars_from_store_on():
         return universe, "raw_spot"
     try:
-        keep, dropped, degraded = ds.store_universe_filter([c for (c, _, _) in universe])
+        keep, dropped, degraded, kept_detail = ds.store_universe_filter(
+            [c for (c, _, _) in universe])
     except Exception as e:                                     # noqa: BLE001
         log.warning("候选池按库裁失败(沿用东财原池, 口径标回 raw_spot): %s", e)
         return universe, "raw_spot"
@@ -180,14 +199,36 @@ def trim_universe_by_store(universe, run_date):
         return universe, "raw_spot"
     kept = set(keep)
     out = [t for t in universe if t[0] in kept]
+    # 尺子自己有多旧: 库末日落后当日"应到交易日" >3 个交易日 -> 照裁, 但口径字段说真话。
+    ruler = ds.store_ruler_freshness()
+    basis = "store_universe"
+    if ruler.get("stale"):
+        basis = "store_universe_stale"
+        log.warning("候选池按库裁: **尺子自己旧了** —— 价格库末日 %s, 落后当日 %s 约 %s 个交易日"
+                    " (>%d)。本轮照裁, 但对外口径标 'store_universe_stale'; "
+                    "请查 `pricestore update` 是不是连着几天没跑成 (Tushare 未就绪守卫会就地停下)。",
+                    ruler.get("store_max_d"), ruler.get("asof"), ruler.get("lag_weekdays"),
+                    ds.STORE_RULER_STALE_TRADE_DAYS)
+    # gap = 留在池里、但库里一根 K 线都没有的票 (阶段A 会逐只回落联网)。平时 0 只, 涨起来
+    # 就是"库漏了一批码"的第一现场 —— 所以哪怕它不被裁, 也必须有数、必须进日志。
+    n_gap = len(kept_detail.get("gap") or [])
+    n_keep_pure = len(out) - n_gap
     if not dropped:
         # 过滤器真的跑完了, 只是这一池全都在库内在市 —— 是新口径, 照标 store_universe
-        log.info("候选池按库裁: 东财 %d 只全部在库内在市, 无可裁 (口径 store_universe)", raw_n)
-        return out, "store_universe"
+        log.info("候选池按库裁: 东财 %d 只全部在库内在市, 无可裁 (留下 %d = 有K线 %d + 缺K线gap %d;"
+                 " 口径 %s)", raw_n, len(out), n_keep_pure, n_gap, basis)
+        return out, basis
     parts = ", ".join(f"{ds.STORE_DROP_REASON_CN.get(k, k)} {len(v)}"
                       for k, v in sorted(dropped.items(), key=lambda kv: -len(kv[1])))
-    log.info("候选池按库裁: 东财 %d → 库内在市 %d (裁 %d: %s)",
-             raw_n, len(out), raw_n - len(out), parts)
+    log.info("候选池按库裁: 东财 %d → 留下 %d (有K线 %d + 缺K线gap %d) | 裁 %d: %s | 口径 %s",
+             raw_n, len(out), n_keep_pure, n_gap, raw_n - len(out), parts, basis)
+    # 恒等式必须闭合, 否则上面那串数字是各算各的 (09-07 那轮 absent 拆解 163+7+12 ≠ 177 就是
+    # 这么来的)。对不上一律 error —— 分母口径是要对外公布的数字, 不许"大概齐"。
+    n_dropped = sum(len(v) for v in dropped.values())
+    if n_keep_pure + n_gap + n_dropped != raw_n:
+        log.error("候选池按库裁: **计数恒等式不闭合** 有K线 %d + gap %d + 裁 %d != 原池 %d "
+                  "(留痕 json 里的数字不可信, 请查 store_universe_filter)",
+                  n_keep_pure, n_gap, n_dropped, raw_n)
     # 裁掉的名单落盘 (data/ 不进 git), 供事后逐只核对"为什么没扫它"
     try:
         import json as _json
@@ -195,14 +236,22 @@ def trim_universe_by_store(universe, run_date):
         _dir = os.path.join(DATA_DIR, "pool_cut")
         os.makedirs(_dir, exist_ok=True)
         payload = {"run_date": run_date, "n_pool_raw": raw_n, "n_kept": len(out),
-                   "n_dropped": raw_n - len(out), "basis": ds.store_pool_meta(),
+                   "n_dropped": raw_n - len(out), "scan_basis": basis,
+                   # 恒等式的三项写进留痕本身, 事后不用再自己加一遍
+                   "counts": {"keep": n_keep_pure, "gap": n_gap,
+                              "dropped": {k: len(v) for k, v in sorted(dropped.items())},
+                              "identity_ok": n_keep_pure + n_gap + n_dropped == raw_n},
+                   "basis": ds.store_pool_meta(),
+                   # 留下但没数据的 (gap) 也要逐只留痕, 不然"库漏了一批码"那天查无对证
+                   "kept_no_bars": {k: [dict(x, name=names.get(x["code"])) for x in v]
+                                    for k, v in kept_detail.items()},
                    "dropped": {k: [dict(x, name=names.get(x["code"])) for x in v]
                                for k, v in dropped.items()}}
         with open(os.path.join(_dir, f"{run_date}.json"), "w", encoding="utf-8") as f:
             _json.dump(payload, f, ensure_ascii=False, indent=1)
     except Exception as e:                                     # noqa: BLE001
         log.warning("裁池名单落盘失败(不影响扫描): %s", e)
-    return out, "store_universe"
+    return out, basis
 
 
 def run(full_market: bool, use_cache: bool):

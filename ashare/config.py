@@ -46,19 +46,34 @@ DB_PATH = os.path.join(DATA_DIR, "ashare.db")
 #:   ③ 或在 PC 上改下面的默认值再 commit+push (需要等下一轮或手动重跑)。
 #: 优先级 环境变量 > 停机文件 > 默认值; 无论被哪一层关掉, run_pipeline 都会打一行
 #: "候选池按库裁: 已关闭 (被谁关的)" —— 不允许静默关闭。
+#:
+#: **环境变量只认 6 个值**: 关 = 0 / false / off, 开 = 1 / true / on (大小写不敏感)。
+#: 别的值 (`yes` `no` `Off ` 带空格的、拼错的) 一律**不当数**, 返回第三个元素 warn,
+#: 由 run_pipeline 在裁池那一步 log.warning 出来, 然后按下面的默认路径 (停机文件 → 默认值 开)
+#: 走。09-08 首版还认 yes/no, 于是"值班的人写了个自以为有效的值"与"写对了"在日志里
+#: 长得一模一样 —— 这正是 09-03「静默跑旧码」/ 09-07「优质榜静默失败」的同一形态:
+#: **按下去没反应, 却没有任何一行字说它没反应**。现在写错值一定会响, 且响的时候明说
+#: "按默认(开)处理, 要关请用 0/false/off 或 touch data/pool_by_store.off"。
 def _pool_by_store_switch(default: bool = True) -> tuple:
-    v = (os.environ.get("ASHARE_POOL_BY_STORE") or "").strip().lower()
-    if v in ("0", "false", "off", "no"):
-        return False, f"环境变量 ASHARE_POOL_BY_STORE={v}"
-    if v in ("1", "true", "on", "yes"):
-        return True, ""
+    """-> (是否开, 被谁关的, 环境变量写错时的告警文本)。三个元素都可离线单测。"""
+    raw = os.environ.get("ASHARE_POOL_BY_STORE")
+    v = (raw or "").strip().lower()
+    warn = ""
+    if v in ("0", "false", "off"):
+        return False, f"环境变量 ASHARE_POOL_BY_STORE={v}", ""
+    if v in ("1", "true", "on"):
+        return True, "", ""
+    if v:                       # 写了东西, 但不是这 6 个值之一 -> 不当数, 但必须响
+        warn = (f"环境变量 ASHARE_POOL_BY_STORE={raw!r} 不是可识别的值 "
+                f"(只认 0/1/true/false/on/off, 大小写不敏感), 本轮**忽略它**按默认处理; "
+                f"要关裁池请用 ASHARE_POOL_BY_STORE=0 或 touch {DATA_DIR}/pool_by_store.off")
     off_file = os.path.join(DATA_DIR, "pool_by_store.off")
     if os.path.exists(off_file):
-        return False, f"停机文件 {off_file}"
-    return bool(default), ""
+        return False, f"停机文件 {off_file}", warn
+    return bool(default), "", warn
 
 
-_POOL_BY_STORE, _POOL_BY_STORE_OFF_BY = _pool_by_store_switch(True)
+_POOL_BY_STORE, _POOL_BY_STORE_OFF_BY, _POOL_BY_STORE_WARN = _pool_by_store_switch(True)
 # 仪表盘读取的数据文件 (导出为 JS, 直接 <script> 引入, 双击 HTML 即可打开, 无需服务器)
 DASHBOARD_DATA_JS = os.path.join(DASHBOARD_DIR, "dashboard_data.js")
 
@@ -166,11 +181,25 @@ CONFIG = {
         "pool_by_store": _POOL_BY_STORE,
         # 被谁关的 (环境变量 / 停机文件), 空串 = 没被关。只用于日志, 不允许静默关闭。
         "pool_by_store_off_by": _POOL_BY_STORE_OFF_BY,
+        # 环境变量写了个不认识的值时的告警文本 (空串 = 没问题)。由 run_pipeline 在裁池
+        # 那一步 log.warning 打出来 —— config 在 basicConfig 之前就 import 完了, 在这里
+        # 直接 log 会走 lastResort 只落到 stderr, 进不了 journal 的正文。
+        "pool_by_store_switch_warn": _POOL_BY_STORE_WARN,
         "exclude_st": True,
         "exclude_new_days": 180,        # 上市交易日不足则视为次新, 剔除
         "min_amount_yi": 0.5,           # 近20日日均成交额下限(亿元)
         "min_price": 2.0,
         "exclude_bj": True,             # 剔除北交所(8/4/920 开头)
+        # ---- 策略射程 (GM 决定 2026-09-08) ----
+        # **本策略射程不含 B 股 (沪B 900xxx / 深B 200xxx)**, 与 exclude_bj 并排。
+        # 理由 (口径决定, 不是 bug): ① 价格库 (Tushare stock_basic 镜像) 对 B 股 0 行、
+        # 一根 bar 都没有, 单为它补一路行情不值; ② 在市 B 股只剩 7 只, 流动性极低且以
+        # 外币 (港币/美元) 计价, 与本策略的成交额门槛/仓位口径根本对不上。
+        # 写成**显式规则**而不是让"库里没有"顺手把它们裁掉: 前者是策略边界 (可复查、可推翻),
+        # 后者是数据缺口冒充策略决定 —— 09-07 的教训就是"看着正常的静默"最贵。
+        # 生效点在**候选池构建阶段** (datasource.build_universe + run_pipeline 的行业成分路),
+        # 所以 B 股既不进候选池、也不进裁池的 uncovered 统计, 分母口径干净。
+        "exclude_b_share": True,
         # ---- 信号阈值 ----
         "channel_window": 120,          # 拟合上升通道窗口(交易日)
         "channel_band_k": 2.0,          # 下轨 = 回归线 - k*残差std

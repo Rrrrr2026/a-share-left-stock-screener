@@ -277,7 +277,9 @@ def log_run(run_date, started_at, finished_at, n_scanned, n_hit,
             selected_industries, status, message="", data_date=None,
             n_pool_raw=None, scan_basis=None):
     """n_scanned = 阶段A 真的扫了几只; n_pool_raw = 裁前的东财候选池大小;
-    scan_basis = 'store_universe'(09-08 起按库内在市股裁) | 'raw_spot'(老口径/裁池关闭)。"""
+    scan_basis = 'store_universe'(09-08 起按库内在市股裁)
+               | 'store_universe_stale'(按库裁了, 但库末日落后当日 >3 个交易日 —— 尺子旧了)
+               | 'raw_spot'(老口径 / 裁池关闭 / 降级放行)。"""
     _upsert("run_log", [{
         "run_date": run_date, "started_at": started_at, "finished_at": finished_at,
         "n_scanned": n_scanned, "n_hit": n_hit,

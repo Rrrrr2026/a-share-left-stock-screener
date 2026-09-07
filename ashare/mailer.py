@@ -72,10 +72,18 @@ def build_summary_text(payload: dict, cfg: dict = CONFIG) -> str:
     L = [f"【A股左侧抄底监视器 · {rd}】", ""]
     scanned = meta.get("n_scanned")
     hit = meta.get("n_hit")
-    L.append(
-        f"全市场扫描 {scanned} 只 → 命中 {hit} 只候选"
-        if scanned else f"命中 {len(cands)} 只候选"
-    )
+    # 2026-09-08 起 n_scanned 换了口径 (按价格库的点时股票池裁候选池, 5180 -> ~4930), 与
+    # 09-08 之前的历史邮件有断层。GM 定的文案把断层写进正文, 免得收信人拿两天的数直接比。
+    # scan_basis='raw_spot' 那天 (裁池被关/降级放行) 分母又是东财原池, 那句注解会变成假话,
+    # 所以按口径分两句 —— 邮件是对外的数字, 不许"平时说得对、回滚那天说错"。
+    basis = str(meta.get("scan_basis") or "raw_spot")
+    if scanned and basis.startswith("store_universe"):
+        L.append(f"全市场扫描 {scanned} 只 (库内在市 A 股; 09-08 前口径含退市老代码约 5180)"
+                 f" → 命中 {hit} 只候选")
+    elif scanned:
+        L.append(f"全市场扫描 {scanned} 只 (东财快照原池, 含退市老代码) → 命中 {hit} 只候选")
+    else:
+        L.append(f"命中 {len(cands)} 只候选")
     sel = meta.get("selected_industries") or []
     if sel:
         L.append("入选景气行业:" + "、".join(sel))
