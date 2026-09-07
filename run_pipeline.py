@@ -218,7 +218,14 @@ def trim_universe_by_store(universe, run_date):
         log.info("候选池按库裁: 东财 %d 只全部在库内在市, 无可裁 (留下 %d = 有K线 %d + 缺K线gap %d;"
                  " 口径 %s)", raw_n, len(out), n_keep_pure, n_gap, basis)
         return out, basis
-    parts = ", ".join(f"{ds.STORE_DROP_REASON_CN.get(k, k)} {len(v)}"
+    def _part(k, rows):
+        s = f"{ds.STORE_DROP_REASON_CN.get(k, k)} {len(rows)}"
+        # B 股正常情况下在候选池构建阶段就没了 (exclude_b_share), 走到这里说明射程开关被关掉
+        # 或候选池从别处进来 —— 那就必须在日志里当场说清"这是策略不做它, 不是库丢了它"。
+        nb = sum(1 for x in rows if x.get("note"))
+        return s + (f"(其中 B 股 {nb} 只·策略射程外)" if nb else "")
+
+    parts = ", ".join(_part(k, v)
                       for k, v in sorted(dropped.items(), key=lambda kv: -len(kv[1])))
     log.info("候选池按库裁: 东财 %d → 留下 %d (有K线 %d + 缺K线gap %d) | 裁 %d: %s | 口径 %s",
              raw_n, len(out), n_keep_pure, n_gap, raw_n - len(out), parts, basis)

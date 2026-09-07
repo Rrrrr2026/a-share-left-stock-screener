@@ -345,6 +345,18 @@ def test_counts_identity_closes_and_screams_when_it_does_not():
         assert line and "库明说退市/暂停(status D/P) 60" in line[0], line
         assert "库未覆盖(无此码且无K线) 15" in line[0], line
         assert "缺K线gap 3" in line[0], line
+        assert "B 股" not in line[0], "这一池没有 B 股, 就不该凭空多出一句"
+
+        # ---- 射程开关被关掉时: uncovered 里的 B 股要在日志里当场点出来
+        drop2 = dict(drop, uncovered=[dict(x, note="策略射程外(B股)") if i < 4 else x
+                                      for i, x in enumerate(drop["uncovered"])])
+        ds.store_universe_filter = lambda cs, days=None: (
+            [c for c in cs if c not in {x["code"] for v in drop2.values() for x in v}],
+            drop2, None, {"gap": gap})
+        with _Cap(rp.log) as cap3:
+            rp.trim_universe_by_store(uni, "2026-09-08")
+        line3 = [m for m in cap3.msgs if "候选池按库裁: 东财" in m]
+        assert line3 and "库未覆盖(无此码且无K线) 15(其中 B 股 4 只·策略射程外)" in line3[0], line3
 
         # ---- 故意把数字弄错: 必须 error, 不许闷头写一份对不上的留痕
         ds.store_universe_filter = lambda cs, days=None: (
