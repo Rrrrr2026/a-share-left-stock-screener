@@ -480,22 +480,22 @@ def run(full_market: bool, use_cache: bool):
         from ashare import backtest as bt
         bt.run_backtest()
     except Exception as e:
-        log.warning("信号回测失败(不影响榜单与发布): %s", e)
+        log.warning("信号回测失败(不影响榜单与发布): %s", e, exc_info=True)
     try:
         from ashare import quality as ql
         ql.build_quality()
     except Exception as e:
-        log.warning("优质榜构建失败(不影响榜单与发布): %s", e)
+        log.warning("优质榜构建失败(不影响榜单与发布): %s", e, exc_info=True)
     try:
         from ashare import paper
         paper.update_portfolio()
     except Exception as e:
-        log.warning("自动模拟组合更新失败(不影响榜单与发布): %s", e)
+        log.warning("自动模拟组合更新失败(不影响榜单与发布): %s", e, exc_info=True)
     try:
         from ashare import biweekly
         biweekly.update()
     except Exception as e:
-        log.warning("双周组合更新失败(不影响榜单与发布): %s", e)
+        log.warning("双周组合更新失败(不影响榜单与发布): %s", e, exc_info=True)
     log.info("✅ 全部完成。请双击打开 dashboard/index.html")
 
 

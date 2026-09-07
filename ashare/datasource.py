@@ -275,6 +275,13 @@ def _pool_reset():
             pass
 
 
+# 退出时主动收池: 不这样做, spawn 池会在解释器拆掉 io 模块之后才被 Pool.__del__ 清理,
+# 每次收尾都在日志里留一条 "AttributeError: 'NoneType' object has no attribute 'BytesIO'"
+# 的假 traceback (2026-09-04/07 两次被当真错误排查), 顺带解决 "leaked semaphore" 告警。
+import atexit as _atexit
+_atexit.register(_pool_reset)
+
+
 def _call_in_thread(fn, args, kwargs, deadline_sec):
     """线程版兜底 (不可序列化的调用, 或进程池已判定不可用): 超时的线程无法强杀, 弃之为守护线程。"""
     import queue as _q

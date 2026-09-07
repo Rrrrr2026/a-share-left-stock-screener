@@ -358,11 +358,6 @@ def build_quality(top_n: int = TOP_N) -> dict | None:
     return result
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    build_quality()
-
-
 def _drawer_profiles(picks: list, reports: dict | None = None) -> dict:
     """优质榜前10只生成候选股同构档案 -> 主表同款弹窗 (尽量填满总览页字段)。"""
     import glob
@@ -541,3 +536,8 @@ def _merge_fundamental_fields(profiles: dict) -> int:
     conn.close()
     log.info("优质档案合并库内财务字段: %d 只", n)
     return n
+
+
+if __name__ == "__main__":   # 必须放在文件末尾: 直接跑 `-m ashare.quality` 时 build_quality 要能看到下面的档案函数
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    build_quality()
