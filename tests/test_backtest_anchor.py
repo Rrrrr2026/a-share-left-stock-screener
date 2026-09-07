@@ -119,6 +119,8 @@ def _mk_store(path: str, last_day: str = "2026-09-07", n: int = 80) -> None:
         ("999998", "在市但库里没有", "2015-01-01", None, "L"),
         ("999999", "早退市", "1996-01-01", "2005-06-30", "D"),
     ])
+    # 200028 (一致Ｂ) 故意**不写进 universe**: 真库的 universe 来自 Tushare stock_basic,
+    # 对 B 股 / 北交所 0 行, 这一路必须与 "D" 分开处理 (见 test_unknown_code_...)。
     conn.commit()
     conn.close()
 
@@ -163,6 +165,24 @@ def test_store_hit_and_per_code_fallback():
     assert abs(float(ser["ohlc"][0][3]) - 9.8) < 1e-9, "ohlc 必须是前复权"
     # 锚定用 raw (10.0) 能命中, 用 qfq (9.8) 命不中 -> 库路径确实把两套都带回来了
     assert bt.find_anchor(bt.anchor_closes(ser), 30, 10.0) == 30
+
+
+def test_unknown_code_falls_back_not_treated_as_delisted():
+    """**库内查无此码 ≠ 库说它退市**: 必须回落联网, 不能静默判无数据。
+
+    09-08 首版写的是 `status.get(code,"") != "L" -> 不联网`, 于是任何 universe 里没有的码
+    都被当成退市。真库的 universe 来自 Tushare stock_basic —— 北交所 (8xx/43x/92x) 与
+    B 股 (200x/900x) **各 0 行**, 开关一开这些板块在回测链上就是永久静默无数据, 日志还统一
+    写成"判退市跳过"。历史快照里已有 4 只在市 B 股候选 (200019/200028/200468/200553)。
+    """
+    path = os.path.join(tempfile.mkdtemp(prefix="cardD_test_"), "pricestore.db")
+    _mk_store(path)
+    with _use_store(path):
+        out, fb = ds.price_series_from_store(["000001", "200028", "999999"], "2026-06-01",
+                                             need_date="2026-09-07")
+    assert set(out) == {"000001"}
+    assert fb == ["200028"], (
+        f"库内查无此码的 200028 该回落联网、退市的 999999 不该联网, 实得 {fb}")
 
 
 def test_store_stale_falls_back_whole_batch():
@@ -222,6 +242,7 @@ def test_market_hook_signature_is_backward_compatible():
 TESTS = [test_anchor_uses_raw_not_qfq, test_anchor_closes_tolerates_nan,
          test_default_is_off_until_boss_signs_off,
          test_return_across_ex_div_uses_qfq, test_store_hit_and_per_code_fallback,
+         test_unknown_code_falls_back_not_treated_as_delisted,
          test_store_stale_falls_back_whole_batch, test_switch_off_disables_store_path,
          test_market_hook_signature_is_backward_compatible]
 
