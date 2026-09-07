@@ -117,8 +117,13 @@ def main() -> int:
         spot, spot_map, ind_df,
         list(ind_df[ind_df["selected"]]["industry"]) if ind_df is not None else [])
     if misses:
+        # ⚠ 这一行是读下面所有 B 股数字的前提: 缺了几十个行业成分表, 池子本身就是个小样本,
+        # "其中 B 股 N 只" 只是**这几个行业里的** B 股数, 不是全市场在市 B 股数 (09-08 复检:
+        # 首版把 09-07 的 7 当成"在市 B 股只剩 7 只"写进了 config, 是错的)。
         print(f"   ! 有 {len(misses)} 个行业没有当日成分缓存 (已按 None 处理): "
               f"{misses[:5]}{' ...' if len(misses) > 5 else ''}")
+        print(f"   ! 因此下面的 B 股/北交所只数是**这 {len(ind_df) - len(misses) if ind_df is not None else '?'}"
+              f" 个有缓存的行业**里的数, 不是全市场数, 不要外推")
     raw_n = len(universe)
     n_b = sum(1 for (c, _, _) in universe if ds.is_b_share(c))
     n_bj = sum(1 for (c, _, _) in universe if str(c).startswith(("8", "4", "920")))
@@ -127,8 +132,10 @@ def main() -> int:
           f"exclude_bj={CONFIG['tech']['exclude_bj']})")
 
     ruler = ds.store_ruler_freshness()
-    print(f"   尺子: 价格库末日 {ruler['store_max_d']} / 落后 {ruler['lag_weekdays']} 个工作日"
-          f" (上界) -> stale={ruler['stale']}")
+    print(f"   尺子: 个股末日 {ruler['store_max_d']} / 库自己的交易日历末日 {ruler['idx_max_d']}"
+          f" -> 落后 {ruler['lag_trade_days']} 个交易日 (自然日 {ruler['lag_calendar_days']}, "
+          f"工作日 {ruler['lag_weekdays']} 仅供诊断) -> stale={ruler['stale']}"
+          f"{(' (' + ruler['stale_reason'] + ')') if ruler['stale_reason'] else ''}")
 
     keep, dropped, degraded, kept_detail = ds.store_universe_filter(
         [c for (c, _, _) in universe])

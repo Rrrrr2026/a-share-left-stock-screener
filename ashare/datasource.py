@@ -633,6 +633,10 @@ def build_universe(spot: pd.DataFrame | None = None) -> pd.DataFrame | None:
         # 在这里剔 (候选池构建阶段) 而不是留给裁池, 是为了让分母口径干净: B 股既不进
         # 候选池, 也不出现在裁池的 uncovered 桶里 —— 否则"策略不做它"会被记成"库没覆盖它",
         # 一个策略边界被写成数据缺口。价格库对 B 股确实 0 覆盖, 但那是**另一件事**。
+        # 实情 (09-08 复检, 别把这一行当成"每天真剔掉了几只"): **东财全A快照里 B 股恒 0 行**
+        # (09-07/09-04/09-03/09-02/08-28 逐日实测都是 0), 所以这条过滤在真实数据上是空转;
+        # B 股只会从 run_pipeline 的**行业成分**那条路进候选池。两条路都设是为了口径一致
+        # (射程规则不依赖某个数据源今天恰好给不给 B 股), 不是因为两条路都真的会命中。
         df = df[~df["code"].str.startswith(B_SHARE_PREFIXES)]
     df = df.drop_duplicates(subset=["code"])   # 去重, 避免重复代码导致命中数虚高
     return df.reset_index(drop=True)
@@ -938,18 +942,26 @@ def _store_verdict_one(code: str, days: int) -> str:
                          status=_store_status_map().get(code))
 
 
-#: 尺子自己允许旧几个交易日。库末日落后当日"应到交易日"超过这个数, 裁池照裁, 但对外口径
-#: 从 'store_universe' 降成 'store_universe_stale' —— 分母仍然是按库算的, 只是那把库是旧的。
+#: 尺子自己允许旧几个交易日。个股末日落后**库自己的交易日历**超过这个数, 裁池照裁, 但对外
+#: 口径从 'store_universe' 降成 'store_universe_stale' —— 分母仍是按库算的, 只是那把尺旧了。
 STORE_RULER_STALE_TRADE_DAYS = 3
+
+#: 兜底: 两条腿 (个股 bars 与指数 idx_bars) 一起冻住时, 交易日差恒为 0, 上面那条判据看不见。
+#: 这时才退回**自然日**。A 股最长连续休市是春节 (含前后周末) 实测 ≤ 11 个自然日, 取 20 天
+#: 留近一倍余量 —— 只用来抓"整个库都不动了", 不承担"晚了几天"的精度。
+STORE_RULER_FROZEN_MAX_DAYS = 20
 
 
 def _weekdays_between(after: str, upto: str) -> int:
-    """(after, upto] 区间内的**工作日**数 (周一至周五)。零联网。
+    """(after, upto] 区间内的**工作日**数 (周一至周五)。零联网。**诊断用, 不是判据。**
 
-    这是"错过了几个交易日"的**上界**: 真实交易日 ≤ 工作日 (节假日只会更少)。故意取上界 ——
-    宁可在"长假后第一天库又没更新"这种日子把 lag 说大 (方向是"尺子可能旧了, 别全信"),
-    也不要拿一个乐观的估计把真的旧了的尺子说成新的。想要精确值就得联网拉 trade_cal,
-    而裁池这一步**必须零联网** (它跑在阶段A 之前, 一次抖动就能拖垮整轮)。
+    ⚠ 09-08 复检: 这个数**不能**用来判"尺子旧了"。挂钟工作日在长假里照常累加, 而市场不开、
+    Tushare 无数据、`pricestore update` 的未就绪守卫就地停下 —— 库末日原地不动是**正确行为**。
+    首版拿它当判据, 复现结果是 2026 国庆 (末交易日 09-30) 10-06/07/08 连报三天假警, 还把那三天的
+    scan_basis 永久写成 'store_universe_stale'; 春节更长。同一个文件里 `_store_trade_day_back`
+    与 `STORE_STALE_MAX_DAYS` 早就写着"刻意不用挂钟日期", 首版正是踩了自己立的戒律。
+    现在判据改用库自己的交易日历 (见 `store_ruler_freshness`), 这个函数只剩两个用处:
+    ① 留痕里给人看"离上一根 bar 过了几个工作日"; ② 出事后排障时的粗略量级。
     """
     try:
         a = dt.date.fromisoformat(str(after)[:10])
@@ -964,8 +976,37 @@ def _weekdays_between(after: str, upto: str) -> int:
     return n
 
 
+def _calendar_days_between(after: str, upto: str) -> int:
+    """(after, upto] 的自然日数。零联网。只给 STORE_RULER_FROZEN_MAX_DAYS 那道兜底用。"""
+    try:
+        a = dt.date.fromisoformat(str(after)[:10])
+        b = dt.date.fromisoformat(str(upto)[:10])
+    except Exception:                                          # noqa: BLE001
+        return 0
+    return max(0, (b - a).days)
+
+
+def _store_idx_max_date() -> str | None:
+    """库自己的交易日历末日 (`MAX(idx_bars.d)`)。取不到/表空返回 None。"""
+    try:
+        return _store_conn().execute("SELECT MAX(d) FROM idx_bars").fetchone()[0]
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+def _store_calendar_lag(mx: str) -> int | None:
+    """库自己的日历里**严格晚于** mx 的交易日数 = 个股腿落后指数腿几个交易日。日历空则 None。"""
+    try:
+        n = _store_conn().execute(
+            "SELECT COUNT(*) FROM idx_bars WHERE d > ?", (str(mx)[:10],)).fetchone()[0]
+    except Exception:                                          # noqa: BLE001
+        return None
+    return int(n or 0)
+
+
 def store_ruler_freshness(asof: str | None = None) -> dict:
-    """**尺子自己有多旧** -> {store_max_d, asof, lag_weekdays, stale}。零联网。
+    """**尺子自己有多旧** -> {store_max_d, idx_max_d, asof, lag_trade_days,
+    lag_calendar_days, lag_weekdays, stale, stale_reason}。零联网。
 
     裁池是拿价格库当尺子量东财候选池。尺子本身要是停在几天前 (Tushare 未就绪守卫就地停下、
     `pricestore update` 连着几天失败), 裁出来的"库内在市股"仍然会得到一个看着正常的数字 ——
@@ -973,16 +1014,45 @@ def store_ruler_freshness(asof: str | None = None) -> dict:
     所以这里把"尺子多旧"变成一个显式字段, 超过 STORE_RULER_STALE_TRADE_DAYS 就让 scan_basis
     说真话 ('store_universe_stale')。**仍然照裁** —— 旧尺子好过没尺子, 但口径不许装新。
 
-    lag 用工作日上界 (见 `_weekdays_between`)。正常日子里 run_a.sh 会先跑
-    `pricestore update` 再进流水线, 库末日 = 当日, lag = 0, 长假也不会误报。
+    **判据: 库自己的两条腿互比, 不看挂钟** (09-08 复检重写)。
+    · 个股腿 = `MAX(bars.d)`, 由 run_a.sh 开头的 `pricestore update` (Tushare) 推进;
+    · 指数腿 = `MAX(idx_bars.d)`, 由 run_a.sh 末尾的 `ingest_cache_to_pricestore.py`
+      (东财 bench 缓存, 失败再走 fill_index_gaps) 推进 —— **另一个数据源、另一条代码路径**。
+    lag = 日历里严格晚于个股末日的交易日数 (`COUNT(idx_bars.d > MAX(bars.d))`)。
+    · 长假: 两条腿都不动, 也没有新的交易日入库 -> lag = 0, **不误报** (首版用挂钟工作日,
+      国庆连报三天假警, 见 `_weekdays_between` 的警告);
+    · Tushare 连着几天不就绪而市场照开: 指数腿照常推进, 个股腿不动 -> lag 逐日涨 -> 报警。
+    lag 的单位是**真交易日**, 不是上界估计 —— 比首版的工作日上界还准, 且完全零联网。
+
+    **说清它抓不到什么** (三条, 别把它当全能守卫):
+    ① 指数腿也停了 (三个免费指数源同时哑火 + Tushare 也不就绪) -> 两条腿一起冻住, lag 恒 0。
+       这一条由 `STORE_RULER_FROZEN_MAX_DAYS` 的自然日兜底接住 (stale_reason='frozen'),
+       代价是它只在 20 个自然日之后才响, 只够抓"整个库都不动了", 抓不到"晚了三天"。
+    ② 本轮的指数腿要等本轮**跑完**才入库, 所以指数腿天然比个股腿晚一轮: Tushare 从第 D 天
+       开始失败, 到第 D+4 轮才够 lag>3。首版的挂钟口径名义上第 D+4 天也才报 —— 量级相同,
+       换来的是长假不误报。真要更早发现 `pricestore update` 失败, 那是 SRE 的单元告警该管的
+       (run_a.sh 里那一行是 `|| echo`, 退出码到不了 systemd, 见 server/run-scripts.txt),
+       不是这个字段的活。
+    ③ 库根本没有 idx_bars (老库/没灌指数) -> lag_trade_days = None, 只剩 ① 那道自然日兜底。
     """
     mx = _store_max_date()
     today = str(asof or dt.date.today().isoformat())[:10]
+    out = {"store_max_d": mx, "idx_max_d": None, "asof": today,
+           "lag_trade_days": None, "lag_calendar_days": None, "lag_weekdays": None,
+           "stale": False, "stale_reason": ""}
     if not mx:
-        return {"store_max_d": None, "asof": today, "lag_weekdays": None, "stale": False}
-    lag = _weekdays_between(mx, today)
-    return {"store_max_d": mx, "asof": today, "lag_weekdays": lag,
-            "stale": lag > STORE_RULER_STALE_TRADE_DAYS}
+        return out
+    out["idx_max_d"] = _store_idx_max_date()
+    out["lag_calendar_days"] = _calendar_days_between(mx, today)
+    out["lag_weekdays"] = _weekdays_between(mx, today)     # 诊断字段, 不参与判定
+    if out["idx_max_d"]:
+        out["lag_trade_days"] = _store_calendar_lag(mx)
+        if (out["lag_trade_days"] or 0) > STORE_RULER_STALE_TRADE_DAYS:
+            out["stale"], out["stale_reason"] = True, "index_ahead"
+            return out
+    if out["lag_calendar_days"] > STORE_RULER_FROZEN_MAX_DAYS:
+        out["stale"], out["stale_reason"] = True, "frozen"
+    return out
 
 
 def store_pool_meta(asof: str | None = None) -> dict:
@@ -992,7 +1062,8 @@ def store_pool_meta(asof: str | None = None) -> dict:
             "fresh_after": fresh_after,
             "min_bars": STORE_MIN_BARS,
             "fresh_trade_days": STORE_FRESH_TRADE_DAYS,
-            "ruler_stale_trade_days": STORE_RULER_STALE_TRADE_DAYS}
+            "ruler_stale_trade_days": STORE_RULER_STALE_TRADE_DAYS,
+            "ruler_frozen_max_days": STORE_RULER_FROZEN_MAX_DAYS}
     meta.update(store_ruler_freshness(asof))
     return meta
 

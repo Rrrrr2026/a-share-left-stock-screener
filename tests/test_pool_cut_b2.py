@@ -13,8 +13,10 @@
     这里要保证"策略不做它"不被写成"库没覆盖它"。
   · **回滚开关严格取值**: ASHARE_POOL_BY_STORE 只认 0/1/true/false/on/off (大小写不敏感),
     别的值不当数但必须 log.warning —— 值班的人写了个无效值, 不许和写对了长得一样。
-  · **尺子自己有多旧**: 库末日落后当日应到交易日 >3 个交易日 -> 照裁, 但 scan_basis 降成
-    'store_universe_stale'。
+  · **尺子自己有多旧**: 个股末日落后**库自己的交易日历** >3 个交易日 (或整库 >20 自然日
+    一动不动) -> 照裁, 但 scan_basis 降成 'store_universe_stale'。判据**不看挂钟** ——
+    09-08 首版用挂钟工作日, 复现结果是每个国庆/春节连报三天假警并把那几天的 scan_basis
+    永久标成 stale (库停在末交易日是正确行为), 这里有一条专门的长假回归用例锁住。
   · **计数恒等式**: 纯 keep + gap + Σ dropped == 原池 (上一轮 absent 拆解 163+7+12 ≠ 177
     那种数字对不上, 不许再出现)。
 
@@ -182,6 +184,20 @@ def test_b_share_marked_out_of_scope_if_switch_off():
         (ds._store_pit_ctx, ds._store_status_map, ds._store_conn, ds.DATA_DIR) = saved
 
 
+def test_config_does_not_claim_a_market_wide_b_share_count():
+    """射程决定的理由里不许再写"在市 B 股只剩 7 只"—— 09-08 复检推翻: 那个 7 是空跑当天
+    恰好抓到的 9/90 个行业成分表里的 B 股数 (同法 09-04=2 / 09-03=4 / 08-28=19), 不是全市场数。
+    本仓根本拿不到权威数 (东财全A快照对 B 股恒 0 行, 库里也 0 行), 所以注释里只许写**下界**。
+    一个错的市场事实被写进 config 当决定依据, 以后翻档案的人会照抄 —— 用例锁住它。
+    """
+    src = open(cfgmod.__file__, encoding="utf-8").read()
+    i = src.find("在市 B 股只剩 7 只")
+    assert i < 0 or "错的" in src[i:i + 60], "这句话只能作为'首版写错了'的引用出现"
+    blk = src[src.find("---- 策略射程"):src.find('"exclude_b_share"')]
+    assert "下界" in blk, "B 股只数只能写成下界"
+    assert "60 只 distinct B 股代码" in blk, "写下界就要写清这 60 是从哪儿数出来的"
+
+
 # ---------------------------------------------------------------------------
 #  3. 回滚开关只认 6 个值
 # ---------------------------------------------------------------------------
@@ -233,7 +249,8 @@ def test_switch_warn_is_logged_not_swallowed():
 # ---------------------------------------------------------------------------
 #  4. 尺子自己有多旧
 # ---------------------------------------------------------------------------
-def test_weekday_lag_is_an_upper_bound():
+def test_weekday_and_calendar_lag_are_diagnostics_only():
+    """两个 lag 辅助函数的算术。**它们只是留痕字段, 不是判据** (见下面的长假回归)。"""
     w = ds._weekdays_between
     assert w("2026-09-08", "2026-09-08") == 0
     assert w("2026-09-07", "2026-09-08") == 1
@@ -241,23 +258,101 @@ def test_weekday_lag_is_an_upper_bound():
     assert w("2026-09-01", "2026-09-08") == 5            # 周末不算
     assert w("2026-09-08", "2026-09-07") == 0, "库比当日还新 (不该发生) 也不许算成负数"
     assert w(None, "2026-09-08") == 0 and w("x", "y") == 0, "日期坏掉时不许抛"
+    c = ds._calendar_days_between
+    assert c("2026-09-01", "2026-09-08") == 7
+    assert c("2026-09-08", "2026-09-01") == 0 and c(None, "x") == 0
 
 
-def test_store_ruler_freshness_and_stale_basis():
+class _TmpStore:
+    """一个只有 bars/idx_bars 两张表的临时价格库, 让尺子判据走**真 SQL** 而不是打桩。"""
+
+    def __init__(self, bars_max: str, idx_days: list):
+        self.dir = tempfile.mkdtemp(prefix="ruler_")
+        self.path = os.path.join(self.dir, "pricestore.db")
+        import sqlite3
+        conn = sqlite3.connect(self.path)
+        conn.execute("CREATE TABLE bars(code TEXT, d TEXT, c REAL)")
+        conn.execute("CREATE TABLE idx_bars(d TEXT PRIMARY KEY, c REAL)")
+        if bars_max:
+            conn.execute("INSERT INTO bars VALUES('600000',?,1.0)", (bars_max,))
+        conn.executemany("INSERT INTO idx_bars VALUES(?,1.0)", [(d,) for d in idx_days])
+        conn.commit()
+        conn.close()
+
+    def __enter__(self):
+        self.saved = ds._store_path                              # noqa: SLF001
+        ds._store_path = lambda: self.path                       # noqa: SLF001
+        ds._STORE_TLS.conn = None                                # noqa: SLF001
+        return self
+
+    def __exit__(self, *a):
+        conn = getattr(ds._STORE_TLS, "conn", None)              # noqa: SLF001
+        if conn is not None:
+            conn.close()
+        ds._store_path = self.saved                              # noqa: SLF001
+        ds._STORE_TLS.conn = None                                # noqa: SLF001
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+#: 2026 国庆前的末交易日 + 假期后真实开市的几个交易日 (用来演长假那出戏)。
+_SEP = ["2026-09-28", "2026-09-29", "2026-09-30"]
+_OCT = ["2026-10-09", "2026-10-12", "2026-10-13", "2026-10-14"]
+
+
+def test_ruler_does_not_cry_wolf_during_a_long_holiday():
+    """**09-08 复检的核心回归**: 国庆休市里库停在 09-30 是**正确行为**, 不许报 stale。
+
+    首版拿挂钟工作日当判据, 10-06/07/08 会连报三天"尺子自己旧了", 还把那三天的
+    scan_basis 永久写成 'store_universe_stale' —— 系统当时完全健康。
+    现在判据是"库自己的交易日历里比个股末日更晚的交易日数": 休市期间没有新交易日入库,
+    lag 恒 0。挂钟工作日照样算给人看 (10-08 已经 6 个), 但它不参与判定。
+    """
+    with _TmpStore("2026-09-30", _SEP):
+        for day, wd in (("2026-10-06", 4), ("2026-10-07", 5), ("2026-10-08", 6)):
+            f = ds.store_ruler_freshness(day)
+            assert f["lag_trade_days"] == 0, f
+            assert f["stale"] is False, f"{day} 假期里误报: {f}"
+            assert f["stale_reason"] == ""
+            assert f["lag_weekdays"] == wd, f          # 诊断字段照记, 只是不当判据
+            assert f["store_max_d"] == "2026-09-30" and f["idx_max_d"] == "2026-09-30"
+
+
+def test_ruler_fires_when_the_stock_leg_falls_behind_the_index_leg():
+    """市场照开而 `pricestore update` 连着几天没跑成: 指数腿往前走, 个股腿不动 -> 报。"""
+    with _TmpStore("2026-09-30", _SEP + _OCT[:3]):     # 指数腿多走 3 个交易日 = 到线不过线
+        f = ds.store_ruler_freshness("2026-10-13")
+        assert f["lag_trade_days"] == 3 and f["stale"] is False, f
+    with _TmpStore("2026-09-30", _SEP + _OCT):         # 多走 4 个 > 3
+        f = ds.store_ruler_freshness("2026-10-14")
+        assert f["lag_trade_days"] == 4, f
+        assert f["stale"] is True and f["stale_reason"] == "index_ahead", f
+    with _TmpStore("2026-10-14", _SEP + _OCT):         # 个股腿比指数腿还新: 不是 stale
+        f = ds.store_ruler_freshness("2026-10-15")
+        assert f["lag_trade_days"] == 0 and f["stale"] is False, f
+
+
+def test_ruler_frozen_fallback_when_both_legs_stop():
+    """两条腿一起冻住 (指数源也哑火): 交易日差恒 0, 只能靠自然日兜底, 且只在 >20 天后才响。"""
+    with _TmpStore("2026-09-30", _SEP):
+        f = ds.store_ruler_freshness("2026-10-20")     # 20 个自然日 = 到线不过线
+        assert f["lag_calendar_days"] == 20 and f["stale"] is False, f
+        f = ds.store_ruler_freshness("2026-10-21")     # 21 天 > 20
+        assert f["stale"] is True and f["stale_reason"] == "frozen", f
+    with _TmpStore("2026-09-30", []):                  # 老库: 根本没有 idx_bars 行
+        f = ds.store_ruler_freshness("2026-10-08")
+        assert f["idx_max_d"] is None and f["lag_trade_days"] is None, f
+        assert f["stale"] is False, "没日历就说不出'旧了', 不许瞎报"
+        assert ds.store_ruler_freshness("2026-10-25")["stale_reason"] == "frozen"
+
+
+def test_ruler_on_empty_store():
     saved = ds._store_max_date
     try:
-        ds._store_max_date = lambda: "2026-09-08"
-        f = ds.store_ruler_freshness("2026-09-08")
-        assert f == {"store_max_d": "2026-09-08", "asof": "2026-09-08",
-                     "lag_weekdays": 0, "stale": False}, f
-        ds._store_max_date = lambda: "2026-09-03"        # 落后 3 个工作日 = 还没到线
-        assert ds.store_ruler_freshness("2026-09-08")["lag_weekdays"] == 3
-        assert ds.store_ruler_freshness("2026-09-08")["stale"] is False
-        ds._store_max_date = lambda: "2026-09-01"        # 落后 5 个工作日 > 3
-        assert ds.store_ruler_freshness("2026-09-08")["stale"] is True
-        ds._store_max_date = lambda: None                # 库空: 判不了, 不许瞎报 stale
+        ds._store_max_date = lambda: None              # 库空: 判不了, 不许瞎报 stale
         assert ds.store_ruler_freshness("2026-09-08") == {
-            "store_max_d": None, "asof": "2026-09-08", "lag_weekdays": None, "stale": False}
+            "store_max_d": None, "idx_max_d": None, "asof": "2026-09-08",
+            "lag_trade_days": None, "lag_calendar_days": None, "lag_weekdays": None,
+            "stale": False, "stale_reason": ""}
     finally:
         ds._store_max_date = saved
 
@@ -281,8 +376,9 @@ def test_trim_marks_scan_basis_stale():
             {"dead": [{"code": c, "n_bars": 0, "last_bar": None, "status": "D"}
                       for c in [x[0] for x in uni][98:]]}, None, {})
         ds.store_ruler_freshness = lambda asof=None: {
-            "store_max_d": "2026-09-01", "asof": "2026-09-08",
-            "lag_weekdays": 5, "stale": True}
+            "store_max_d": "2026-09-01", "idx_max_d": "2026-09-08", "asof": "2026-09-08",
+            "lag_trade_days": 5, "lag_calendar_days": 7, "lag_weekdays": 5,
+            "stale": True, "stale_reason": "index_ahead"}
         with _Cap(rp.log) as cap:
             out, basis = rp.trim_universe_by_store(uni, "2026-09-08")
         assert len(out) == 98, "尺子旧不等于不裁"
@@ -291,6 +387,16 @@ def test_trim_marks_scan_basis_stale():
         rec = json.load(open(os.path.join(tmp, "pool_cut", "2026-09-08.json"),
                              encoding="utf-8"))
         assert rec["scan_basis"] == "store_universe_stale"
+        # 两条腿一起冻住是**另一种事故**, 值班要查的地方也不同 -> 必须是另一句话
+        ds.store_ruler_freshness = lambda asof=None: {
+            "store_max_d": "2026-08-10", "idx_max_d": "2026-08-10", "asof": "2026-09-08",
+            "lag_trade_days": 0, "lag_calendar_days": 29, "lag_weekdays": 21,
+            "stale": True, "stale_reason": "frozen"}
+        with _Cap(rp.log) as cap2:
+            _, basis2 = rp.trim_universe_by_store(uni, "2026-09-08")
+        assert basis2 == "store_universe_stale", basis2
+        assert any("整个库不动了" in m for m in cap2.msgs), cap2.msgs
+        assert not any("尺子自己旧了" in m for m in cap2.msgs), "两种事故不许共用一句话"
     finally:
         (ds.bars_from_store_on, ds.store_universe_filter, ds.store_pool_meta,
          ds.store_ruler_freshness, rp.DATA_DIR, CONFIG["tech"]["pool_by_store"],

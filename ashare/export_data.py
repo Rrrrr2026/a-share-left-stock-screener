@@ -224,7 +224,8 @@ def build_payload(run_date: str | None = None) -> dict:
             # 2026-09-08 起 n_scanned = **裁后**的数 (按价格库的点时股票池, 约 4,950), 不再是
             # 东财快照的 5,180 (那里面混着 196 只早已退市的老代码)。scan_basis/n_pool_raw 让
             # 前端和历史快照能分辨口径: 'store_universe' = 新口径, 'raw_spot'/缺失 = 老口径,
-            # 'store_universe_stale' = 新口径但**尺子旧了** (库末日落后当日 >3 个交易日)。
+            # 'store_universe_stale' = 新口径但**尺子旧了** (个股末日落后库自己的交易日历
+            # >3 个交易日, 或整库 >20 自然日不动 —— 判据不看挂钟, 长假不会误标)。
             "n_scanned": runlog.get("n_scanned"),
             "n_pool_raw": runlog.get("n_pool_raw"),
             "scan_basis": runlog.get("scan_basis") or "raw_spot",

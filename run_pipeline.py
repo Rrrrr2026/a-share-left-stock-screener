@@ -161,9 +161,11 @@ def trim_universe_by_store(universe, run_date):
     库/尺子出了问题, 原样放行不裁 —— 宁可多扫 200 只退市码, 也不能因为库没更新就把候选池清空。
 
     **scan_basis 三个取值**: 'raw_spot' (没裁/没能裁, 老口径) | 'store_universe' (按库裁了,
-    尺子也新鲜) | 'store_universe_stale' (按库裁了, **但库末日已经落后当日应到交易日 >3 个
-    交易日**) —— 第三个是 09-08 复检补的: 尺子自己旧了的时候, 裁出来的数字照样长得很正常,
-    不给它一个字段说真话, 就又是一次"产物还在、数字还在、没人知道它旧了"。
+    尺子也新鲜) | 'store_universe_stale' (按库裁了, **但个股末日已经落后库自己的交易日历 >3
+    个交易日**, 或整个库 >20 个自然日一动不动) —— 第三个是 09-08 复检补的: 尺子自己旧了的
+    时候, 裁出来的数字照样长得很正常, 不给它一个字段说真话, 就又是一次"产物还在、数字还在、
+    没人知道它旧了"。判据用**库自己的两条腿互比**而不是挂钟 (否则每个国庆/春节必连报假警),
+    详见 ds.store_ruler_freshness 的 docstring。
     """
     raw_n = len(universe)
     # 环境变量写了个不认识的值 (yes/no/拼错的) -> config 层已经把它忽略了, 这里必须响一声。
@@ -199,16 +201,27 @@ def trim_universe_by_store(universe, run_date):
         return universe, "raw_spot"
     kept = set(keep)
     out = [t for t in universe if t[0] in kept]
-    # 尺子自己有多旧: 库末日落后当日"应到交易日" >3 个交易日 -> 照裁, 但口径字段说真话。
+    # 尺子自己有多旧: 个股末日落后**库自己的交易日历** >3 个交易日 (或整库 >20 自然日不动)
+    # -> 照裁, 但口径字段说真话。两种情形的话术不同, 值班要查的地方也不同, 所以分开写。
     ruler = ds.store_ruler_freshness()
     basis = "store_universe"
     if ruler.get("stale"):
         basis = "store_universe_stale"
-        log.warning("候选池按库裁: **尺子自己旧了** —— 价格库末日 %s, 落后当日 %s 约 %s 个交易日"
-                    " (>%d)。本轮照裁, 但对外口径标 'store_universe_stale'; "
-                    "请查 `pricestore update` 是不是连着几天没跑成 (Tushare 未就绪守卫会就地停下)。",
-                    ruler.get("store_max_d"), ruler.get("asof"), ruler.get("lag_weekdays"),
-                    ds.STORE_RULER_STALE_TRADE_DAYS)
+        if ruler.get("stale_reason") == "frozen":
+            log.warning("候选池按库裁: **整个库不动了** —— 个股末日 %s / 指数末日 %s, 距当日 %s "
+                        "已 %s 个自然日 (>%d)。本轮照裁, 但对外口径标 'store_universe_stale'; "
+                        "两条腿一起停 = `pricestore update` 与指数补缺 (ingest_cache_to_"
+                        "pricestore.py) **同时**没跑成, 先查库文件是不是根本没被换过。",
+                        ruler.get("store_max_d"), ruler.get("idx_max_d"), ruler.get("asof"),
+                        ruler.get("lag_calendar_days"), ds.STORE_RULER_FROZEN_MAX_DAYS)
+        else:
+            log.warning("候选池按库裁: **尺子自己旧了** —— 个股末日 %s 落后库自己的交易日历"
+                        " (指数末日 %s) %s 个交易日 (>%d), 当日 %s。本轮照裁, 但对外口径标"
+                        " 'store_universe_stale'; 请查 `pricestore update` 是不是连着几天没跑成"
+                        " (Tushare 未就绪守卫会就地停下)。",
+                        ruler.get("store_max_d"), ruler.get("idx_max_d"),
+                        ruler.get("lag_trade_days"), ds.STORE_RULER_STALE_TRADE_DAYS,
+                        ruler.get("asof"))
     # gap = 留在池里、但库里一根 K 线都没有的票 (阶段A 会逐只回落联网)。平时 0 只, 涨起来
     # 就是"库漏了一批码"的第一现场 —— 所以哪怕它不被裁, 也必须有数、必须进日志。
     n_gap = len(kept_detail.get("gap") or [])
