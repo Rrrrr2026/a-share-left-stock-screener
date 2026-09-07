@@ -120,9 +120,233 @@ def news_titles(code: str) -> list:
         return []
 
 
+def _bars_source() -> str:
+    """A 股日线主源开关: CONFIG.source.bars ∈ {"fuyao"(默认/现状), "tushare"}。
+
+    **每次调用现读**, 不在导入期定死 —— 这样切源不用重启进程 (重建脚本/测试直接改
+    CONFIG 即可), 也保证 P1 期间生产默认值不被本模块的导入顺序意外改掉。
+    """
+    from .config import CONFIG
+    return str(CONFIG["source"].get("bars", "fuyao") or "fuyao").lower()
+
+
+def _tushare_on() -> bool:
+    try:
+        from . import tushare_client as tsc
+        return _bars_source() == "tushare" and tsc.available()
+    except Exception:       # noqa: BLE001
+        return False
+
+
+def _stock_ts(code: str) -> str:
+    """6 位代码 -> ts_code。**不能用 tushare_client.to_ts_code** —— 那个把 000001 特判成
+    沪深300 的 000001.SH (指数用), 个股 000001 是平安银行 (SZ)。"""
+    c = str(code).zfill(6)
+    if c[0] in ("6", "9"):
+        return f"{c}.SH"
+    if c[0] in ("4", "8"):
+        return f"{c}.BJ"
+    return f"{c}.SZ"
+
+
+def keep_a_code(ts_code: str) -> str | None:
+    """A 股主板/创业板/科创板过滤 -> 6 位代码; 不要的返回 None。
+    剔除: 北交所 (.BJ 或 8/4/920 前缀) 与 B 股 (900xxx.SH / 200xxx.SZ) —— 与 tech.exclude_bj
+    及 universe_codes 的 0/3/6 规则一致 (设计 §4)。"""
+    s = str(ts_code or "").strip().upper()
+    if not s:
+        return None
+    code, _, ex = s.partition(".")
+    code = code.zfill(6)
+    if len(code) != 6 or not code.isdigit():
+        return None
+    if ex == "BJ" or code[0] in ("4", "8") or code.startswith("920"):
+        return None
+    if code[0] not in ("0", "3", "6"):       # 900/200 B股、其他前缀一并剔除
+        return None
+    return code
+
+
+def _day_ymd(d: str) -> str:
+    """'2026-09-04' -> '20260904'。**禁止时区换算** (Tushare trade_date 是北京日历)。"""
+    return str(d).replace("-", "")[:8]
+
+
+def _iso(d8) -> str:
+    s = str(d8)[:10].replace("-", "")
+    return f"{s[:4]}-{s[4:6]}-{s[6:8]}" if len(s) == 8 else ""
+
+
+def fetch_bars_by_date(trade_date: str):
+    """某交易日**全市场原始日线** -> {code: (o,h,l,c,v股,amt元)}。
+
+    返回 None = 本路径未启用 (CONFIG.source.bars 不是 tushare, 或没配 token) —— pricestore
+    据此回退旧的逐股增量; 返回 {} = 启用了但当日无数据 (非交易日 / 源尚未入库)。
+    **单位** (设计 §P1): Tushare vol 单位手 ×100 = 股; amount 单位千元 ×1000 = 元。
+    """
+    if not _tushare_on():
+        return None
+    from . import tushare_client as tsc
+    df = tsc.query("daily", trade_date=_day_ymd(trade_date),
+                   fields="ts_code,trade_date,open,high,low,close,vol,amount")
+    return _rows_from_daily(df)
+
+
+def _rows_from_daily(df) -> dict:
+    out = {}
+    if df is None or len(df) == 0:
+        return out
+    need = {"ts_code", "open", "high", "low", "close", "vol"}
+    if not need <= set(df.columns):
+        log.warning("daily 返回缺列 %s", sorted(need - set(df.columns)))
+        return out
+    has_amt = "amount" in df.columns
+    for t in df.itertuples(index=False):
+        code = keep_a_code(t.ts_code)
+        if not code:
+            continue
+        try:
+            o, h, l, c = float(t.open), float(t.high), float(t.low), float(t.close)
+            v = float(t.vol) * 100.0                       # 手 -> 股
+            amt = float(t.amount) * 1000.0 if has_amt and t.amount is not None else None
+        except (TypeError, ValueError):
+            continue
+        if h < l or min(o, h, l, c) <= 0 or v < 0:
+            continue
+        out[code] = (o, h, l, c, v, amt)
+    return out
+
+
+def fetch_adj_by_date(trade_date: str):
+    """某交易日全市场复权因子 -> {code: factor}; None = 路径未启用。"""
+    if not _tushare_on():
+        return None
+    from . import tushare_client as tsc
+    df = tsc.query("adj_factor", trade_date=_day_ymd(trade_date),
+                   fields="ts_code,trade_date,adj_factor")
+    out = {}
+    if df is None or len(df) == 0 or "adj_factor" not in df.columns:
+        return out
+    for t in df.itertuples(index=False):
+        code = keep_a_code(t.ts_code)
+        if not code:
+            continue
+        try:
+            f = float(t.adj_factor)
+        except (TypeError, ValueError):
+            continue
+        if f > 0:
+            out[code] = f
+    return out
+
+
+def trading_days(start: str, end: str):
+    """开市日 ['YYYY-MM-DD', ...]; None = 路径未启用 (让 pricestore 回退旧增量)。"""
+    if not _tushare_on():
+        return None
+    from . import tushare_client as tsc
+    try:
+        return tsc.trade_cal(start, end)
+    except Exception as e:      # noqa: BLE001
+        log.warning("trade_cal 失败: %s", str(e)[:120])
+        return []
+
+
+def fetch_universe_rows(list_status: str = "L,D,P") -> list:
+    """全市场股票池 (含**退市**) -> [(code,name,list_date,delist_date,status), ...]。
+    status: L 上市 / D 退市 / P 暂停上市 (Tushare stock_basic 口径)。"""
+    if not _tushare_on():
+        return []
+    from . import tushare_client as tsc
+    rows, seen = [], set()
+    for st in [s.strip() for s in list_status.split(",") if s.strip()]:
+        try:
+            df = tsc.query("stock_basic", list_status=st,
+                           fields="ts_code,symbol,name,list_date,delist_date,list_status")
+        except Exception as e:      # noqa: BLE001
+            log.warning("stock_basic %s 失败: %s", st, str(e)[:120])
+            continue
+        if df is None or len(df) == 0:
+            continue
+        for t in df.itertuples(index=False):
+            code = keep_a_code(t.ts_code)
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            rows.append((code, str(getattr(t, "name", "") or ""),
+                         _iso(getattr(t, "list_date", "") or ""),
+                         _iso(getattr(t, "delist_date", "") or ""),
+                         str(getattr(t, "list_status", st) or st)))
+    return sorted(rows)
+
+
+def fetch_bars_bulk_tushare(codes: list, start: str) -> dict:
+    """逐股长历史 **前复权** 日线 (daily + adj_factor 各一次) -> {code: [(d,o,h,l,c,v),...]}。
+
+    给 pricestore 的旧 v1 钩子用 (backfill / 逐股补缺); 整库重建走
+    research/rebuild_a_pricestore_tushare.py 的按 trade_date 路线 (调用量少两个数量级)。
+    qfq 基准 = 该股窗口内最新因子, v 单位 = 股。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from . import tushare_client as tsc
+    s8, e8 = _day_ymd(start), dt.date.today().strftime("%Y%m%d")
+    skip_day = _drop_partial_today()
+
+    def one(code):
+        ts = _stock_ts(code)
+        try:
+            df = tsc.query("daily", ts_code=ts, start_date=s8, end_date=e8,
+                           fields="trade_date,open,high,low,close,vol")
+            fa = tsc.query("adj_factor", ts_code=ts, start_date=s8, end_date=e8,
+                           fields="trade_date,adj_factor")
+        except Exception as e:      # noqa: BLE001
+            log.debug("tushare 长历史 %s 失败: %s", code, str(e)[:100])
+            return code, None
+        if df is None or len(df) == 0:
+            return code, None
+        fac = {}
+        if fa is not None and len(fa) and "adj_factor" in fa.columns:
+            for t in fa.itertuples(index=False):
+                try:
+                    fac[_iso(t.trade_date)] = float(t.adj_factor)
+                except (TypeError, ValueError):
+                    continue
+        base = fac[max(fac)] if fac else 1.0
+        rows = []
+        for t in df.itertuples(index=False):
+            d1 = _iso(t.trade_date)
+            if not d1 or d1 < start or (skip_day and d1 >= skip_day):
+                continue
+            try:
+                o, h, l, c = float(t.open), float(t.high), float(t.low), float(t.close)
+                v = float(t.vol) * 100.0
+            except (TypeError, ValueError):
+                continue
+            if h < l or min(o, h, l, c) <= 0 or v < 0:
+                continue
+            k = fac.get(d1, base) / base if base else 1.0
+            rows.append((d1, o * k, h * k, l * k, c * k, v))
+        rows.sort()
+        return code, (rows if len(rows) >= 60 else None)
+
+    res = {}
+    with ThreadPoolExecutor(max_workers=4) as exe:      # 令牌桶在客户端里, 这里只控并发
+        for i, (code, rows) in enumerate(exe.map(one, codes), 1):
+            if rows:
+                res[code] = rows
+            if i % 200 == 0 or i == len(codes):
+                log.info("Tushare长历史进度 %d/%d (拿到 %d)", i, len(codes), len(res))
+    return res
+
+
 def fetch_bars_bulk(codes: list, start: str) -> dict:
-    """长历史日线(含成交量), 腾讯前复权, 按 ~700 自然日分页拼接 (单请求上限640根)。
-    -> {code: [(d,o,h,l,c,v), ...]} 升序; 盘中丢当日未走完bar。"""
+    """长历史日线(含成交量)。**源由 CONFIG.source.bars 决定** (默认 fuyao 之外的历史行为
+    = 腾讯; 设为 "tushare" 才走 Tushare) —— P1 期间生产默认值不动。
+    -> {code: [(d,o,h,l,c,v), ...]} 升序; 盘中丢当日未走完bar。
+
+    以下为腾讯实现: 前复权, 按 ~700 自然日分页拼接 (单请求上限640根)。"""
+    if _tushare_on():
+        return fetch_bars_bulk_tushare(codes, start)
     from concurrent.futures import ThreadPoolExecutor
     from . import datasource as ds
     skip_day = _drop_partial_today()
@@ -398,7 +622,16 @@ def fetch_bars_bulk_fuyao(codes: list, start: str) -> dict:
 
 
 def universe_codes() -> list:
-    """全A代码 (主板/创业板/科创板: 0/3/6 前缀; 剔除北交所)。"""
+    """全A**在市**代码 (主板/创业板/科创板: 0/3/6 前缀; 剔除北交所与B股)。
+
+    源由 CONFIG.source.bars 决定: "tushare" -> stock_basic(list_status=L) (稳定, 不会像
+    东财 push2 那样被截断成 1086 行); 否则沿用东财快照。退市股不在这里 —— 点时股票池请用
+    pricestore.universe_at(date)。"""
+    if _tushare_on():
+        rows = fetch_universe_rows("L")
+        if rows:
+            return sorted({r[0] for r in rows})
+        log.warning("universe_codes: Tushare stock_basic 返回空, 回退东财快照")
     from . import datasource as ds
     spot = ds.fetch_spot_snapshot()
     if spot is None or spot.empty:
@@ -421,5 +654,8 @@ MARKET = set_market(Market(
     news_titles=news_titles, news_keywords=NEWS_KEYWORDS,
     fetch_bars_bulk=fetch_bars_bulk, fetch_index_bars=fetch_index_bars,
     universe_codes=universe_codes,
+    # schema v2 按日增量钩子 (未启用时各自返回 None -> pricestore 自动回退旧路径)
+    fetch_bars_by_date=fetch_bars_by_date, fetch_adj_by_date=fetch_adj_by_date,
+    trading_days=trading_days, fetch_universe_rows=fetch_universe_rows,
     log_prefix="ashare",
 ))
