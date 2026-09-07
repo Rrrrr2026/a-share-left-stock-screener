@@ -171,16 +171,69 @@ def fetch_bars_bulk(codes: list, start: str) -> dict:
     return res
 
 
+def _index_bars_tushare(sym: str, start: str, skip_day: str | None) -> list:
+    """Tushare index_daily 一次拉全段 -> [(d,o,h,l,c,v), ...] 升序 (无分页, 单次 8000 行足够 10 年)。
+
+    **单位**: Tushare 指数 vol 就是 "手", 与库内 idx_bars (腾讯/东财口径) 一致 ——
+    2026-09-07 实测 000300.SH 2026-09-04: OHLC 与服务器库内逐字相等, vol 比 1.0000。
+    所以这里不做任何换算; 若日后换指数发现比值 ≠1, ingest_cache_to_pricestore 的
+    10 次幂校准守卫会拦住 (它只放行 10 的整数次幂), 但本函数直写库, 故此处留此实测记录。
+    """
+    from . import tushare_client as tsc
+    df = tsc.index_daily(sym, start, dt.date.today())
+    if df is None or len(df) == 0:
+        return []
+    cols = set(df.columns)
+    need = {"trade_date", "open", "high", "low", "close", "vol"}
+    if not need <= cols:
+        log.warning("基准指数 %s: Tushare 返回缺列 %s, 放弃", sym, sorted(need - cols))
+        return []
+    rows = []
+    for t in df.itertuples(index=False):
+        s8 = str(t.trade_date)[:10].replace("-", "")
+        if len(s8) != 8:
+            continue
+        d1 = f"{s8[:4]}-{s8[4:6]}-{s8[6:]}"
+        if d1 < start or (skip_day and d1 >= skip_day):
+            continue
+        try:
+            o, h, l, c, v = (float(t.open), float(t.high), float(t.low),
+                             float(t.close), float(t.vol))
+        except (TypeError, ValueError):
+            continue
+        if h < l or min(o, h, l, c) <= 0 or v < 0:
+            continue
+        rows.append((d1, o, h, l, c, v))
+    rows.sort()
+    return rows
+
+
 def fetch_index_bars(start: str) -> list:
     """沪深300 (sh000300) 长历史日线 -> [(d,o,h,l,c,v), ...]。
-    三源顺序: 腾讯 -> 东财直连 -> 新浪 (每页失败才降级, 失败原因进日志, 每源根数进日志)。
-    2026-09-03 教训: 单源静默 `except: kl = []` 让指数表卡在 09-01 四天无人知, lab 连败。
-    三源口径已对齐 (成交量 "手", 见 datasource._em_index_chunk/_sina_index_chunk)。"""
+    源顺序: **Tushare (有 token 时的主源)** -> 腾讯 -> 东财直连 -> 新浪
+    (每页失败才降级, 失败原因进日志, 每源根数进日志)。
+    2026-09-03 教训: 单源静默 `except: kl = []` 让指数表卡在 09-01 四天无人知, lab 连败;
+    2026-09-06/07 改造: 腾讯/东财/新浪三个免费源同时不给指数的日子越来越多, 买了 Tushare
+    就让它当主源, 三个免费源退为兜底 (口径一致: 成交量均为 "手")。"""
     from . import datasource as ds
     from .config import CONFIG
     sym = CONFIG["source"].get("benchmark_index", "sh000300")
     sources = (("腾讯", ds._tencent_chunk), ("东财", ds._em_index_chunk), ("新浪", ds._sina_index_chunk))
     skip_day = _drop_partial_today()
+    try:
+        from . import tushare_client as tsc
+        if tsc.available():
+            rows = _index_bars_tushare(sym, start, skip_day)
+            if rows:
+                log.info("基准指数 %s: Tushare %d 根 (%s..%s)", sym, len(rows),
+                         rows[0][0], rows[-1][0])
+                return rows
+            log.warning("基准指数 %s: Tushare 主源返回 0 根, 回退 腾讯/东财/新浪", sym)
+        else:
+            log.info("基准指数 %s: 未配 tushare_token, 走 腾讯/东财/新浪", sym)
+    except Exception as e:      # noqa: BLE001  (Tushare 挂了不能拖垮指数表 — 还有三个兜底源)
+        log.warning("基准指数 %s: Tushare 主源失败 (%s), 回退 腾讯/东财/新浪",
+                    sym, str(e)[:150])
     today = dt.date.today()
     d0 = dt.date.fromisoformat(start)
     rows, seen = [], set()

@@ -10,6 +10,9 @@ fuyao 请求, 与 14:00 流水线的 ~5200 次共享同一配额, 晚间必然�
 用法: 流水线跑完后执行 (run_a.sh 已接线); 幂等, 可重复跑。
 2026-09-06 追加: 基准指数也从流水线的 bench 缓存补进 idx_bars (只填库里没有的日期; 成交量按
 与库内重叠日的比值校准到库内 "手" 口径 — 东财 = 腾讯, 新浪 = 100 倍股; 收盘对不上则拒绝)。
+2026-09-07 追加: bench 缓存补不上时再走 fill_index_gaps —— 直接问 market.fetch_index_bars
+(主源已改 Tushare)。lab 改 --no-update 之后, 服务器上再没有第二处会更新指数表, 而三个免费
+指数源同时哑火已成常态; 这一步是指数表日更的最后一道 (同款收盘/口径守卫, 失败非致命)。
 """
 import datetime as dt
 import math
@@ -93,6 +96,61 @@ def ingest_index(conn, df, cutoff: str) -> int:
     return len(rows)
 
 
+def fill_index_gaps(conn) -> int:
+    """bench 缓存补不上时的第二道: 直接问 market.fetch_index_bars (2026-09-07 起主源 = Tushare)。
+
+    为什么需要它: lab 已改 --no-update, 服务器上再没有别的地方调 fetch_index_bars —— 指数表
+    的日更全靠流水线的 bench 缓存, 而 bench 走的是 腾讯/东财/新浪 (09-01 起屡屡同时哑火,
+    指数卡 09-01 直接让 lab 连败 5 天)。守卫与 ingest_index 同款: 重叠日收盘 0.3% 容差 +
+    成交量比必须 ≈1 (Tushare 指数 vol 就是"手", 与库内口径一致, 09-04 实测比值 1.0000)。
+    """
+    # 只拿最近 12 根做参照: 库内 idx_bars 的成交量口径在 2026-08-24 有个历史断点 (之前是"股",
+    # 之后是"手" — 09-07 数据线实测, 无任何消费者读指数量, 故未回改历史)。窗口太长会把断点
+    # 两侧混进比值; 12 根足够 (>=3 个可比日即可判口径), 且中位数对残留的异常值免疫。
+    ref = {r[0]: r for r in conn.execute("SELECT d,o,h,l,c,v FROM idx_bars ORDER BY d DESC LIMIT 12")}
+    if not ref:
+        print("指数补缺: 库内 idx_bars 为空, 无参照不灌")
+        return 0
+    from ashare import market
+    start = min(ref)
+    rows = market.fetch_index_bars(start)
+    if not rows:
+        print("指数补缺: 所有源都没给出指数长历史, 放弃 (指数表将停在库内末日)")
+        return 0
+    ratios = []
+    for d, o, h, l, c, v in rows:
+        r = ref.get(d)
+        if not r:
+            continue
+        if r[4] and r[4] > 0 and abs(c / r[4] - 1) > IDX_CLOSE_TOL:
+            print(f"指数补缺: {d} 收盘 {c} vs 库内 {r[4]} 对不上, 拒绝灌库")
+            return 0
+        if r[5] and r[5] > 0 and v > 0:
+            ratios.append(v / r[5])
+    if len(ratios) < 3:
+        print(f"指数补缺: 可比重叠日仅 {len(ratios)} 天 (<3), 无法确认成交量口径, 跳过")
+        return 0
+    med = statistics.median(ratios)
+    if abs(med - 1) > 0.1:
+        print(f"指数补缺: 成交量口径不符 (中位比值 {med:.4g}, 应 ≈1), 拒绝灌库")
+        return 0
+    if max(ratios) / min(ratios) > 10:
+        print(f"指数补缺: 注意 — 库内参照窗口内成交量口径不一致 (比值 {min(ratios):.4g}..{max(ratios):.4g}), "
+              f"按中位 {med:.4f} 判定为一致并继续")
+    have = {r[0] for r in conn.execute("SELECT d FROM idx_bars")}
+    skip_day = _partial_today()
+    new = [(d, o, h, l, c, v) for d, o, h, l, c, v in rows
+           if d not in have and d >= start and not (skip_day and d >= skip_day)
+           and h >= l and min(o, h, l, c) > 0]
+    if not new:
+        print(f"指数补缺: 库内 idx_bars 已到 {max(ref)}, 无缺日")
+        return 0
+    conn.executemany("INSERT OR REPLACE INTO idx_bars(d,o,h,l,c,v) VALUES(?,?,?,?,?,?)", new)
+    conn.commit()
+    print(f"指数补缺灌库: +{len(new)} 根 ({new[0][0]}..{new[-1][0]}), 重叠日收盘对齐, 量比 {med:.4f}")
+    return len(new)
+
+
 def main():
     if not os.path.exists(DB):
         print("pricestore.db 不存在, 跳过")
@@ -137,7 +195,8 @@ def main():
     print(f"缓存灌库: 成功 {n_ok} / 无缓存 {n_miss} / 单位存疑跳过 {n_unit}; "
           f"今日({today})bar覆盖 {n_today}/{len(codes)}")
     try:
-        ingest_index(conn, load_bench_cache(), cutoff)
+        if ingest_index(conn, load_bench_cache(), cutoff) == 0:
+            fill_index_gaps(conn)               # 缓存补不上 -> 直接问 Tushare (主源)
     except Exception as e:  # noqa: BLE001  指数补缺失败不影响个股灌库结果
         print(f"指数缓存灌库异常 (非致命): {e!r}")
     idx_max = conn.execute("SELECT MAX(d) FROM idx_bars").fetchone()[0]
