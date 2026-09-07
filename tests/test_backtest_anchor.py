@@ -233,13 +233,19 @@ def test_default_is_off_until_boss_signs_off():
 def test_demo_seed_snapshot_excluded_from_replay():
     """演示种子快照 (合成价) 不许进回放样本, 但**真快照一份都不许误伤**。
 
-    背景: 2026-09-08 把 day_2026-07-01.json 的 data_date 按价格证据改成 06-30 之后, 它与
-    演示种子 day_2026-06-30.json 撞同一个 as_of; 按文件名排序种子在前, 会在 build_and_run
-    的"同一 (code, as_of) 先到先得"里把 200 条真候选顶掉。"""
+    为什么排除 (2026-09-08 实测, 首版这里的理由是编的): 种子 day_2026-06-30.json 借用了
+    **真实存在的股票代码** (600111 等) 配假名字假价格 —— 放回样本重跑 build_and_run 会多出
+    6 笔纯合成价造的假事件, 其中 600111 那笔的 busy_until 冷却又挡掉 1 笔真信号
+    (600111 @ 2026-07-07)。首版写的"与 day_2026-07-01 撞 as_of, 会在'同一 (code, as_of)
+    先到先得'里把 200 条真候选顶掉"两处都不成立: build_and_run 没有按 (code, as_of) 去重,
+    只有按代码的事件冷却; 且种子的 14 个代码与 07-01 那份的 200 个代码交集为空。"""
     real = [{"code": "600000", "name": "浦发银行", "price": 10.0}]
     demo = [{"code": "600111", "name": "演示半导A", "price": 63.46},
             {"code": "300222", "name": "演示半导B", "price": 24.27}]
-    # ① 已知的种子文件名 (按市场; 当前 Market 是 ashare)
+    # ① 已知的种子文件名 (按市场; 当前 Market 是 ashare)。**必须用真候选来考这一条** ——
+    #    拿 demo 候选考等于同时命中判据③, 白名单这条路根本没被单独验到 (09-08 校验实证:
+    #    把 DEMO_SNAPSHOT_FILES 清空, 首版那 7 条断言一条都不挂)。
+    assert bt.is_demo_snapshot("x/day_2026-06-30.json", {}, real) is True
     assert bt.is_demo_snapshot("x/day_2026-06-30.json", {}, demo) is True
     # ② meta 显式标记 (以后新造种子请打这个标) —— 文件名不在白名单里也要认
     for key in ("demo", "seed", "demo_seed"):
@@ -252,6 +258,70 @@ def test_demo_seed_snapshot_excluded_from_replay():
     assert bt.is_demo_snapshot("x/day_2026-01-05.json", {}, []) is False
     # 美股侧白名单是空的: 同名文件在美股仓不许被当成种子误删
     assert bt.DEMO_SNAPSHOT_FILES["us"] == set()
+
+
+def test_demo_whitelist_is_load_bearing():
+    """把白名单删空, 上面那条断言必须变红 —— 否则"三条判据"只是写在注释里。
+
+    这是判据①的**存在性**证明: 真候选 + 种子文件名的组合只能靠白名单判 True, 兜底判据
+    (候选名全以"演示"开头) 对真候选是 False。"""
+    saved = dict(bt.DEMO_SNAPSHOT_FILES)
+    try:
+        bt.DEMO_SNAPSHOT_FILES = {"ashare": set(), "us": set()}
+        real = [{"code": "600000", "name": "浦发银行", "price": 10.0}]
+        assert bt.is_demo_snapshot("x/day_2026-06-30.json", {}, real) is False
+    finally:
+        bt.DEMO_SNAPSHOT_FILES = saved
+    assert bt.is_demo_snapshot(
+        "x/day_2026-06-30.json", {}, [{"code": "600000", "name": "浦发银行"}]) is True
+
+
+def test_snapshot_data_date_fix_table():
+    """标注日修正表: 只在读到"已知错值"时改, 已修正的副本是 no-op, 第三种值不许静默套。"""
+    f24 = "d/day_2026-08-24.json"
+    got, note, applied = bt.corrected_data_date(f24, "2026-08-21")
+    assert (got, applied) == ("2026-08-24", True) and "2026-08-24" in note
+    # 文件里已经是修正后的值 (PC / GitHub Pages 那份) -> 原样返回, 不重复报
+    assert bt.corrected_data_date(f24, "2026-08-24") == ("2026-08-24", None, False)
+    # 第三种值 = 文件被别人动过 -> 不改, 但必须给出说明 (调用方打 warning)
+    got, note, applied = bt.corrected_data_date(f24, "2026-08-19")
+    assert (got, applied) == ("2026-08-19", False) and note
+    # 表外的文件一律不碰
+    assert bt.corrected_data_date("d/day_2026-09-07.json", "2026-09-07") == (
+        "2026-09-07", None, False)
+    assert bt.corrected_data_date("d/day_2026-07-01.json", "2026-07-01")[0] == "2026-06-30"
+
+
+def test_load_snapshots_applies_data_date_fix_on_stale_copy():
+    """**生产落地的那条断言**: 磁盘上还是错值的那份副本, 经 load_snapshots 出来必须已修正。
+
+    背景 (09-08 校验): 修正只写进文件到不了服务器 —— 回放读的 dashboard/history 是运行时
+    目录 (gitignore), 服务器只靠 run_a.sh 的 `rsync -a --ignore-existing docs/history/
+    dashboard/history/` 回种, 而 --ignore-existing 对已存在的文件一个字节都不写。所以修正
+    必须走代码 (跟着 git reset 到位), 这条用例锁的就是这一点。"""
+    import glob as _glob
+    import json as _json
+    d = tempfile.mkdtemp(prefix="snapfix_")
+    hist = os.path.join(d, "history")
+    os.makedirs(hist)
+    cands = [{"code": "600000", "name": "浦发银行", "price": 10.0}]
+    for fn, dd in (("day_2026-08-24.json", "2026-08-21"),      # 未修正的陈旧副本
+                   ("day_2026-09-07.json", "2026-09-07")):     # 对照: 表外文件
+        with open(os.path.join(hist, fn), "w", encoding="utf-8") as f:
+            _json.dump({"meta": {"run_date": fn[4:14], "data_date": dd},
+                        "candidates": cands}, f, ensure_ascii=False)
+    saved = bt._paths
+    try:
+        bt._paths = lambda: (hist, os.path.join(d, "a.js"), os.path.join(d, "a.json"))
+        snaps = bt.load_snapshots()
+    finally:
+        bt._paths = saved
+    got = {s["run_date"]: s["as_of"] for s in snaps}
+    assert got == {"2026-08-24": "2026-08-24", "2026-09-07": "2026-09-07"}, got
+    # 文件本身一个字节都没被改 —— 修正只发生在装载处
+    with open(os.path.join(hist, "day_2026-08-24.json"), encoding="utf-8") as f:
+        assert _json.load(f)["meta"]["data_date"] == "2026-08-21"
+    assert len(_glob.glob(os.path.join(hist, "*.json"))) == 2
 
 
 def test_market_hook_signature_is_backward_compatible():
@@ -273,6 +343,9 @@ TESTS = [test_anchor_uses_raw_not_qfq, test_anchor_closes_tolerates_nan,
          test_unknown_code_falls_back_not_treated_as_delisted,
          test_store_stale_falls_back_whole_batch, test_switch_off_disables_store_path,
          test_demo_seed_snapshot_excluded_from_replay,
+         test_demo_whitelist_is_load_bearing,
+         test_snapshot_data_date_fix_table,
+         test_load_snapshots_applies_data_date_fix_on_stale_copy,
          test_market_hook_signature_is_backward_compatible]
 
 
