@@ -218,12 +218,40 @@ def test_switch_off_disables_store_path():
 
 
 def test_default_is_off_until_boss_signs_off():
-    """默认必须是**关**: 重放 win10 +0.9pp 超过卡上 0.5pp 验收线, 差异已归因为"旧口径锚错bar"
-    的修正, 但改动对外公布的胜率要老板拍板。谁把默认翻成开, 就要连这条断言一起改 ——
+    """默认必须是**关**。2026-09-08 按 GM 预登记的三条裁决规则复验后仍然关:
+    (a) anchor 门 pass (raw exact 99.97%, 干净样本占比 100%) —— 过;
+    (b) "新口径更差" 必须 = 0, 实测 **1 笔** (600061 除权日快照存的是除权后昨收) —— 不过;
+    (c) pool 级最差 |Δ| 必须 ≤ 0.5pp, 实测 **0.9pp** (win10 52.3%→53.2%) —— 不过。
+    那 0.9pp 里 94/95 笔是把入场日从"早 1..6 根 bar"拨回正确的那根, **是修正不是回归**,
+    但它改动对外公布的胜率, 按规则不许执行者自己开。谁把默认翻成开, 就要连这条断言一起改 ——
     这份摩擦是故意的 (与 test_pricestore_v2.test_source_switch_default 同一套路)。"""
     if os.environ.get("ASHARE_BACKTEST_PRICES_FROM_STORE"):
         return                                                   # 环境显式指定时不判
     assert CONFIG["source"]["backtest_prices_from_store"] is False
+
+
+def test_demo_seed_snapshot_excluded_from_replay():
+    """演示种子快照 (合成价) 不许进回放样本, 但**真快照一份都不许误伤**。
+
+    背景: 2026-09-08 把 day_2026-07-01.json 的 data_date 按价格证据改成 06-30 之后, 它与
+    演示种子 day_2026-06-30.json 撞同一个 as_of; 按文件名排序种子在前, 会在 build_and_run
+    的"同一 (code, as_of) 先到先得"里把 200 条真候选顶掉。"""
+    real = [{"code": "600000", "name": "浦发银行", "price": 10.0}]
+    demo = [{"code": "600111", "name": "演示半导A", "price": 63.46},
+            {"code": "300222", "name": "演示半导B", "price": 24.27}]
+    # ① 已知的种子文件名 (按市场; 当前 Market 是 ashare)
+    assert bt.is_demo_snapshot("x/day_2026-06-30.json", {}, demo) is True
+    # ② meta 显式标记 (以后新造种子请打这个标) —— 文件名不在白名单里也要认
+    for key in ("demo", "seed", "demo_seed"):
+        assert bt.is_demo_snapshot("x/day_2026-01-05.json", {key: True}, real) is True
+    # ③ 兜底: 候选名全部以"演示"开头
+    assert bt.is_demo_snapshot("x/day_2026-01-05.json", {}, demo) is True
+    # 真快照一律 False —— 包括与种子同名日期但内容是真的、以及混进一条演示名的
+    assert bt.is_demo_snapshot("x/day_2026-09-07.json", {}, real) is False
+    assert bt.is_demo_snapshot("x/day_2026-01-05.json", {}, real + demo) is False
+    assert bt.is_demo_snapshot("x/day_2026-01-05.json", {}, []) is False
+    # 美股侧白名单是空的: 同名文件在美股仓不许被当成种子误删
+    assert bt.DEMO_SNAPSHOT_FILES["us"] == set()
 
 
 def test_market_hook_signature_is_backward_compatible():
@@ -244,6 +272,7 @@ TESTS = [test_anchor_uses_raw_not_qfq, test_anchor_closes_tolerates_nan,
          test_return_across_ex_div_uses_qfq, test_store_hit_and_per_code_fallback,
          test_unknown_code_falls_back_not_treated_as_delisted,
          test_store_stale_falls_back_whole_batch, test_switch_off_disables_store_path,
+         test_demo_seed_snapshot_excluded_from_replay,
          test_market_hook_signature_is_backward_compatible]
 
 
