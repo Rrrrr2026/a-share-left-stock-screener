@@ -660,6 +660,8 @@ _store_stat = {"hit": 0, "fallback": 0, "skipped": 0}
 _store_stat_lock = threading.Lock()
 _store_status: dict | None = None
 _store_status_lock = threading.Lock()
+_store_pit: tuple | None = None          # (点时股票池 set|None, 新鲜度截止日 str|None)
+_store_pit_lock = threading.Lock()
 
 #: 阶段A 从库里取多长的历史。**刻意不是 CONFIG.fetch.lookback_days(500)**: 换库前阶段A 的主源是
 #: `fuyao.hist(code, years=2.5)` —— 它无视 lookback_days, 一律给 2.5 年 (≈607 根)。module2 的
@@ -668,6 +670,23 @@ _store_status_lock = threading.Lock()
 #: (13.8%) 的 tech_score 不同 (中位差 0.95 分, dip/coil 桶不受影响) —— 那是**窗口**造成的差异,
 #: 不是换源造成的。换库这一步只该换数据来源, 不该顺手改扫描窗口, 所以这里对齐 fuyao 的 2.5 年。
 STORE_HIST_DAYS = 913               # ≈ fuyao years=2.5 的等效自然日数
+
+#: 库判"这只票能不能扫"的两个阈值 —— 候选池裁剪与 fetch_hist 判无数据**共用**这一份口径。
+#: · MIN_BARS: module2 起步就要 60 根 (再往下 MA60/通道拟合都算不出来), 库里不足 60 根的票
+#:   联网也凑不出来 (它的历史本来就这么短), 扫它只是白占分母;
+#: · FRESH_TRADE_DAYS: 最后一根 bar 允许落后几个**交易日**。用于"库里有 K 线但 universe 表
+#:   没有这一行"的票 (09-07 实测 3 只改过代码的: 000022/000043/300114) —— 在市证据以 K 线为准,
+#:   但必须是**新鲜的** K 线, 否则刚退市的票会靠一段陈年 K 线赖在池里。
+STORE_MIN_BARS = 60
+STORE_FRESH_TRADE_DAYS = 10
+
+#: 裁剪原因 -> 中文标签 (日志与留痕 json 共用)
+STORE_DROP_REASON_CN = {
+    "absent": "退市/不在池(库内无此码)",
+    "stale": "退市/长停(有K线但已过期)",
+    "too_new": f"次新<{STORE_MIN_BARS}根",
+    "gap": "在池但库内无K线",
+}
 
 
 def _store_path() -> str:
@@ -719,15 +738,8 @@ def _hist_from_store(code: str, days: int, min_bars: int = 60) -> pd.DataFrame |
     return _finalize_hist(df)
 
 
-def _store_bars_count(code: str, days: int) -> int:
-    """窗口内库里有几根 bar。0 = 库里根本没有这只票 (真缺口, 值得回落联网);
-    1..59 = 这票的历史本来就这么短 (次新股) —— 联网也凑不出 module2 要的 255 根, 别白跑。"""
-    start = (dt.date.today() - dt.timedelta(days=int(days))).isoformat()
-    try:
-        return int(_store_conn().execute(
-            "SELECT COUNT(*) FROM bars WHERE code=? AND d>=?", (code, start)).fetchone()[0])
-    except Exception:                                          # noqa: BLE001
-        return 0
+# (09-08: 原 _store_bars_count 已并入 _store_probe_one —— bar 数与最后一根日期一次查完,
+#  判定统一走 store_verdict, 免得裁池与判无数据各写一份口径。)
 
 
 def _store_status_map() -> dict:
@@ -750,6 +762,138 @@ def _store_status_map() -> dict:
                                 str(e)[:120])
                     _store_status = {}
     return _store_status
+
+
+def _store_trade_day_back(n: int) -> str | None:
+    """库自己的交易日历往回数 n 个交易日的日期 (含当日为第 1 个)。
+
+    日历取 `idx_bars` (基准指数逐日收盘, d 是主键, 取末 n 行是毫秒级)。**刻意不用挂钟日期**:
+    库若某天没更新 (Tushare 未就绪守卫会就地停下), 用挂钟算出来的"10 天窗口"会把整池的
+    last_bar 都判成过期 —— 一次数据延迟就把候选池清空, 那是最坏的失败方式。
+    """
+    try:
+        rows = [r[0] for r in _store_conn().execute(
+            "SELECT d FROM idx_bars ORDER BY d DESC LIMIT ?", (int(n),))]
+    except Exception:                                          # noqa: BLE001
+        rows = []
+    if len(rows) >= int(n):
+        return rows[-1]
+    try:                                    # idx_bars 空 (老库/没灌指数): 退回个股末日 - 宽限
+        last = _store_conn().execute("SELECT MAX(d) FROM bars").fetchone()[0]
+    except Exception:                                          # noqa: BLE001
+        return None
+    if not last:
+        return None
+    return (dt.date.fromisoformat(str(last)[:10]) - dt.timedelta(days=int(n) * 2)).isoformat()
+
+
+def _store_pit_ctx() -> tuple:
+    """(今日点时股票池 set | None, 新鲜度截止日 str | None) —— 进程内算一次。
+
+    股票池直接用 `leftside_core.pricestore.universe_at` (未退市 + 已上市 + 首根 bar 已到),
+    **不在这里重写一遍判据**: 九年重放、验收门 8 和这里必须是同一个函数, 否则口径又要分叉。
+    传自己的只读连接进去, 避免 pricestore._conn() 的读写连接 + 建表 DDL 抢 WAL 锁。
+    读不出来 (universe 表空 / 老库) 返回 (None, ...) = **不判**, 调用方一律按"在市"处理。
+    """
+    global _store_pit
+    if _store_pit is None:
+        with _store_pit_lock:
+            if _store_pit is None:
+                uni = None
+                try:
+                    from leftside_core import pricestore as _ps
+                    codes = _ps.universe_at(dt.date.today().isoformat(), conn=_store_conn())
+                    uni = set(codes) if codes else None
+                except Exception as e:                         # noqa: BLE001
+                    log.warning("价格库点时股票池读取失败 (不裁池, 一律按在市处理): %s",
+                                str(e)[:160])
+                _store_pit = (uni, _store_trade_day_back(STORE_FRESH_TRADE_DAYS))
+    return _store_pit
+
+
+def store_verdict(n_bars: int, last_bar: str | None, in_universe: bool,
+                  fresh_after: str | None, min_bars: int = STORE_MIN_BARS) -> str:
+    """库对一只票的裁决 —— **纯函数, 无 I/O, 可离线单测**; 候选池裁剪与 fetch_hist 共用。
+
+    · keep     : 够 60 根, 且 (在点时股票池里 **或** 最后一根 bar 还新鲜) —— 可以扫;
+    · stale    : 够 60 根, 但既不在池、最后一根也过期 —— 退市/长停, 别扫;
+    · too_new  : 库内 1..59 根 —— 次新股, 联网也凑不出 module2 要的根数;
+    · gap      : 一根都没有但在池里 —— 真缺口 (fetch_hist 据此回落联网);
+    · absent   : 一根都没有也不在池 —— 东财快照的历史遗留退市码 (09-07 实测 196 只)。
+
+    "在市证据以 K 线为准" 那一条 (in_universe=False 但 bar 新鲜也 keep) 是为库里有 K 线、
+    universe 表却没有对应行的票留的口子 —— 09-07 实测 3 只改过代码的 (000022/000043/300114)。
+    """
+    if n_bars >= int(min_bars):
+        if in_universe or (last_bar and fresh_after and str(last_bar) >= str(fresh_after)):
+            return "keep"
+        return "stale"
+    if n_bars > 0:
+        return "too_new"
+    return "gap" if in_universe else "absent"
+
+
+def _store_probe_one(code: str, days: int) -> tuple:
+    """单只票: (窗口内 bar 数, 最后一根 bar 日期)。fetch_hist 的漏网路径用 (只查一只)。"""
+    start = (dt.date.today() - dt.timedelta(days=int(days))).isoformat()
+    try:
+        r = _store_conn().execute(
+            "SELECT COUNT(*), MAX(d) FROM bars WHERE code=? AND d>=?", (code, start)).fetchone()
+        return (int(r[0] or 0), r[1])
+    except Exception:                                          # noqa: BLE001
+        return (0, None)
+
+
+def _store_verdict_one(code: str, days: int) -> str:
+    uni, fresh_after = _store_pit_ctx()
+    n, last = _store_probe_one(code, days)
+    return store_verdict(n, last, uni is None or code in uni, fresh_after)
+
+
+def store_pool_meta() -> dict:
+    """裁池口径的留痕 (写进 data/pool_cut/*.json, 供事后核对是按什么尺子裁的)。"""
+    uni, fresh_after = _store_pit_ctx()
+    return {"n_universe": (len(uni) if uni is not None else None),
+            "fresh_after": fresh_after,
+            "min_bars": STORE_MIN_BARS,
+            "fresh_trade_days": STORE_FRESH_TRADE_DAYS}
+
+
+def store_universe_filter(codes, days: int | None = None) -> tuple:
+    """候选池 -> (库内在市的代码 list, {原因: [{code,n_bars,last_bar}, ...]})。
+
+    东财快照给的候选池混着早已退市的老代码与次新股 (09-07 实测 5,180 只里 196 只退市);
+    它们在取数层已经被判"无数据"跳过, 但仍然计进对外的 n_scanned —— 分母不诚实。这里在
+    开扫之前就按库内点时股票池裁掉, 让"扫描数"回到"今天真的扫了这么多只"。
+
+    判据与 fetch_hist 完全同源 (`store_verdict`)。入参顺序保留; 库读不出来时原样返回不裁。
+    """
+    codes = [str(c) for c in (codes or [])]
+    win = int(days or max(int(CONFIG["fetch"]["lookback_days"]), STORE_HIST_DAYS))
+    uni, fresh_after = _store_pit_ctx()
+    if uni is None:
+        log.warning("价格库点时股票池不可用, 候选池不裁 (%d 只原样进阶段A)", len(codes))
+        return (codes, {})
+    start = (dt.date.today() - dt.timedelta(days=win)).isoformat()
+    probe: dict = {}
+    try:
+        # 一次 GROUP BY 扫窗口 (实测 0.7s / 5,310 码), 比 5,180 次逐码 COUNT 便宜一个数量级
+        probe = {r[0]: (int(r[1] or 0), r[2]) for r in _store_conn().execute(
+            "SELECT code, COUNT(*), MAX(d) FROM bars WHERE d>=? GROUP BY code", (start,))}
+    except Exception as e:                                     # noqa: BLE001
+        log.warning("价格库 bar 统计失败, 候选池不裁: %s", str(e)[:160])
+        return (codes, {})
+    keep, dropped = [], {}
+    for code in codes:
+        n, last = probe.get(code, (0, None))
+        v = store_verdict(n, last, code in uni, fresh_after)
+        if v == "keep":
+            keep.append(code)
+        else:
+            dropped.setdefault(v, []).append(
+                {"code": code, "n_bars": n, "last_bar": last,
+                 "status": _store_status_map().get(code) or None})
+    return (keep, dropped)
 
 
 def _store_note(kind: str) -> None:
@@ -790,11 +934,11 @@ def fetch_hist(code: str) -> pd.DataFrame | None:
             _store_note("hit")
             _cache_save(key, df)
             return df
-        st = _store_status_map()
-        # 只有"库说它在市 **且** 库里一根都没有"才算真缺口, 值得回落联网。其余两种都直接判无数据:
-        #   · 库说已退市/不在池里 -> 东财快照的历史遗留代码 (09-07 实测 196 只), 联网也只是白跑;
-        #   · 库里有 1..59 根 -> 这票历史本来就短 (次新股), 联网同样凑不出 module2 要的 255 根。
-        if (st and st.get(code, "") != "L") or _store_bars_count(code, win) > 0:
+        # 判据与候选池裁剪**共用同一个** store_verdict: 只有 "在点时股票池里却一根 bar 都没有"
+        # (gap) 才算真缺口, 值得回落联网。其余一律直接判无数据:
+        #   · 退市/不在池 -> 东财快照的历史遗留代码 (09-07 实测 196 只), 联网也只是白跑;
+        #   · 库里有 1..59 根 -> 这票历史本来就短 (次新股), 联网同样凑不出 module2 要的根数。
+        if _store_verdict_one(code, win) != "gap":
             _store_note("skipped")
             return None
         _store_note("fallback")

@@ -58,6 +58,132 @@ def _tqdm():
         return _f
 
 
+# ---------------------------------------------------------------------------
+#  候选股票池
+# ---------------------------------------------------------------------------
+def build_candidate_universe(spot, spot_map, ind_df, selected_inds=None):
+    """候选池构建 (行业成分并池 / 全市场预筛) -> (universe, ind_to_codes)。
+
+    2026-09-08 从 run() 里**原样**抽出来 (逻辑一字未改): 裁池那一步要能离线复现和单测,
+    而它原来内联在 500 行的 run() 里, 只能靠跑整条流水线才验证得了。
+    universe = [(code, name, industry|None), ...]; ind_to_codes = {行业: [成分码]}。
+    """
+    ind_to_codes: dict = {}
+    universe = []   # list of (code, name, industry)
+
+    def _full_market_universe():
+        uni = ds.build_universe(spot)
+        rows = []
+        if uni is not None:
+            thr = CONFIG["tech"]["min_amount_yi"] * 1e8
+            minp = CONFIG["tech"]["min_price"]
+            for _, r in uni.iterrows():
+                code, name = r["code"], r["name"]
+                sp = spot_map.get(code, {})
+                price = sp.get("price")
+                if price is not None and price == price and price < minp:
+                    continue   # 低价股预筛, 避免无谓拉取日线
+                amt = sp.get("amount")
+                if amt is not None and amt == amt and 0 < amt < thr * 0.3:
+                    continue   # 明显流动性不足预筛
+                rows.append((code, name, None))
+        log.info("候选池: 全市场(预筛后) %d 只", len(rows))
+        return rows
+
+    # v2: 扫描面扩大 — 扫"全部行业"的成分股(带行业归属), 景气作为打分/标签而非硬性预筛
+    # (与美股版一致: 全市场扫, 高景气只是加成)。原"仅入选行业"模式已被覆盖。
+    all_inds = (list(ind_df["industry"]) if (ind_df is not None and not ind_df.empty)
+                else list(selected_inds or []))
+    if CONFIG["industry"]["use_full_market"] or not all_inds:
+        universe = _full_market_universe()
+    else:
+        seen = set()
+        for ind_name in all_inds:
+            cons = ds.fetch_industry_cons(ind_name)
+            if cons is None:
+                continue
+            ind_to_codes[ind_name] = list(cons["code"])
+            for _, r in cons.iterrows():
+                code = r["code"]
+                if code in seen:
+                    continue
+                # 基础过滤: ST / 北交所
+                name = r.get("name") or (spot_map.get(code, {}).get("name"))
+                if CONFIG["tech"]["exclude_st"] and name and "ST" in str(name).upper():
+                    continue
+                if CONFIG["tech"]["exclude_bj"] and str(code).startswith(("8", "4", "920")):
+                    continue
+                seen.add(code)
+                universe.append((code, name, ind_name))
+        log.info("候选池: 全行业成分股 %d 只 (行业数 %d)", len(universe), len(ind_to_codes))
+        # 行业成分接口大面积失败会让扫描面悄悄缩水: 覆盖过低时并入全市场池补齐。
+        # 全A正常 ~5200 只; 2026-08-14 限频事故只拿到 1086 只、恰好躲过旧阈值 1000 ->
+        # 阈值提到 3000, 任何明显缩水都并入全市场池
+        if 0 < len(universe) < 3000:
+            log.warning("行业成分覆盖偏低(%d只), 并入全市场池补齐 ...", len(universe))
+            have = {c for (c, _, _) in universe}
+            for (c, n, i) in _full_market_universe():
+                if c not in have:
+                    universe.append((c, n, i))
+        # 成分股全部获取失败(东财实时端点被重置)时, 回退到全市场扫描, 保证流程不空跑
+        if len(universe) == 0:
+            log.warning("行业成分股获取失败(东财push2被限, 无可用备用成分接口), 回退到全市场扫描。"
+                        "行业景气榜仍展示; 但个股缺行业归属, '所属行业/景气加成/行业PE对比'将显示 '—'。")
+            universe = _full_market_universe()
+    return universe, ind_to_codes
+
+
+def trim_universe_by_store(universe, run_date):
+    """开扫前按价格库的点时股票池裁候选池 -> (universe, scan_basis)。
+
+    东财快照的候选池里混着 196 只早已退市的老代码和一批次新股 (09-07 实测): 取数层已经把
+    它们判"无数据"跳过, 但它们照样计进对外的 `n_scanned=5180` —— 分母不诚实。裁掉之后
+    "扫描数"才是"今天真的扫了这么多只"(约 4,950), 代价是与 09-08 之前的历史快照有口径断层
+    (老板 09-07 夜已拍板接受), meta.scan_basis / n_pool_raw 就是给前端留的断层标记。
+
+    **回滚**: CONFIG['tech']['pool_by_store'] = False 即整段关掉, 回到东财原池。
+    安全阀: 裁后不足 3000 只 (或不足原池 60%) 一律判为库/尺子出了问题, 原样放行不裁 ——
+    宁可多扫 200 只退市码, 也不能因为库没更新就把候选池清空。
+    """
+    raw_n = len(universe)
+    if not CONFIG["tech"].get("pool_by_store", True):
+        log.info("候选池按库裁: 已由 CONFIG.tech.pool_by_store 关闭, 沿用东财原池 %d 只", raw_n)
+        return universe, "raw_spot"
+    if not ds.bars_from_store_on():
+        return universe, "raw_spot"
+    try:
+        keep, dropped = ds.store_universe_filter([c for (c, _, _) in universe])
+    except Exception as e:                                     # noqa: BLE001
+        log.warning("候选池按库裁失败(沿用东财原池): %s", e)
+        return universe, "raw_spot"
+    if not dropped:
+        return universe, ("store_universe" if len(keep) == raw_n else "raw_spot")
+    if len(keep) < max(3000, int(raw_n * 0.6)):
+        log.warning("候选池按库裁: 裁后只剩 %d/%d 只, 明显不对(库未更新?), 本轮不裁", len(keep), raw_n)
+        return universe, "raw_spot"
+    kept = set(keep)
+    out = [t for t in universe if t[0] in kept]
+    parts = ", ".join(f"{ds.STORE_DROP_REASON_CN.get(k, k)} {len(v)}"
+                      for k, v in sorted(dropped.items(), key=lambda kv: -len(kv[1])))
+    log.info("候选池按库裁: 东财 %d → 库内在市 %d (裁 %d: %s)",
+             raw_n, len(out), raw_n - len(out), parts)
+    # 裁掉的名单落盘 (data/ 不进 git), 供事后逐只核对"为什么没扫它"
+    try:
+        import json as _json
+        names = {c: n for (c, n, _) in universe}
+        _dir = os.path.join(DATA_DIR, "pool_cut")
+        os.makedirs(_dir, exist_ok=True)
+        payload = {"run_date": run_date, "n_pool_raw": raw_n, "n_kept": len(out),
+                   "n_dropped": raw_n - len(out), "basis": ds.store_pool_meta(),
+                   "dropped": {k: [dict(x, name=names.get(x["code"])) for x in v]
+                               for k, v in dropped.items()}}
+        with open(os.path.join(_dir, f"{run_date}.json"), "w", encoding="utf-8") as f:
+            _json.dump(payload, f, ensure_ascii=False, indent=1)
+    except Exception as e:                                     # noqa: BLE001
+        log.warning("裁池名单落盘失败(不影响扫描): %s", e)
+    return out, "store_universe"
+
+
 def run(full_market: bool, use_cache: bool):
     # 全局socket兜底超时: 任何库(akshare内部等)没设超时的阻塞读, 60秒后抛异常
     # 走重试, 而不是永远挂死。2026-08-13/17/18/19 连续四天 13:30 任务卡死在
@@ -105,7 +231,6 @@ def run(full_market: bool, use_cache: bool):
     if ind_df is not None and not ind_df.empty:
         db.save_industry_scores(run_date, ind_df)
     prosperity_map = {}
-    ind_to_codes = {}
     selected_inds = []
     if ind_df is not None and not ind_df.empty:
         prosperity_map = dict(zip(ind_df["industry"], ind_df["prosperity_score"]))
@@ -118,66 +243,11 @@ def run(full_market: bool, use_cache: bool):
     if spot is not None and not spot.empty:
         spot_map = {r["code"]: r.to_dict() for _, r in spot.iterrows()}
 
-    def _full_market_universe():
-        uni = ds.build_universe(spot)
-        rows = []
-        if uni is not None:
-            thr = CONFIG["tech"]["min_amount_yi"] * 1e8
-            minp = CONFIG["tech"]["min_price"]
-            for _, r in uni.iterrows():
-                code, name = r["code"], r["name"]
-                sp = spot_map.get(code, {})
-                price = sp.get("price")
-                if price is not None and price == price and price < minp:
-                    continue   # 低价股预筛, 避免无谓拉取日线
-                amt = sp.get("amount")
-                if amt is not None and amt == amt and 0 < amt < thr * 0.3:
-                    continue   # 明显流动性不足预筛
-                rows.append((code, name, None))
-        log.info("候选池: 全市场(预筛后) %d 只", len(rows))
-        return rows
-
-    universe = []   # list of (code, name, industry)
-    # v2: 扫描面扩大 — 扫"全部行业"的成分股(带行业归属), 景气作为打分/标签而非硬性预筛
-    # (与美股版一致: 全市场扫, 高景气只是加成)。原"仅入选行业"模式已被覆盖。
-    all_inds = (list(ind_df["industry"]) if (ind_df is not None and not ind_df.empty)
-                else list(selected_inds))
-    if CONFIG["industry"]["use_full_market"] or not all_inds:
-        universe = _full_market_universe()
-    else:
-        seen = set()
-        for ind_name in all_inds:
-            cons = ds.fetch_industry_cons(ind_name)
-            if cons is None:
-                continue
-            ind_to_codes[ind_name] = list(cons["code"])
-            for _, r in cons.iterrows():
-                code = r["code"]
-                if code in seen:
-                    continue
-                # 基础过滤: ST / 北交所
-                name = r.get("name") or (spot_map.get(code, {}).get("name"))
-                if CONFIG["tech"]["exclude_st"] and name and "ST" in str(name).upper():
-                    continue
-                if CONFIG["tech"]["exclude_bj"] and str(code).startswith(("8", "4", "920")):
-                    continue
-                seen.add(code)
-                universe.append((code, name, ind_name))
-        log.info("候选池: 全行业成分股 %d 只 (行业数 %d)", len(universe), len(ind_to_codes))
-        # 行业成分接口大面积失败会让扫描面悄悄缩水: 覆盖过低时并入全市场池补齐。
-        # 全A正常 ~5200 只; 2026-08-14 限频事故只拿到 1086 只、恰好躲过旧阈值 1000 ->
-        # 阈值提到 3000, 任何明显缩水都并入全市场池
-        if 0 < len(universe) < 3000:
-            log.warning("行业成分覆盖偏低(%d只), 并入全市场池补齐 ...", len(universe))
-            have = {c for (c, _, _) in universe}
-            for (c, n, i) in _full_market_universe():
-                if c not in have:
-                    universe.append((c, n, i))
-        # 成分股全部获取失败(东财实时端点被重置)时, 回退到全市场扫描, 保证流程不空跑
-        if len(universe) == 0:
-            log.warning("行业成分股获取失败(东财push2被限, 无可用备用成分接口), 回退到全市场扫描。"
-                        "行业景气榜仍展示; 但个股缺行业归属, '所属行业/景气加成/行业PE对比'将显示 '—'。")
-            universe = _full_market_universe()
+    universe, ind_to_codes = build_candidate_universe(spot, spot_map, ind_df, selected_inds)
+    # 开扫前按价格库的点时股票池裁池 (退市老代码 / 次新不足 60 根)。n_pool_raw 是裁前的东财口径,
+    # 与 scan_basis 一起写进 run_log 和 meta —— 09-08 起 n_scanned 换了口径, 得让快照自己说清楚。
+    n_pool_raw = len(universe)
+    universe, scan_basis = trim_universe_by_store(universe, run_date)
 
     # 行业 PE 中位 (用于基本面对比)
     industry_pe_median = m3.compute_industry_pe_median(spot, ind_to_codes) if ind_to_codes else {}
@@ -464,8 +534,10 @@ def run(full_market: bool, use_cache: bool):
     data_date = str(_bench["date"].iloc[-1]) if (_bench is not None and not _bench.empty) else run_date
     finished = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.log_run(run_date, started, finished, n_scanned, len(final_records),
-               selected_inds, "ok", data_date=data_date)
-    log.info("扫描完成: 扫描 %d, 命中 %d", n_scanned, len(final_records))
+               selected_inds, "ok", data_date=data_date,
+               n_pool_raw=n_pool_raw, scan_basis=scan_basis)
+    log.info("扫描完成: 扫描 %d (口径 %s, 裁前 %d), 命中 %d",
+             n_scanned, scan_basis, n_pool_raw, len(final_records))
 
     # ---------------- 导出仪表盘 ----------------
     ex.write_dashboard_js(run_date)

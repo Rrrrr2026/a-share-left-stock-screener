@@ -70,7 +70,10 @@ CREATE TABLE IF NOT EXISTS trade_plan(
 CREATE TABLE IF NOT EXISTS run_log(
     run_date TEXT PRIMARY KEY, started_at TEXT, finished_at TEXT,
     n_scanned INTEGER, n_hit INTEGER, selected_industries TEXT,
-    status TEXT, message TEXT, data_date TEXT
+    status TEXT, message TEXT, data_date TEXT,
+    -- 2026-09-08: n_scanned 改成"按库内在市股裁后"的数, 这两列留住裁前口径, 免得
+    -- 前端/快照拿 09-08 前后的扫描数直接比 (老口径含 196 只早已退市的东财老代码)
+    n_pool_raw INTEGER, scan_basis TEXT
 );
 """
 
@@ -120,7 +123,8 @@ def _migrate(conn):
         "final_rank": [("conclusion_en", "TEXT"),
                        ("dip", "INTEGER"), ("dip_score", "REAL"), ("dip_confirm", "TEXT"),
                        ("coil", "INTEGER"), ("coil_score", "REAL"), ("coil_confirm", "TEXT")],
-        "run_log": [("data_date", "TEXT")],
+        "run_log": [("data_date", "TEXT"),
+                    ("n_pool_raw", "INTEGER"), ("scan_basis", "TEXT")],
     }
     for table, cols in want.items():
         have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -270,12 +274,16 @@ def save_trade_plan(run_date: str, code: str, plan: dict):
 
 
 def log_run(run_date, started_at, finished_at, n_scanned, n_hit,
-            selected_industries, status, message="", data_date=None):
+            selected_industries, status, message="", data_date=None,
+            n_pool_raw=None, scan_basis=None):
+    """n_scanned = 阶段A 真的扫了几只; n_pool_raw = 裁前的东财候选池大小;
+    scan_basis = 'store_universe'(09-08 起按库内在市股裁) | 'raw_spot'(老口径/裁池关闭)。"""
     _upsert("run_log", [{
         "run_date": run_date, "started_at": started_at, "finished_at": finished_at,
         "n_scanned": n_scanned, "n_hit": n_hit,
         "selected_industries": json.dumps(selected_industries, ensure_ascii=False),
         "status": status, "message": message, "data_date": data_date or run_date,
+        "n_pool_raw": n_pool_raw, "scan_basis": scan_basis,
     }])
 
 

@@ -14,6 +14,8 @@
     钩子未启用时 v1 老库回退逐股路径, 而 **v2 库一律拒写** (逐股给的是另一套复权基准)
   · 阶段A 取数改道 (2026-09-07 换库): datasource.fetch_hist 直读库; 库判退市/次新的票
     不再逐股联网 (东财快照里 196 只历史遗留退市码曾把阶段A 从 98 秒拖到 30 分钟+)
+  · 候选池按库裁 (2026-09-08): store_verdict / store_universe_filter —— 在池 / 不在池但
+    K线新鲜 / 次新不足 60 根 / 退市无 K线 四种情形, 与 fetch_hist 共用同一份口径
   · ashare/market: 单位换算 (vol 手×100=股, amount 千元×1000=元)、北交所/B股剔除、
     个股 000001 必须是 SZ (不能被指数特判成 SH)、源开关未翻时按日钩子恒返回 None
 
@@ -524,6 +526,7 @@ def test_stage_a_reads_store():
     ds.DATA_DIR, CONFIG["source"]["bars"], CONFIG["source"]["use_cache"] = d, "tushare", False
     ds._STORE_TLS = threading.local()
     ds._store_status = None
+    ds._store_pit = None
     ds._store_stat.clear()
     net = []
     saved_fuyao = sys.modules.get("ashare.fuyao")
@@ -555,6 +558,112 @@ def test_stage_a_reads_store():
             sys.modules.pop("ashare.fuyao", None)
         ds._STORE_TLS = threading.local()
         ds._store_status = None
+        ds._store_pit = None
+        ds._store_stat.clear()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_store_universe_filter():
+    """候选池按库裁 (2026-09-08): 东财快照的候选池 -> 库内在市股。
+
+    老板 09-07 夜拍板接受口径断层 (对外扫描数 5180 -> ~4950)。四种情形必须都判对, 且判据
+    与 fetch_hist 是**同一个** store_verdict —— 两处口径一分叉, 分母就又不诚实了。
+    """
+    print("\n[候选池按库裁: universe_at + K线在市证据]")
+    from ashare import datasource as ds
+
+    # ---- 纯函数先单独判 (无 I/O): 四种情形 + "有K线但不在 universe 表" 那个口子
+    fresh = "2026-08-25"
+    check("① 在池 + 够根数 -> keep",
+          ds.store_verdict(300, "2026-09-07", True, fresh) == "keep")
+    check("② 不在池, 但 ≥60 根且末根新鲜 -> keep (在市证据以K线为准)",
+          ds.store_verdict(300, "2026-09-07", False, fresh) == "keep")
+    check("②' 不在池 + 末根过期 -> stale (陈年K线不算在市)",
+          ds.store_verdict(300, "2026-06-30", False, fresh) == "stale")
+    check("③ 次新 (1..59 根) -> too_new, 在不在池都一样",
+          ds.store_verdict(30, "2026-09-07", True, fresh) == "too_new"
+          and ds.store_verdict(1, "2026-09-07", False, fresh) == "too_new")
+    check("④ 无 bar: 在池=gap(值得回落联网) / 不在池=absent(退市老代码)",
+          ds.store_verdict(0, None, True, fresh) == "gap"
+          and ds.store_verdict(0, None, False, fresh) == "absent")
+
+    # ---- 再用临时最小 v2 库跑一遍真链路
+    fake = FakeMarket({}, {}, [])
+    d = use_tmp_market(fake)
+    conn = ps._conn()
+    today = dt.date.today()
+    days = [(today - dt.timedelta(days=i)).isoformat() for i in range(400, -1, -1)]
+    conn.executemany("INSERT OR REPLACE INTO idx_bars(d,o,h,l,c,v) VALUES(?,?,?,?,?,?)",
+                     [(dd, 1.0, 1.0, 1.0, 1.0, 1.0) for dd in days])   # 库自己的交易日历
+
+    def _bars(code, dates):
+        rows = [(code, dd, 10.0, 11.0, 9.0, 10.5, 1000.0, 12345.0) for dd in dates]
+        conn.executemany("INSERT OR REPLACE INTO bars(code,d,o,h,l,c,v,amt) "
+                         "VALUES(?,?,?,?,?,?,?,?)", rows)
+        conn.executemany("INSERT OR REPLACE INTO bars_raw(code,d,o,h,l,c,v,amt) "
+                         "VALUES(?,?,?,?,?,?,?,?)", rows)
+
+    _bars("600000", days)                 # ① 在池老票, 400 根到今天
+    _bars("000022", days)                 # ② 有K线但 universe 表没这一行 (改过代码的票)
+    _bars("600001", days[:200])           # ②' 有K线但最后一根停在 200 天前 = 已退市/长停
+    _bars("301999", days[-30:])           # ③ 次新: 只有 30 根
+    conn.executemany("INSERT OR REPLACE INTO universe(code,name,list_date,delist_date,status) "
+                     "VALUES(?,?,?,?,?)",
+                     [("600000", "老票", "2015-01-05", None, "L"),
+                      ("301999", "次新", days[-30], None, "L"),
+                      ("600002", "在池无K线", "2015-01-05", None, "L"),
+                      ("000004", "国华退", "1990-12-01", days[100], "D")])
+    conn.commit()
+    conn.close()
+
+    saved_dir, saved_src, saved_cache = ds.DATA_DIR, CONFIG["source"].get("bars"), \
+        CONFIG["source"]["use_cache"]
+    ds.DATA_DIR, CONFIG["source"]["bars"], CONFIG["source"]["use_cache"] = d, "tushare", False
+    ds._STORE_TLS = threading.local()
+    ds._store_status = None
+    ds._store_pit = None
+    try:
+        codes = ["600000", "000022", "600001", "301999", "000004", "600002"]
+        keep, dropped = ds.store_universe_filter(codes)
+        by = {k: sorted(x["code"] for x in v) for k, v in dropped.items()}
+        check("① 在池老票留下", "600000" in keep)
+        check("② 不在 universe 表但K线新鲜 -> 留下 (000022 那三只)", "000022" in keep)
+        check("②' 有K线但过期 -> 裁 (stale)", by.get("stale") == ["600001"])
+        check("③ 次新 30 根 -> 裁 (too_new)", by.get("too_new") == ["301999"])
+        check("④ 退市无K线 -> 裁 (absent)", by.get("absent") == ["000004"])
+        check("④' 在池却一根K线都没有 -> 裁 (gap, 但 fetch_hist 会为它回落联网)",
+              by.get("gap") == ["600002"])
+        check("裁后只剩两只, 且保留入参顺序", keep == ["600000", "000022"])
+        check("裁前裁后数对得上", len(keep) + sum(len(v) for v in dropped.values()) == len(codes))
+        meta = ds.store_pool_meta()
+        check("留痕: 新鲜度截止日取自库内交易日历 (末 10 个交易日)",
+              meta["fresh_after"] == days[-10] and meta["min_bars"] == 60)
+        check("留痕: 点时股票池只数 = universe_at(今日)",
+              meta["n_universe"] == len(ps.universe_at(today.isoformat())))
+        # fetch_hist 与裁池共用同一判据 (store_verdict): 被裁的票在取数层同样是"无数据"。
+        # 例外是 stale (600001): 它库里有 200 根旧 bar, fetch_hist 的直读快路会照样把这段陈年
+        # K 线交出来 —— 所以"退市/长停"这一刀**只有裁池能挡**, 这正是裁池的价值所在。
+        check("同一口径: 次新/退市无K线的票 fetch_hist 也拿不到",
+              all(ds.fetch_hist(c) is None for c in ("301999", "000004")))
+        check("stale 票的旧K线只有裁池能挡 (fetch_hist 直读快路仍会给)",
+              ds.fetch_hist("600001") is not None)
+        # 开关关掉 = 一行回滚
+        saved_sw = CONFIG["tech"].get("pool_by_store")
+        try:
+            CONFIG["tech"]["pool_by_store"] = False
+            import run_pipeline as rp
+            uni = [(c, c, None) for c in codes]
+            out, basis = rp.trim_universe_by_store(uni, "2026-09-08")
+            check("回滚开关: pool_by_store=False 原样放行, 口径标回 raw_spot",
+                  len(out) == len(codes) and basis == "raw_spot")
+        finally:
+            CONFIG["tech"]["pool_by_store"] = saved_sw
+    finally:
+        ds.DATA_DIR, CONFIG["source"]["bars"], CONFIG["source"]["use_cache"] = \
+            saved_dir, saved_src, saved_cache
+        ds._STORE_TLS = threading.local()
+        ds._store_status = None
+        ds._store_pit = None
         ds._store_stat.clear()
         shutil.rmtree(d, ignore_errors=True)
 
@@ -570,7 +679,7 @@ TESTS = [test_schema_and_v1_upgrade, test_qfq_math, test_load_adjust_modes,
          test_update_daily_by_date, test_update_daily_falls_back,
          test_update_daily_v2_refuses_legacy, test_update_daily_not_ready_guard,
          test_market_units_and_filters, test_source_switch_default,
-         test_stage_a_reads_store]
+         test_stage_a_reads_store, test_store_universe_filter]
 
 
 if __name__ == "__main__":

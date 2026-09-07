@@ -221,7 +221,12 @@ def build_payload(run_date: str | None = None) -> dict:
             "run_date": run_date,
             "data_date": runlog.get("data_date") or run_date,   # 真实行情数据日期(最新收盘)
             "updated_at": runlog.get("finished_at") or run_date,
+            # 2026-09-08 起 n_scanned = **裁后**的数 (按价格库的点时股票池, 约 4,950), 不再是
+            # 东财快照的 5,180 (那里面混着 196 只早已退市的老代码)。scan_basis/n_pool_raw 让
+            # 前端和历史快照能分辨口径: 'store_universe' = 新口径, 'raw_spot'/缺失 = 老口径。
             "n_scanned": runlog.get("n_scanned"),
+            "n_pool_raw": runlog.get("n_pool_raw"),
+            "scan_basis": runlog.get("scan_basis") or "raw_spot",
             "n_hit": len(candidates),   # 与主表展示条数一致
             "selected_industries": selected_inds,
             "disclaimer": DISCLAIMER,

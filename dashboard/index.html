@@ -466,7 +466,7 @@
     <div id="deckMoreBody" class="mt-2"></div></details>
   </section>
   <section class="card px-3 py-1.5 mb-2 text-[12px] hidden flex-wrap items-center gap-x-5 gap-y-1">
-    <span class="text-slate-400"><span data-i18n="ov_scanned">今日扫描数</span> <b id="ovScanned" class="text-white">—</b></span>
+    <span class="text-slate-400" data-i18n-title="ov_scanned_title" title="2026-09-08 起按库内在市股计（约4950）；此前的扫描数含东财快照里早已退市的老代码（约5180）。"><span data-i18n="ov_scanned">今日扫描数</span> <b id="ovScanned" class="text-white">—</b></span>
     <span class="text-slate-400"><span data-i18n="ov_hit">命中候选数</span> <b id="ovHit" class="text-sky-300">—</b></span>
     <span class="text-slate-400"><span data-i18n="ov_inds">入选景气板块</span> <b id="ovInds" style="color:var(--ok)">—</b></span>
     <span class="text-slate-400"><span data-i18n="ov_date">数据日期</span> <b id="ovDate" class="text-white">—</b></span>
@@ -804,6 +804,7 @@
       updated:"最后更新：", datasource:"数据源：akshare（东财行业 · 前复权日线）· 价格单位 人民币￥",
       disclaimer:'⚠️ <b>免责声明</b>：本系统仅对A股做技术/基本面数据的自动化整理与形态筛选，<b>不构成任何投资建议</b>。“左侧买入”是在下跌中、支撑确认前进场，风险天然更高（可能继续下跌或破位）。所有标的需<b>人工复核</b>，使用者自负盈亏与风控。',
       ov_scanned:"今日扫描数", ov_hit:"命中候选数", ov_inds:"入选景气行业",       ov_date:"数据日期",
+      ov_scanned_title:"2026-09-08 起按库内在市股计（约4950）；此前的扫描数含东财快照里早已退市的老代码（约5180）。",
       deck_temp:"机会温度", deck_lvl:"试仓等级", title_short:"A股工作台", mkt_a:"🇨🇳 A股", mkt_us:"🇺🇸 美股",
       tab_deck:"作战台", tab_cands:"候选", tab_bt:"回测", tab_more:"更多", tab_acct:"账号",
       more_sections:"板块顺序", more_reorder_hint:"长按拖动排序", reorder_done:"顺序已保存",
@@ -1022,6 +1023,7 @@
       updated:"Updated: ", datasource:"Source: akshare (EM industries · adjusted daily bars) · prices in CNY ￥",
       disclaimer:'⚠️ <b>Disclaimer</b>: This tool only performs automated organization and pattern screening of technical/fundamental data for China A-shares and is <b>not investment advice</b>. "Left-side buying" enters during a decline, before support is confirmed, and is inherently higher-risk. Verify every name <b>manually</b>; users bear their own P&amp;L and risk.',
       ov_scanned:"Scanned today", ov_hit:"Candidates", ov_inds:"Selected industries",       ov_date:"Data date",
+      ov_scanned_title:"From 2026-09-08 this counts only codes the price store says are still listed (~4950); earlier runs included long-delisted codes from the EastMoney snapshot (~5180).",
       deck_temp:"Opportunity temp", deck_lvl:"Sizing level", title_short:"A-share Desk", mkt_a:"🇨🇳 CN", mkt_us:"🇺🇸 US",
       tab_deck:"Desk", tab_cands:"Picks", tab_bt:"Backtest", tab_more:"More", tab_acct:"Account",
       more_sections:"Sections", more_reorder_hint:"Long-press to reorder", reorder_done:"Order saved",
