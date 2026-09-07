@@ -7,7 +7,8 @@
   · 建表与 **v1 老库就地升级** (bars 补 amt 列, 老数据不动)
   · 前复权物化: base = 该股最新因子, 因子前向填充, 除权日前后水平比为常数
   · load(adjust=qfq|hfq|raw) 三口径 + 老库无 bars_raw 时退回 qfq (不静默返回空)
-  · universe_at(date): list_date <= d < delist_date (退市股点时进出)
+  · universe_at(date): list_date <= d < delist_date (退市股点时进出); **list_date 缺失时**
+    落 NULL 而不是 '1970-01-01' 哨兵, 改以 "库内首根 bar" 当在市起点 (前视污染修复)
   · update_daily 按 trade_date 增量: 因子未变只补当日, 因子变了整段重物化; 钩子返回
     None 时回退旧逐股路径 (P1 期间生产默认走这条)
   · ashare/market: 单位换算 (vol 手×100=股, amount 千元×1000=元)、北交所/B股剔除、
@@ -229,6 +230,70 @@ def test_universe_at():
     shutil.rmtree(d, ignore_errors=True)
 
 
+def test_universe_null_list_date():
+    print("\n[list_date 缺失: 落 NULL 不落 1970 哨兵, universe_at 以首根 bar 兜底]")
+    # 背景 (2026-09-07 实测): 镜像的 stock_basic 对刚上市的次新股把 list_date 返回成 epoch 0
+    # 的 '19700101'。它是个**合法日期字符串**, 落库后 universe_at(任意历史日) 都会把这些
+    # 2026 年才上市的票算成 "1970 年就在市" —— 点时股票池被前视污染, 九年研究的分母全歪。
+    check("norm_date 认得各路空值/哨兵", all(ps.norm_date(x) is None for x in (
+        "19700101", "1970-01-01", "", None, "0", "00000000", "0000-00-00", "nan", "NaT",
+        float("nan"), "1899-12-30", "garbage")))
+    check("norm_date 正常日期照常规整",
+          ps.norm_date("20260907") == ps.norm_date("2026-09-07") == ps.norm_date("2026/9/7")
+          == "2026-09-07")
+
+    raw = [("301688", "C格林", "19700101", None, "L"),          # 源没给上市日, 有 bar
+           ("301699", "洛轴股份", "19700101", None, "L"),        # 源没给上市日, 且一根 bar 都没有
+           ("000693", "长期停牌", "19970226", "", "l"),          # 有上市日, 但首根 bar 很晚
+           ("000004", "国华退", "19901201", "20260714", "D"),    # 退市股
+           ("000001", "平安银行", "19910403", None, "L")]
+    norm = ps.normalize_universe_rows(raw)
+    check("1970 哨兵 -> None (不是 '1970-01-01' 也不是 '')", norm[0][2] is None)
+    check("空 delist_date -> None; 有值原样带上",
+          norm[0][3] is None and norm[3][3] == "2026-07-14")
+    check("状态归一到大写", norm[2][4] == "L")
+
+    fake = FakeMarket({}, {}, [], universe=raw)
+    d = use_tmp_market(fake)
+    conn = ps._conn()
+    conn.executemany(
+        "INSERT OR REPLACE INTO bars_raw VALUES(?,?,?,?,?,?,?,?)",
+        [("000001", f"2026-0{m}-01", 10, 11, 9, 10.5, 100, 1000) for m in (1, 6, 9)]
+        + [("301688", "2026-09-02", 10, 11, 9, 10.5, 100, 1000)]
+        + [("000693", "2026-09-01", 10, 11, 9, 10.5, 100, 1000)]
+        + [("000004", "2026-01-05", 10, 11, 9, 10.5, 100, 1000)])
+    conn.commit()
+    n = ps._refresh_universe(ps.current(), conn)
+    got = dict(conn.execute("SELECT code, list_date FROM universe"))
+    check("刷新写入 5 只", n == 5 and len(got) == 5)
+    check("库里一条 1970 都没有", conn.execute(
+        "SELECT COUNT(*) FROM universe WHERE list_date LIKE '1970%'").fetchone()[0] == 0)
+    check("源没给的上市日在库里是 NULL", got["301688"] is None and got["301699"] is None)
+    check("有上市日的照旧", got["000001"] == "1991-04-03")
+
+    before, after = ps.universe_at("2026-06-30", conn), ps.universe_at("2026-09-02", conn)
+    check("没上市日的票: 首根 bar 之前不入池", "301688" not in before)
+    check("没上市日的票: 首根 bar 当天起入池", "301688" in after)
+    check("没上市日又一根 bar 都没有 -> 永不入池",
+          "301699" not in before and "301699" not in after)
+    check("有上市日但首根 bar 还没到 -> 当日买不到, 不入池",
+          "000693" not in before and "000693" in after)
+    check("退市股仍按 delist_date 点时进出", "000004" in before and "000004" not in after)
+    check("正常票不受影响", "000001" in before and "000001" in after)
+
+    # 缓存: universe_at 会把 universe 行 + 首根 bar 表按库指纹缓存 (九年重放要按天调上千次),
+    # 库一改必须自动失效, 否则新写的行看不见。
+    conn.execute("INSERT OR REPLACE INTO universe VALUES('302000','新票',NULL,NULL,'L')")
+    conn.execute("INSERT OR REPLACE INTO bars_raw VALUES('302000','2026-09-01',"
+                 "10,11,9,10.5,100,1000)")
+    conn.commit()
+    check("库一改, 点时缓存自动失效", "302000" in ps.universe_at("2026-09-02", conn))
+    check("first_bar_dates 报得出首根 bar",
+          ps.first_bar_dates(conn).get("301688") == "2026-09-02")
+    conn.close()
+    shutil.rmtree(d, ignore_errors=True)
+
+
 def _day_fixture():
     """两只票三天: 000001 因子不变, 000002 第三天除权 (因子 1.0 -> 1.25)。"""
     days = ["2026-09-03", "2026-09-04", "2026-09-07"]
@@ -356,7 +421,8 @@ def test_source_switch_default():
 
 
 TESTS = [test_schema_and_v1_upgrade, test_qfq_math, test_load_adjust_modes,
-         test_load_v1_fallback, test_universe_at, test_update_daily_by_date,
+         test_load_v1_fallback, test_universe_at, test_universe_null_list_date,
+         test_update_daily_by_date,
          test_update_daily_falls_back, test_market_units_and_filters,
          test_source_switch_default]
 
