@@ -65,7 +65,9 @@ def _fair_upside(industry, pe, pb, roe_a, g_latest, mv, ni_annual):
     周期/重资产: 三年正常化盈利PE (合理PE=15) —— 单年盈利在周期顶/底都会骗人;
     高增长(>=25%): PEG (合理PE=增速, 夹10-35);
     稳定增长: PE回归 (合理PE=增速夹10-22)。"""
-    ind = industry or ""
+    # 行业字段可能是 pandas 缺失值 float-NaN (非 None): `NaN or ""` 仍是 NaN, `k in NaN` 抛
+    # TypeError → 整个优质榜崩溃 (2026-09-01..05 三次丢快照)。非字符串一律当"未知行业"。
+    ind = industry if isinstance(industry, str) else ""
     if any(k in ind for k in FIN_PB_KEYS):
         if pb and pb > 0 and roe_a:
             fair_pb = max(0.5, min(2.5, roe_a / 10.0))

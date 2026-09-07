@@ -101,7 +101,10 @@ def test_module2():
 
 def test_module4():
     print("[模块4 交叉打分]")
-    tech_rec = {"code": "000003", "name": "X", "tech_score": 2.4, "sig_channel": "✓",
+    # 强左侧技术分门槛 = CONFIG["cross"]["strong_left_tech"] = 2.5 (ashare/config.py:164, 2026-08-10
+    # e9eba41 美股对齐重建时由 2.0 提高; 本夹具原写 2.4 是 2.0 时代的旧值, 自那天起就落在
+    # "技术弱" 桶 —— 08-30 兜底桶拆分只是把它从 "🔎 观察" 改名成 "🔎 观察·技术弱", 不是回归)
+    tech_rec = {"code": "000003", "name": "X", "tech_score": 3.0, "sig_channel": "✓",
                 "sig_pivot": "✓", "sig_ma": "MA60", "sig_osc": "超卖",
                 "support_price": 10.0, "support_label": "前低",
                 "dist_support_pct": 1.2, "breakdown_price": 9.5}
@@ -119,6 +122,12 @@ def test_module4():
                                         "debt_ratio": 30, "fund_flags": []}, None)
     check("景气未知 -> prosperity_score=None(不伪造50)", unknown["prosperity_score"] is None)
     check("景气未知综合分仍在 0-100", 0 <= unknown["final_score"] <= 100)
+    # 08-30 兜底桶拆分 (module4_crossscore._tag): 技术分 < 门槛 → 观察·技术弱; 核心字段全缺 → 观察·缺数据 置顶
+    weak_tech = m4.cross_score(dict(tech_rec, tech_score=2.0), {"roe": 20, "pe_pct": 15, "netprofit_yoy": 30,
+                                                                "debt_ratio": 30, "fund_flags": []}, 80)
+    check("技术分低于门槛 -> 观察·技术弱", weak_tech["tag"] == "🔎 观察·技术弱")
+    nodata = m4.cross_score(tech_rec, {"fund_flags": []}, 80)
+    check("核心字段全缺 -> 观察·缺数据 (置顶, 不落 ⚠️ 桶)", nodata["tag"] == "🔎 观察·缺数据")
 
 
 def test_module3_valuation():
@@ -166,6 +175,20 @@ def test_module3_valuation():
     check("行业PE中位对比有值", f["pe_industry_median"] == 25.0 and f["pe_vs_industry"] is not None)
     check("ROE/EPS/负债率 取到", f["roe"] is not None and f["eps"] is not None and f["debt_ratio"] is not None)
     check("ROE多年趋势非空", len(f["roe_trend"]) >= 3)
+
+
+def test_quality_nan_industry():
+    print("[优质榜 行业字段 float-NaN 守卫]")
+    from ashare import quality as q
+    args = (12.0, 1.5, 15.0, 20.0, 1e10, [1e8, 1.1e8, 1.2e8])
+    try:
+        up, model = q._fair_upside(float("nan"), *args)
+        check("float-NaN 行业不崩, 走通用 PE 模型", model == "PE回归" and up is not None)
+    except TypeError as e:      # 回归形态: argument of type 'float' is not iterable
+        check(f"float-NaN 行业不崩 ({e})", False)
+    check("None 行业不崩", q._fair_upside(None, *args)[1] == "PE回归")
+    check("银行仍走 PB-ROE", q._fair_upside("银行", 5.0, 0.6, 12.0, 5.0, 1e10, [])[1] == "PB-ROE")
+    check("周期行业仍走正常化", q._fair_upside("煤炭开采", 8.0, 1.0, 10.0, 5.0, 1.5e10, [1e9, 1e9, 1e9])[1] == "周期正常化")
 
 
 def test_module1_with_stubs():
@@ -221,6 +244,7 @@ if __name__ == "__main__":
     test_module2()
     test_module4()
     test_module3_valuation()
+    test_quality_nan_industry()
     test_module1_with_stubs()
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     sys.exit(1 if FAIL else 0)
