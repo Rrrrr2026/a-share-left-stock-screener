@@ -18,6 +18,7 @@ import os
 import time
 import pickle
 import hashlib
+import sqlite3
 import threading
 import datetime as dt
 import logging
@@ -640,8 +641,126 @@ def _finalize_hist(df: pd.DataFrame) -> pd.DataFrame | None:
     return df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
 
+# ===========================================================================
+#  本地价格库直读 (Tushare 适配 P1) —— 阶段A 不再逐股联网
+# ===========================================================================
+#  CONFIG.source.bars == "tushare" 时, 个股日线一律读 data/pricestore.db 的物化前复权表。
+#  这一步才是"买 Tushare"的真正收益: 每日 5,200 次 fuyao/东财逐股请求 -> 0 次
+#  (库由 run_a.sh 开头的 pricestore update 按 trade_date 拉全市场, 约 10 次调用)。
+#  库里拿不到的个别代码 (次新股不足 60 根、库缺该码) 仍回落到原来的联网链, 只影响个位数只票。
+_STORE_TLS = threading.local()
+_store_stat = {"hit": 0, "fallback": 0, "skipped": 0}
+_store_stat_lock = threading.Lock()
+_store_status: dict | None = None
+_store_status_lock = threading.Lock()
+
+#: 阶段A 从库里取多长的历史。**刻意不是 CONFIG.fetch.lookback_days(500)**: 换库前阶段A 的主源是
+#: `fuyao.hist(code, years=2.5)` —— 它无视 lookback_days, 一律给 2.5 年 (≈607 根)。module2 的
+#: "前期重要低点" 走 `ind.find_pivot_lows(low, ...)` 扫**整条**序列 (只有它不是 .tail(N)),
+#: 所以窗口一短枢轴集就变。09-07 换库时实测 400 只样本: 500 天窗口 vs 913 天窗口有 42/305 只
+#: (13.8%) 的 tech_score 不同 (中位差 0.95 分, dip/coil 桶不受影响) —— 那是**窗口**造成的差异,
+#: 不是换源造成的。换库这一步只该换数据来源, 不该顺手改扫描窗口, 所以这里对齐 fuyao 的 2.5 年。
+STORE_HIST_DAYS = 913               # ≈ fuyao years=2.5 的等效自然日数
+
+
+def _store_path() -> str:
+    return os.path.join(DATA_DIR, "pricestore.db")
+
+
+def bars_from_store_on() -> bool:
+    """阶段A 是否直读价格库。开关与 market._bars_source 同一个 (CONFIG.source.bars)。"""
+    if str(CONFIG["source"].get("bars", "fuyao") or "fuyao").lower() != "tushare":
+        return False
+    return os.path.exists(_store_path())
+
+
+def _store_conn() -> sqlite3.Connection:
+    """线程私有的**只读**连接。
+
+    刻意不用 leftside_core.pricestore._conn(): 那是读写连接, 每次还要跑一遍建表 DDL —— 阶段A
+    16 线程 × 5,200 次会平白去抢 WAL 写锁, 而别的代理这会儿正在读同一批 data/*.db。
+    mode=ro + query_only 保证这里绝无可能写坏刚换上的库。
+    """
+    conn = getattr(_STORE_TLS, "conn", None)
+    if conn is None:
+        conn = sqlite3.connect(f"file:{_store_path()}?mode=ro", uri=True,
+                               timeout=60, check_same_thread=False)
+        conn.execute("PRAGMA query_only=1")
+        _STORE_TLS.conn = conn
+    return conn
+
+
+def _hist_from_store(code: str, days: int, min_bars: int = 60) -> pd.DataFrame | None:
+    """价格库 -> date/open/high/low/close/volume/amount (前复权, v=股, amt=元)。
+
+    单位与 fuyao 一致 (成交量股、成交额元), 所以 module2 的 `amount/1e8 >= 0.5亿` 流动性门
+    和量比计算都不用改。取不到/太短返回 None, 由调用方决定要不要回落联网。
+    """
+    start = (dt.date.today() - dt.timedelta(days=int(days))).isoformat()
+    try:
+        rows = _store_conn().execute(
+            "SELECT d,o,h,l,c,v,amt FROM bars WHERE code=? AND d>=? ORDER BY d",
+            (code, start)).fetchall()
+    except Exception as e:                                     # noqa: BLE001
+        log.debug("价格库读取 %s 失败: %s", code, str(e)[:120])
+        _STORE_TLS.conn = None                                 # 连接坏了就丢掉, 下次重开
+        return None
+    if len(rows) < min_bars:
+        return None
+    df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close",
+                                     "volume", "amount"])
+    return _finalize_hist(df)
+
+
+def _store_bars_count(code: str, days: int) -> int:
+    """窗口内库里有几根 bar。0 = 库里根本没有这只票 (真缺口, 值得回落联网);
+    1..59 = 这票的历史本来就这么短 (次新股) —— 联网也凑不出 module2 要的 255 根, 别白跑。"""
+    start = (dt.date.today() - dt.timedelta(days=int(days))).isoformat()
+    try:
+        return int(_store_conn().execute(
+            "SELECT COUNT(*) FROM bars WHERE code=? AND d>=?", (code, start)).fetchone()[0])
+    except Exception:                                          # noqa: BLE001
+        return 0
+
+
+def _store_status_map() -> dict:
+    """{code: 'L'|'D'|'P'} —— 库内 universe 口径的在市状态 (Tushare stock_basic)。
+
+    换库后**库才是股票池的权威**: 阶段A 的候选池来自东财快照, 里面混着 196 只早就退市、
+    东财却还在列的老代码 (09-07 实测)。这些票库里当然没有近期 K 线, 放它们回落联网就是
+    每天 200 次注定失败的逐股请求 —— 而且最后会掉到**串行加锁的新浪 V8 路径**上, 实测把
+    阶段A 从 98 秒拖到 30 分钟以上, 直接威胁服务器 watchdog 的 25 分钟心跳。
+    """
+    global _store_status
+    if _store_status is None:
+        with _store_status_lock:
+            if _store_status is None:
+                try:
+                    _store_status = {r[0]: (r[1] or "") for r in
+                                     _store_conn().execute("SELECT code, status FROM universe")}
+                except Exception as e:                         # noqa: BLE001
+                    log.warning("价格库 universe 读取失败 (退市票将照旧回落联网): %s",
+                                str(e)[:120])
+                    _store_status = {}
+    return _store_status
+
+
+def _store_note(kind: str) -> None:
+    with _store_stat_lock:
+        _store_stat[kind] = _store_stat.get(kind, 0) + 1
+
+
+def store_stats() -> dict:
+    """阶段A 收尾时打印: 命中价格库 / 回落联网 / 按库判退市直接跳过 —— 换库当天的核验凭据。"""
+    with _store_stat_lock:
+        return dict(_store_stat)
+
+
 def fetch_hist(code: str) -> pd.DataFrame | None:
-    """个股日线(前复权)。顺序: 东财(akshare) -> 腾讯(直连) -> 新浪(加锁, 最后手段)。
+    """个股日线(前复权)。
+
+    CONFIG.source.bars == "tushare" -> **本地价格库直读** (零网络), 库里没有才回落下面这条链。
+    回落链顺序: 同花顺(fuyao) -> 东财(akshare) -> 腾讯(直连) -> 新浪(加锁, 最后手段)。
 
     ⚠ 顺序不是随便排的: 阶段A 要用 16 线程扫 4000+ 只, 而 akshare 的新浪日线
     (stock_zh_a_daily) 内部用 py_mini_racer(V8) 算复权 —— V8 非线程安全, 并发下
@@ -649,12 +768,30 @@ def fetch_hist(code: str) -> pd.DataFrame | None:
     线程安全、640根足够 MA250, 因此排在新浪之前; 新浪只在腾讯也失败时用, 且必须加锁。
     """
     f = CONFIG["fetch"]
-    # 缓存键含 lookback_days: 改了回看天数(bar数)会自动失效旧缓存, 避免用到过短的历史
-    key = _cache_key("hist", code, f["adjust"], f["lookback_days"], dt.date.today().isoformat())
+    store_on = bars_from_store_on()
+    win = max(int(f["lookback_days"]), STORE_HIST_DAYS) if store_on else int(f["lookback_days"])
+    # 缓存键含**实际**回看天数: 改了回看天数(bar数)、或在 库/联网 两条路之间来回切, 旧缓存都会
+    # 自动失效 —— 否则切源当天会拿着上一条路缓存的短序列跑, 差异被静默吃掉 (09-07 换库踩过)
+    key = _cache_key("hist", code, f["adjust"], win, dt.date.today().isoformat())
     c = _cache_load(key)
     if c is not None:
         return c
     df = None
+    if store_on:
+        df = _hist_from_store(code, win)
+        if df is not None and not df.empty:
+            _store_note("hit")
+            _cache_save(key, df)
+            return df
+        st = _store_status_map()
+        # 只有"库说它在市 **且** 库里一根都没有"才算真缺口, 值得回落联网。其余两种都直接判无数据:
+        #   · 库说已退市/不在池里 -> 东财快照的历史遗留代码 (09-07 实测 196 只), 联网也只是白跑;
+        #   · 库里有 1..59 根 -> 这票历史本来就短 (次新股), 联网同样凑不出 module2 要的 255 根。
+        if (st and st.get(code, "") != "L") or _store_bars_count(code, win) > 0:
+            _store_note("skipped")
+            return None
+        _store_note("fallback")
+        df = None
     from . import fuyao
     if fuyao.available():                      # 同花顺: 结构稳定、无V8、线程安全
         df = fuyao.hist(code, years=2.5)
@@ -854,7 +991,14 @@ def fetch_long_hist(code: str, years: int = 10) -> pd.DataFrame | None:
         return None
     if c is not None:
         return c
-    # 优先同花顺: 一次请求拿满10年前复权, 不需要分段拼接 -> 从源头消除
+    # 最优先本地价格库 (Tushare P1): 库本身就是单一复权基准的 10 年物化前复权, 逐段拼接的
+    # 断裂问题在这里根本不存在, 也不占任何配额。
+    if bars_from_store_on():
+        sdf = _hist_from_store(code, int(365.25 * years) + 5, min_bars=250)
+        if sdf is not None and _long_hist_is_sane(sdf, code):
+            _cache_save(key, sdf)
+            return sdf
+    # 其次同花顺: 一次请求拿满10年前复权, 不需要分段拼接 -> 从源头消除
     # "每段复权基准不同导致断裂"的问题(腾讯那条路实测茅台47处跳变)。
     from . import fuyao
     if fuyao.available():
@@ -1432,6 +1576,11 @@ def fetch_hist_long(code: str, years: int = 10) -> pd.DataFrame | None:
     c = _cache_load(key)
     if c is not None:
         return c
+    if bars_from_store_on():                   # Tushare P1: 库里就有 10 年, 不必再走新浪 V8
+        sdf = _hist_from_store(code, int(years * 365.25) + 5, min_bars=250)
+        if sdf is not None and not sdf.empty:
+            _cache_save(key, sdf)
+            return sdf
     end = dt.date.today()
     start = end - dt.timedelta(days=int(years * 365.25))
     try:

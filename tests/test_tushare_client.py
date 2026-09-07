@@ -269,8 +269,15 @@ def test_deadline_goes_through_datasource_pool():
         raise AssertionError("不该走 call_with_retry (它会误标东财不可用)")
 
     stub.call_with_retry = _boom
+    # 只换 sys.modules 不够: `from . import datasource` 走的是 _handle_fromlist ——
+    # 只要 ashare 包上已经有 datasource 这个**属性** (同进程里别的用例导过就有), 它就直接
+    # 拿属性, 根本不看 sys.modules, 打桩被绕过 -> _post_json 被丢进真的进程池打真网络。
+    # 2026-09-07: 单跑本文件绿、`pytest tests/` 红两个月, 根因就是这里。两处都要换。
+    import ashare as _pkg
     saved = sys.modules.get("ashare.datasource")
+    saved_attr = getattr(_pkg, "datasource", None)
     sys.modules["ashare.datasource"] = stub
+    _pkg.datasource = stub
     try:
         df = tc.query("daily", trade_date="20260904", deadline_sec=42)
     finally:
@@ -278,6 +285,13 @@ def test_deadline_goes_through_datasource_pool():
             sys.modules["ashare.datasource"] = saved
         else:
             sys.modules.pop("ashare.datasource", None)
+        if saved_attr is not None:
+            _pkg.datasource = saved_attr
+        else:
+            try:
+                del _pkg.datasource
+            except AttributeError:
+                pass
         tc.USE_PROCESS_DEADLINE = False
     check("结果正常", len(df) == 1)
     check("走的是 _call_with_deadline", seen.get("fn") == "_post_json")

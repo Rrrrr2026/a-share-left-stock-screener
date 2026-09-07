@@ -42,10 +42,15 @@ CONFIG = {
     # =====================================================================
     "source": {
         "primary": "akshare",          # akshare (免费, 全市场)
-        # 日线/股票池主源开关 (Tushare 适配 P1): "fuyao"(现状: 腾讯/fuyao/东财一族) | "tushare"
-        # 切成 "tushare" 后 market.fetch_bars_bulk / universe_codes / pricestore 按日增量
-        # 一起改道 (三处同一开关, 免得半切半不切混口径)。**P1 期间保持现状, 换库那步才翻。**
-        "bars": os.environ.get("ASHARE_BARS_SOURCE", "fuyao"),
+        # 日线/股票池主源开关 (Tushare 适配 P1): "tushare"(现状) | "fuyao"(回滚: 腾讯/fuyao/东财一族)
+        # 这一个开关同时改道四处 (免得半切半不切混口径):
+        #   ① datasource.fetch_hist / fetch_long_hist —— 阶段A 直读 data/pricestore.db, 不再逐股联网
+        #   ② market.fetch_bars_by_date / fetch_adj_by_date / trading_days —— 价格库按日增量
+        #   ③ market.fetch_bars_bulk (逐股长历史)  ④ market.universe_codes -> stock_basic
+        # **2026-09-07 P1 换库: 默认翻到 tushare** (库已换成 Tushare 单源 schema v2, 八道验收门全过)。
+        # 回滚 = 把默认改回 "fuyao" 并把 data/pricestore_fuyao_bak.db 换回来 —— 两件事必须一起做:
+        # v2 库配 fuyao 开关会让 update_daily 拒绝更新 (见 pricestore._update_daily_legacy 的守卫)。
+        "bars": os.environ.get("ASHARE_BARS_SOURCE", "tushare"),
         "tushare_token": os.environ.get("TUSHARE_TOKEN", ""),  # 可选, 留空则只用 akshare
         "industry_classification": "东财",   # 行业分类口径: 东财(EastMoney). akshare 的 board_industry_* 即东财一级行业
         "benchmark_index": "sh000300",  # 沪深300, 用于超额收益基准

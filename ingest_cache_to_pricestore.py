@@ -13,6 +13,9 @@ fuyao 请求, 与 14:00 流水线的 ~5200 次共享同一配额, 晚间必然�
 2026-09-07 追加: bench 缓存补不上时再走 fill_index_gaps —— 直接问 market.fetch_index_bars
 (主源已改 Tushare)。lab 改 --no-update 之后, 服务器上再没有第二处会更新指数表, 而三个免费
 指数源同时哑火已成常态; 这一步是指数表日更的最后一道 (同款收盘/口径守卫, 失败非致命)。
+2026-09-07 换库 (Tushare schema v2) 起: **个股灌库自动空转** —— 见 store_is_v2_tushare()。
+个股日更改由 run_a.sh 开头的 pricestore update (按 trade_date 拉全市场) 负责; 本脚本只剩
+指数补缺一件事, 保留到 P4 一并删。
 """
 import datetime as dt
 import math
@@ -151,11 +154,41 @@ def fill_index_gaps(conn) -> int:
     return len(new)
 
 
+def store_is_v2_tushare(conn) -> bool:
+    """库是不是 Tushare 单源 schema v2 (原始价 + 因子, bars 为物化前复权)。
+
+    是的话**必须跳过个股灌库**: 这里灌的是流水线缓存里的前复权价, 复权基准是"抓取那天"的,
+    与库内 rebase_date 不同; 一旦 INSERT OR REPLACE 进 bars, 就会
+      ① 把刚验收通过的 qfq 口径改花 (P1 验收门4 自证的乘法复权关系当场作废),
+      ② amt 写成 NULL -> module2 的 `近20日均成交额 >= 0.5亿` 流动性门失真,
+      ③ bars 与 bars_raw/adj 脱钩 -> 之后每次 update_daily 的整段重物化都会把它冲掉。
+    v2 的日更走 run_a.sh 开头的 pricestore update (按 trade_date 拉全市场), 这里无事可做。
+    """
+    try:
+        src = dict(conn.execute("SELECT key,value FROM meta")).get("source", "")
+        has_raw = conn.execute("SELECT 1 FROM bars_raw LIMIT 1").fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+    return bool(has_raw) or str(src).lower() == "tushare"
+
+
 def main():
     if not os.path.exists(DB):
         print("pricestore.db 不存在, 跳过")
         return
     conn = sqlite3.connect(DB)
+    if store_is_v2_tushare(conn):
+        print("价格库已是 Tushare schema v2 -> 个股缓存灌库跳过 (日更由 pricestore update 负责); "
+              "只补指数表")
+        try:
+            if ingest_index(conn, load_bench_cache(), (dt.date.today()
+                                                       - dt.timedelta(days=KEEP_DAYS)).isoformat()) == 0:
+                fill_index_gaps(conn)
+        except Exception as e:  # noqa: BLE001
+            print(f"指数缓存灌库异常 (非致命): {e!r}")
+        print(f"idx_bars 末日 {conn.execute('SELECT MAX(d) FROM idx_bars').fetchone()[0]}")
+        conn.close()
+        return
     codes = [r[0] for r in conn.execute("SELECT DISTINCT code FROM bars")]
     f = CONFIG["fetch"]
     today = dt.date.today().isoformat()

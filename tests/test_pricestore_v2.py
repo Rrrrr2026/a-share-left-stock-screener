@@ -9,8 +9,11 @@
   · load(adjust=qfq|hfq|raw) 三口径 + 老库无 bars_raw 时退回 qfq (不静默返回空)
   · universe_at(date): list_date <= d < delist_date (退市股点时进出); **list_date 缺失时**
     落 NULL 而不是 '1970-01-01' 哨兵, 改以 "库内首根 bar" 当在市起点 (前视污染修复)
-  · update_daily 按 trade_date 增量: 因子未变只补当日, 因子变了整段重物化; 钩子返回
-    None 时回退旧逐股路径 (P1 期间生产默认走这条)
+  · update_daily 按 trade_date 增量: 因子未变只补当日, 因子变了整段重物化;
+    **未就绪守卫** (当日行数 < 在市股 90% 就地停下, 不写残缺日, 不越过它);
+    钩子未启用时 v1 老库回退逐股路径, 而 **v2 库一律拒写** (逐股给的是另一套复权基准)
+  · 阶段A 取数改道 (2026-09-07 换库): datasource.fetch_hist 直读库; 库判退市/次新的票
+    不再逐股联网 (东财快照里 196 只历史遗留退市码曾把阶段A 从 98 秒拖到 30 分钟+)
   · ashare/market: 单位换算 (vol 手×100=股, amount 千元×1000=元)、北交所/B股剔除、
     个股 000001 必须是 SZ (不能被指数特判成 SH)、源开关未翻时按日钩子恒返回 None
 
@@ -22,6 +25,9 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
+import types
+import datetime as dt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -294,6 +300,14 @@ def test_universe_null_list_date():
     shutil.rmtree(d, ignore_errors=True)
 
 
+def _snapshot_bars(path):
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("SELECT code,d,o,h,l,c,v,amt FROM bars ORDER BY code,d").fetchall()
+    finally:
+        conn.close()
+
+
 def _day_fixture():
     """两只票三天: 000001 因子不变, 000002 第三天除权 (因子 1.0 -> 1.25)。"""
     days = ["2026-09-03", "2026-09-04", "2026-09-07"]
@@ -352,19 +366,78 @@ def test_update_daily_by_date():
 
 
 def test_update_daily_falls_back():
-    print("\n[钩子未启用 (返回 None) -> 回退旧逐股增量]")
+    print("\n[钩子未启用 (返回 None) + v1 老库 -> 回退旧逐股增量]")
     days, bars, facs = _day_fixture()
     fake = FakeMarket(bars, facs, days, enabled=False)
     d = use_tmp_market(fake)
     conn = ps._conn()
-    conn.executemany("INSERT OR REPLACE INTO bars_raw VALUES(?,?,?,?,?,?,?,?)",
-                     [(c, days[0], *v) for c, v in bars[days[0]].items()])
+    # v1 老库: 只有物化 bars, 没有 bars_raw —— 美股库与 A 股换库前都是这个形态
     conn.executemany("INSERT OR REPLACE INTO bars(code,d,o,h,l,c,v) VALUES(?,?,?,?,?,?,?)",
                      [("000001", days[0], 1, 2, 0.5, 1.5, 9)])
     conn.commit()
     conn.close()
     ps.update_daily()
-    check("走了旧路径 (fetch_bars_bulk 被调用)", bool(fake.legacy_calls))
+    check("v1 老库仍走旧路径 (fetch_bars_bulk 被调用)", bool(fake.legacy_calls))
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_update_daily_v2_refuses_legacy():
+    """2026-09-07 换库后的硬规矩: v2 库上, 按日路径没启用就什么都不写。
+
+    旧逐股路径 _upsert 的是数据源直给的前复权价 (基准 = 抓取那天), 与 v2 的 adj_base 无关;
+    一旦写进 bars 就会把物化 qfq 口径改花、amt 抹成 NULL、bars 与 bars_raw/adj 脱钩。
+    r1shadow / factor_export 在开关还没切 tushare 时也会调 update_daily —— 必须挡住。"""
+    print("\n[v2 库 + 钩子未启用 -> 拒绝写库, 不回退逐股]")
+    days, bars, facs = _day_fixture()
+    fake = FakeMarket(bars, facs, days, enabled=False)
+    d = use_tmp_market(fake)
+    path = os.path.join(d, "pricestore.db")
+    conn = ps._conn()
+    conn.executemany("INSERT OR REPLACE INTO bars_raw VALUES(?,?,?,?,?,?,?,?)",
+                     [(c, days[0], *v) for c, v in bars[days[0]].items()])
+    conn.executemany("INSERT OR REPLACE INTO bars(code,d,o,h,l,c,v,amt) "
+                     "VALUES(?,?,?,?,?,?,?,?)",
+                     [(c, days[0], *v) for c, v in bars[days[0]].items()])
+    conn.commit()
+    conn.close()
+    before = _snapshot_bars(path)
+    check("返回 0 (什么都没写)", ps.update_daily() == 0)
+    check("没有回退到逐股路径", not fake.legacy_calls)
+    check("bars 逐值未被改动", _snapshot_bars(path) == before)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_update_daily_not_ready_guard():
+    """当日行数 < 在市股 90% -> 打 'Tushare 当日未就绪, 沿用昨日库' 并**就地停下**。
+
+    必须是停下不是跳过: days 是连续的, 跳过 D 却写了 D+1, MAX(d) 就越过 D, 那天永远补不回。"""
+    print("\n[未就绪守卫: 半天的行情不许进库]")
+    days, bars, facs = _day_fixture()
+    bars = {k: dict(v) for k, v in bars.items()}
+    bars[days[1]].pop("000002")            # 第二天只回来 1/2 只 = 50% < 90%
+    uni = [("000001", "甲", "2020-01-01", "", "L"), ("000002", "乙", "2020-01-01", "", "L")]
+    fake = FakeMarket(bars, facs, days, universe=uni)
+    d = use_tmp_market(fake)
+    path = os.path.join(d, "pricestore.db")
+    conn = ps._conn()
+    conn.executemany("INSERT OR REPLACE INTO bars_raw VALUES(?,?,?,?,?,?,?,?)",
+                     [(c, days[0], *v) for c, v in bars[days[0]].items()])
+    conn.executemany("INSERT OR REPLACE INTO adj VALUES(?,?,?)",
+                     [(c, days[0], f) for c, f in facs[days[0]].items()])
+    conn.executemany("INSERT OR REPLACE INTO universe(code,name,list_date,delist_date,status) "
+                     "VALUES(?,?,?,?,?)", uni)
+    conn.commit()
+    ps.materialize(None, conn)
+    conn.close()
+    n = ps.update_daily()
+    conn = sqlite3.connect(path)
+    mx = conn.execute("SELECT MAX(d) FROM bars_raw").fetchone()[0]
+    got = dict(conn.execute("SELECT d, COUNT(*) FROM bars_raw GROUP BY d").fetchall())
+    conn.close()
+    check("残缺日一根都没写", got == {days[0]: 2})
+    check("末日仍停在最后一个完整日", mx == days[0])
+    check("残缺日之后的日子也不许抢跑 (停下而非跳过)", days[2] not in got)
+    check("返回 0 根", n == 0)
     shutil.rmtree(d, ignore_errors=True)
 
 
@@ -402,11 +475,13 @@ def test_market_units_and_filters():
 
 
 def test_source_switch_default():
-    print("\n[源开关: 默认不翻 (P1 期间生产照旧)]")
+    print("\n[源开关: 生产默认已切 tushare (2026-09-07 换库), 开关仍可回落 fuyao]")
     saved = CONFIG["source"].get("bars")
     try:
+        check("生产默认是 tushare", str(saved or "").lower() == "tushare")
         CONFIG["source"]["bars"] = "fuyao"
-        check("默认源不是 tushare", amkt._bars_source() == "fuyao" and not amkt._tushare_on())
+        check("回落 fuyao 后按日钩子全部熄火", amkt._bars_source() == "fuyao"
+              and not amkt._tushare_on())
         check("未启用时 fetch_bars_by_date 返回 None (不是 {})",
               amkt.fetch_bars_by_date("2026-09-07") is None)
         check("未启用时 fetch_adj_by_date 返回 None",
@@ -420,11 +495,82 @@ def test_source_switch_default():
         CONFIG["source"]["bars"] = saved
 
 
+def test_stage_a_reads_store():
+    """阶段A 取数改道 (2026-09-07 换库): datasource.fetch_hist 直读库, 且不再为退市票联网。"""
+    print("\n[阶段A: fetch_hist 直读价格库 / 退市票不回落联网]")
+    from ashare import datasource as ds
+    days, bars, facs = _day_fixture()
+    fake = FakeMarket(bars, facs, days)
+    d = use_tmp_market(fake)
+    path = os.path.join(d, "pricestore.db")
+    conn = ps._conn()
+    today = dt.date.today()
+    ds_dates = [(today - dt.timedelta(days=i)).isoformat()
+                for i in range(400, 0, -1)]
+    conn.executemany("INSERT OR REPLACE INTO bars(code,d,o,h,l,c,v,amt) VALUES(?,?,?,?,?,?,?,?)",
+                     [("000001", dd, 10.0, 11.0, 9.0, 10.5, 1000.0, 12345.0) for dd in ds_dates]
+                     + [("000002", dd, 20.0, 21.0, 19.0, 20.5, 2000.0, 42345.0)
+                        for dd in ds_dates[:30]])          # 000002 只有 30 根 = 次新股形态
+    conn.executemany("INSERT OR REPLACE INTO universe(code,name,list_date,delist_date,status) "
+                     "VALUES(?,?,?,?,?)",
+                     [("000001", "甲", "2020-01-01", None, "L"),
+                      ("000002", "乙", "2026-08-01", None, "L"),
+                      ("000009", "丙", "2001-01-01", "2024-05-01", "D")])
+    conn.commit()
+    conn.close()
+
+    saved_dir, saved_src, saved_cache = ds.DATA_DIR, CONFIG["source"].get("bars"), \
+        CONFIG["source"]["use_cache"]
+    ds.DATA_DIR, CONFIG["source"]["bars"], CONFIG["source"]["use_cache"] = d, "tushare", False
+    ds._STORE_TLS = threading.local()
+    ds._store_status = None
+    ds._store_stat.clear()
+    net = []
+    saved_fuyao = sys.modules.get("ashare.fuyao")
+    stub = types.ModuleType("ashare.fuyao")
+    stub.available = lambda: (net.append("fuyao"), True)[1]
+    stub.hist = lambda code, years=2.5: net.append(("hist", code))
+    sys.modules["ashare.fuyao"] = stub
+    try:
+        check("开关生效", ds.bars_from_store_on())
+        df = ds.fetch_hist("000001")
+        check("在市票直读库 (400 根)", df is not None and len(df) == 400)
+        check("列齐 (含 amount, module2 的流动性门要用)",
+              df is not None and {"date", "open", "high", "low", "close", "volume",
+                                  "amount"} <= set(df.columns))
+        check("直读没碰网络", not net)
+        check("退市票直接判无数据", ds.fetch_hist("000009") is None)
+        check("次新股 (库里 30 根) 也不联网 —— 联网也凑不出 255 根",
+              ds.fetch_hist("000002") is None)
+        check("全程零联网", not net)
+        st = ds.store_stats()
+        check("统计: 命中 1 / 跳过 2 / 回落 0",
+              st.get("hit") == 1 and st.get("skipped") == 2 and not st.get("fallback"))
+    finally:
+        ds.DATA_DIR, CONFIG["source"]["bars"], CONFIG["source"]["use_cache"] = \
+            saved_dir, saved_src, saved_cache
+        if saved_fuyao is not None:
+            sys.modules["ashare.fuyao"] = saved_fuyao
+        else:
+            sys.modules.pop("ashare.fuyao", None)
+        ds._STORE_TLS = threading.local()
+        ds._store_status = None
+        ds._store_stat.clear()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_zz_no_check_failures():
+    """pytest 只看有没有抛异常, 而 check() 是打印不是断言 —— 没有这一条, 上面任何一条
+    ✗ FAIL 在 `pytest -q` 里都会被算成绿。放在最后一个 (pytest 按文件顺序跑)。"""
+    assert FAIL == 0, f"{FAIL} 条 check 未通过 (逐条见上面的 ✗ FAIL 行)"
+
+
 TESTS = [test_schema_and_v1_upgrade, test_qfq_math, test_load_adjust_modes,
          test_load_v1_fallback, test_universe_at, test_universe_null_list_date,
-         test_update_daily_by_date,
-         test_update_daily_falls_back, test_market_units_and_filters,
-         test_source_switch_default]
+         test_update_daily_by_date, test_update_daily_falls_back,
+         test_update_daily_v2_refuses_legacy, test_update_daily_not_ready_guard,
+         test_market_units_and_filters, test_source_switch_default,
+         test_stage_a_reads_store]
 
 
 if __name__ == "__main__":

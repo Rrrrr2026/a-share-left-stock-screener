@@ -236,6 +236,11 @@ def run(full_market: bool, use_cache: bool):
                 continue
             if r:
                 hits.append(r)
+    if ds.bars_from_store_on():
+        _st = ds.store_stats()
+        log.info("阶段A 取数来源: 本地价格库 %d 只 / 库判退市直接跳过 %d 只 / 回落联网 %d 只 "
+                 "(Tushare P1: 回落数应是个位数的次新股)",
+                 _st.get("hit", 0), _st.get("skipped", 0), _st.get("fallback", 0))
     log.info("技术命中 %d 只", len(hits))
 
     # ---------------- 模块3-4: 仅对技术分最高的前N只拉基本面 (阶段B) ----------------

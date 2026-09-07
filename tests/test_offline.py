@@ -204,17 +204,31 @@ def test_module1_with_stubs():
         for j, code in enumerate(codes):
             hist_map[code] = gen_series(500 + i * 10 + j, 20 + j, drift, pull=False)
 
-    # 打桩
-    ds.fetch_industry_list = lambda: pd.DataFrame({"industry": inds})
-    ds.fetch_industry_hist = lambda name: idx_map.get(name)
-    ds.fetch_industry_cons = lambda name: cons_map.get(name)
-    ds.fetch_hist = lambda code: hist_map.get(code)
-    ds.fetch_benchmark_close = lambda: gen_series(9, 4000, 0.0010, pull=False)[["date", "close"]]
-    # 只给前 6 个行业资金流数据 (模拟资金流接口只返回部分行业)
-    flow_inds = inds[:6]
-    ds.fetch_industry_fund_flow = lambda: pd.DataFrame(
-        {"industry": flow_inds, "net_inflow": np.linspace(5e8, -5e8, len(flow_inds))})
+    # 打桩。**必须收尾还原**: 这些是模块级赋值, 不还原就会漏给同一进程里后面跑的用例 ——
+    # 2026-09-07 实测: 留在 ds 上的假 fetch_hist 让 test_pricestore_v2 的"阶段A 直读价格库"
+    # 拿到 20 根打桩序列, `pytest tests/` 整目录跑必红, 单独跑该文件却绿 (顺序依赖最难查)。
+    flow_inds = inds[:6]                      # 只给前 6 个行业资金流 (模拟接口只返回部分行业)
+    _stubs = {
+        "fetch_industry_list": lambda: pd.DataFrame({"industry": inds}),
+        "fetch_industry_hist": lambda name: idx_map.get(name),
+        "fetch_industry_cons": lambda name: cons_map.get(name),
+        "fetch_hist": lambda code: hist_map.get(code),
+        "fetch_benchmark_close":
+            lambda: gen_series(9, 4000, 0.0010, pull=False)[["date", "close"]],
+        "fetch_industry_fund_flow": lambda: pd.DataFrame(
+            {"industry": flow_inds, "net_inflow": np.linspace(5e8, -5e8, len(flow_inds))}),
+    }
+    _saved = {k: getattr(ds, k) for k in _stubs}
+    for k, v in _stubs.items():
+        setattr(ds, k, v)
+    try:
+        _module1_checks(inds, flow_inds)
+    finally:
+        for k, v in _saved.items():
+            setattr(ds, k, v)
 
+
+def _module1_checks(inds, flow_inds):
     df = m1.compute_industry_scores()
     check("模块1 返回非空", df is not None and not df.empty)
     check("含景气总分列", "prosperity_score" in df.columns)
