@@ -465,6 +465,12 @@
     <details id="deckMore"><summary data-i18n="deck_more">市场状态详情（机会温度计 / 风险偏好）</summary>
     <div id="deckMoreBody" class="mt-2"></div></details>
   </section>
+  <!-- ⚠ 这一条横条 09-07 老板已下线 (class 里的 hidden, 全站没有任何代码把它取消隐藏;
+       可见的迷你统计 ovMini 只渲染数据日期, 见文件末尾 "2026-09-07 老板: 扫描数/命中数下线")。
+       下面 ov_scanned_title 那个口径提示因此是**看不见的**: 属性在 DOM 里, 但节点 display:none。
+       09-08 起 n_scanned 换了口径 (按库内在市股计, 5180 -> ~4930), 目前前端对用户零提示 ——
+       提示放哪里 (ovMini 的数据日期旁 / 免责声明 / 邮件正文) 待老板定, 见 CHRONICLE 09-07 段。
+       留着它是为了万一横条重新上线时提示就位; 别拿"DOM 里有这个 title"当"用户看得到"。 -->
   <section class="card px-3 py-1.5 mb-2 text-[12px] hidden flex-wrap items-center gap-x-5 gap-y-1">
     <span class="text-slate-400" data-i18n-title="ov_scanned_title" title="2026-09-08 起按库内在市股计（约4950）；此前的扫描数含东财快照里早已退市的老代码（约5180）。"><span data-i18n="ov_scanned">今日扫描数</span> <b id="ovScanned" class="text-white">—</b></span>
     <span class="text-slate-400"><span data-i18n="ov_hit">命中候选数</span> <b id="ovHit" class="text-sky-300">—</b></span>

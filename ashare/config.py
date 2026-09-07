@@ -32,6 +32,33 @@ DASHBOARD_DIR = os.path.join(ROOT_DIR, "dashboard")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, "ashare.db")
+
+
+#: 候选池按库裁 (CONFIG.tech.pool_by_store) 的**可按下去的**回滚口子 -> (是否开, 被谁关的)。
+#: 服务器上 run_a.sh 在跑流水线之前会 `git reset -q --hard origin/main`, 而 config.py 是被
+#: 跟踪文件 —— 值班的人登录服务器把下面的 True 改成 False, 那行改动会在下一次 stock-a 启动的
+#: 头几秒被 reset 抹掉, 日志里既不报错也不提示, **他会以为关掉了其实没关**。09-03「静默跑旧码」
+#: 与 09-07「优质榜静默失败」都是同一种失败形态, 所以这个开关必须留一条服务器上真按得下去的路:
+#:   ① `sudo systemctl edit stock-a` 加 Environment=ASHARE_POOL_BY_STORE=0 (stock-a.service
+#:      现在没有任何 Environment=, 也没有 .env 文件, 所以只有这一条环境变量的路);
+#:   ② 或 `touch /srv/stock/a-share-left-stock-screener/data/pool_by_store.off` —— data/ 不在
+#:      git 里, reset 抹不掉, 且 stock 用户自己就能按, 不需要 root;
+#:   ③ 或在 PC 上改下面的默认值再 commit+push (需要等下一轮或手动重跑)。
+#: 优先级 环境变量 > 停机文件 > 默认值; 无论被哪一层关掉, run_pipeline 都会打一行
+#: "候选池按库裁: 已关闭 (被谁关的)" —— 不允许静默关闭。
+def _pool_by_store_switch(default: bool = True) -> tuple:
+    v = (os.environ.get("ASHARE_POOL_BY_STORE") or "").strip().lower()
+    if v in ("0", "false", "off", "no"):
+        return False, f"环境变量 ASHARE_POOL_BY_STORE={v}"
+    if v in ("1", "true", "on", "yes"):
+        return True, ""
+    off_file = os.path.join(DATA_DIR, "pool_by_store.off")
+    if os.path.exists(off_file):
+        return False, f"停机文件 {off_file}"
+    return bool(default), ""
+
+
+_POOL_BY_STORE, _POOL_BY_STORE_OFF_BY = _pool_by_store_switch(True)
 # 仪表盘读取的数据文件 (导出为 JS, 直接 <script> 引入, 双击 HTML 即可打开, 无需服务器)
 DASHBOARD_DATA_JS = os.path.join(DASHBOARD_DIR, "dashboard_data.js")
 
@@ -117,9 +144,14 @@ CONFIG = {
         # ---- 股票池过滤 ----
         # 2026-09-08: 开扫前按价格库的**点时股票池**裁候选池 (东财快照里混着 196 只早已退市的
         # 老代码和一批次新股, 它们在取数层已被判无数据跳过, 却照样计进对外的 n_scanned)。
-        # 只在 CONFIG.source.bars == 'tushare' 且库存在时生效。**回滚: 这里改 False 即可**,
-        # 一行关掉整段裁池, 回到东财原池 (扫描数回到 ~5180 的老口径)。
-        "pool_by_store": True,
+        # 只在 CONFIG.source.bars == 'tushare' 且库存在时生效。
+        # **回滚**: 服务器上 `systemctl edit stock-a` 加 Environment=ASHARE_POOL_BY_STORE=0,
+        # 或 `touch data/pool_by_store.off`; PC 上才是改这个默认值 (再 commit+push)。
+        # 只在服务器上改下面这一行是**按不下去**的 —— run_a.sh 每次 git reset --hard 会抹掉它。
+        # 判定与提示语见上面 _pool_by_store_switch()。
+        "pool_by_store": _POOL_BY_STORE,
+        # 被谁关的 (环境变量 / 停机文件), 空串 = 没被关。只用于日志, 不允许静默关闭。
+        "pool_by_store_off_by": _POOL_BY_STORE_OFF_BY,
         "exclude_st": True,
         "exclude_new_days": 180,        # 上市交易日不足则视为次新, 剔除
         "min_amount_yi": 0.5,           # 近20日日均成交额下限(亿元)

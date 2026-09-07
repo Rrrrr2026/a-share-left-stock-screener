@@ -688,6 +688,15 @@ STORE_DROP_REASON_CN = {
     "gap": "在池但库内无K线",
 }
 
+#: 哪些裁决**留在候选池里**。卡的规则第一句是"保留 pricestore.universe_at(今日) 内的代码",
+#: 而 gap = 在池(库自己说它今天在市)但窗口内一根 K 线都没有 —— 按规则必须留下。
+#: 09-08 首版把 gap 也裁了, 有两个后果: ① 与规则相反, 库说在市的票被静默移出候选池;
+#: ② 阶段A 根本不会为它调 fetch_hist, 于是 fetch_hist 里那条"只有 gap 才值得回落联网"的
+#: 分支对阶段A 变成死代码 —— 恰恰是"某天某批码没入库"时最需要的兜底 (安全阀只在裁后<3000
+#: 才响, 少掉几十上百只不会触发)。09-07 真实候选池里 gap=0 只, 所以这一条不改变当日任何
+#: 数字, 是给库出岔子那天留的。次新 (too_new) 即使在池也照裁 —— 卡的原文明确要求。
+STORE_KEEP_VERDICTS = ("keep", "gap")
+
 
 def _store_path() -> str:
     return os.path.join(DATA_DIR, "pricestore.db")
@@ -818,7 +827,8 @@ def store_verdict(n_bars: int, last_bar: str | None, in_universe: bool,
     · keep     : 够 60 根, 且 (在点时股票池里 **或** 最后一根 bar 还新鲜) —— 可以扫;
     · stale    : 够 60 根, 但既不在池、最后一根也过期 —— 退市/长停, 别扫;
     · too_new  : 库内 1..59 根 —— 次新股, 联网也凑不出 module2 要的根数;
-    · gap      : 一根都没有但在池里 —— 真缺口 (fetch_hist 据此回落联网);
+    · gap      : 一根都没有但在池里 —— 真缺口, **留在候选池里** (见 STORE_KEEP_VERDICTS),
+                 由 fetch_hist 为它回落联网; 这是"库某天漏了一批码"时唯一的兜底;
     · absent   : 一根都没有也不在池 —— 东财快照的历史遗留退市码 (09-07 实测 196 只)。
 
     "在市证据以 K 线为准" 那一条 (in_universe=False 但 bar 新鲜也 keep) 是为库里有 K 线、
@@ -860,20 +870,28 @@ def store_pool_meta() -> dict:
 
 
 def store_universe_filter(codes, days: int | None = None) -> tuple:
-    """候选池 -> (库内在市的代码 list, {原因: [{code,n_bars,last_bar}, ...]})。
+    """候选池 -> (库内在市的代码 list, {原因: [{code,n_bars,last_bar}, ...]}, 降级原因 str|None)。
 
     东财快照给的候选池混着早已退市的老代码与次新股 (09-07 实测 5,180 只里 196 只退市);
     它们在取数层已经被判"无数据"跳过, 但仍然计进对外的 n_scanned —— 分母不诚实。这里在
     开扫之前就按库内点时股票池裁掉, 让"扫描数"回到"今天真的扫了这么多只"。
 
-    判据与 fetch_hist 完全同源 (`store_verdict`)。入参顺序保留; 库读不出来时原样返回不裁。
+    判据与 fetch_hist 完全同源 (`store_verdict` + `STORE_KEEP_VERDICTS`)。
+
+    **第三个返回值是"没能裁"与"没什么可裁"的分界**, 调用方必须据此定对外口径:
+    None = 过滤器真的跑完了 (哪怕一只没裁, 那也是新口径);
+    非空字符串 = 库/尺子不可用, 原样放行, 这一轮的分母还是**老口径**。
+    09-08 首版没有这个返回值, 两种情形都是 `(codes, {})`, 于是"库读不出来"那天一只没裁、
+    n_pool_raw == n_scanned == 5180, scan_basis 却自称 'store_universe' —— 这个字段存在的
+    唯一理由就是让事后对账的人分清新老口径, 那样等于恰恰在它最该说真话的那天说了假话。
     """
     codes = [str(c) for c in (codes or [])]
     win = int(days or max(int(CONFIG["fetch"]["lookback_days"]), STORE_HIST_DAYS))
     uni, fresh_after = _store_pit_ctx()
     if uni is None:
-        log.warning("价格库点时股票池不可用, 候选池不裁 (%d 只原样进阶段A)", len(codes))
-        return (codes, {})
+        log.warning("价格库点时股票池不可用, 候选池不裁 (%d 只原样进阶段A, 对外口径仍是老口径)",
+                    len(codes))
+        return (codes, {}, "价格库点时股票池不可用(universe 表空/老库/读取失败)")
     start = (dt.date.today() - dt.timedelta(days=win)).isoformat()
     probe: dict = {}
     try:
@@ -881,19 +899,19 @@ def store_universe_filter(codes, days: int | None = None) -> tuple:
         probe = {r[0]: (int(r[1] or 0), r[2]) for r in _store_conn().execute(
             "SELECT code, COUNT(*), MAX(d) FROM bars WHERE d>=? GROUP BY code", (start,))}
     except Exception as e:                                     # noqa: BLE001
-        log.warning("价格库 bar 统计失败, 候选池不裁: %s", str(e)[:160])
-        return (codes, {})
+        log.warning("价格库 bar 统计失败, 候选池不裁 (对外口径仍是老口径): %s", str(e)[:160])
+        return (codes, {}, f"价格库 bar 统计失败: {str(e)[:80]}")
     keep, dropped = [], {}
     for code in codes:
         n, last = probe.get(code, (0, None))
         v = store_verdict(n, last, code in uni, fresh_after)
-        if v == "keep":
+        if v in STORE_KEEP_VERDICTS:
             keep.append(code)
         else:
             dropped.setdefault(v, []).append(
                 {"code": code, "n_bars": n, "last_bar": last,
                  "status": _store_status_map().get(code) or None})
-    return (keep, dropped)
+    return (keep, dropped, None)
 
 
 def backtest_prices_from_store_on() -> bool:
@@ -919,6 +937,14 @@ def _store_max_date() -> str | None:
 #: 把 2,600 只票全推回腾讯, 那正是本卡要消灭的东西。
 STORE_STALE_MAX_DAYS = 7
 
+#: 库**明说**这只票不再交易的状态 (Tushare stock_basic: L 上市 / D 退市 / P 暂停上市)。
+#: 只有落进这个集合才算"联网也白跑"。**"库内查无此码" 不在此列** —— 那是"库没听说过",
+#: 不是"库说它死了": universe 来自 Tushare stock_basic, 实测它对北交所 (8xx/43x/92x) 与
+#: B 股 (200x/900x) 各 0 行, 把"没听说过"当"已退市"会让这些板块在回测链上永久静默无数据
+#: (历史快照里已有 4 只在市 B 股候选: 深粮B/一致Ｂ/宁通信B/安道麦B)。设计文档 §3 写的也是
+#: "库内无此码 -> 仅该码回落网络"; 09-08 首版实现写反了, 这里改回与文档一致。
+_STORE_DEAD_STATUS = ("D", "P")
+
 
 def price_series_from_store(codes: list, start: str,
                             need_date: str | None = None) -> tuple[dict, list]:
@@ -928,8 +954,11 @@ def price_series_from_store(codes: list, start: str,
     与 raw 同口径; qfq 的基准是库内最新一天, 快照日之后的任何除权都会让那天的 qfq 价平移),
     **收益要前复权** (跨除权只有 qfq 的涨跌幅是真涨跌幅)。两条序列逐位同索引。
 
-    回落名单只含"库说它在市、库里却没有近期 bar"的码; 库判退市/不在池的直接判无数据 ——
-    这些是东财候选池里的历史遗留代码 (09-07 实测 196 只), 联网也只是白跑。
+    窗口内 <5 根 bar 时按 universe 分三路 (日志也分三个计数, 别混成一桶):
+      · `status in ("D","P")` -> 库明说退市/暂停, **不联网** (东财候选池里的历史遗留代码,
+        09-07 实测 196 只, 联网只是每天几百次注定失败的请求);
+      · `status == "L"`       -> 库说在市却没数据 = 真缺口, 回落联网;
+      · 库内查无此码           -> 也回落联网 (见 `_STORE_DEAD_STATUS` 注释)。
     """
     if need_date:
         mx = _store_max_date()
@@ -941,7 +970,7 @@ def price_series_from_store(codes: list, start: str,
             log.warning("回测取价: 价格库末日 %s 落后目标日 %s %d 天 (>%d), 整批回落联网",
                         mx, need_date, lag, STORE_STALE_MAX_DAYS)
             return {}, list(codes)
-    out, fallback, dead = {}, [], 0
+    out, fallback, dead, unknown = {}, [], 0, 0
     status = _store_status_map()
     for code in codes:
         try:
@@ -954,9 +983,12 @@ def price_series_from_store(codes: list, start: str,
             _STORE_TLS.conn = None                             # 连接坏了就丢掉, 下次重开
             rows = []
         if len(rows) < 5:
-            if status and status.get(code, "") != "L":
-                dead += 1                                      # 退市/不在池: 不联网
+            st = status.get(code) if status else None
+            if st in _STORE_DEAD_STATUS:
+                dead += 1                                      # 库明说退市/暂停: 不联网
             else:
+                if st is None:
+                    unknown += 1                               # 库内查无此码 (B股/北交所...)
                 fallback.append(code)
             continue
         out[code] = {
@@ -965,8 +997,8 @@ def price_series_from_store(codes: list, start: str,
             "raw_close": np.array([np.nan if r[5] is None else r[5] for r in rows],
                                   dtype=float),
         }
-    log.info("回测取价 读库: 命中 %d / 回落联网 %d / 判退市跳过 %d (共 %d)",
-             len(out), len(fallback), dead, len(codes))
+    log.info("回测取价 读库: 命中 %d / 回落联网 %d (其中库内查无此码 %d) / 库判退市跳过 %d "
+             "(共 %d)", len(out), len(fallback), unknown, dead, len(codes))
     return out, fallback
 
 

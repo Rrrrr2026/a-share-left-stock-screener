@@ -586,6 +586,8 @@ def test_store_universe_filter():
     check("④ 无 bar: 在池=gap(值得回落联网) / 不在池=absent(退市老代码)",
           ds.store_verdict(0, None, True, fresh) == "gap"
           and ds.store_verdict(0, None, False, fresh) == "absent")
+    check("留在池里的裁决 = keep + gap (gap 在 universe_at 里, 按卡的规则必须留)",
+          tuple(ds.STORE_KEEP_VERDICTS) == ("keep", "gap"))
 
     # ---- 再用临时最小 v2 库跑一遍真链路
     fake = FakeMarket({}, {}, [])
@@ -624,17 +626,23 @@ def test_store_universe_filter():
     ds._store_pit = None
     try:
         codes = ["600000", "000022", "600001", "301999", "000004", "600002"]
-        keep, dropped = ds.store_universe_filter(codes)
+        keep, dropped, degraded = ds.store_universe_filter(codes)
         by = {k: sorted(x["code"] for x in v) for k, v in dropped.items()}
+        check("过滤器真的跑完了 (第三个返回值 None = 不是降级放行)", degraded is None)
         check("① 在池老票留下", "600000" in keep)
         check("② 不在 universe 表但K线新鲜 -> 留下 (000022 那三只)", "000022" in keep)
         check("②' 有K线但过期 -> 裁 (stale)", by.get("stale") == ["600001"])
-        check("③ 次新 30 根 -> 裁 (too_new)", by.get("too_new") == ["301999"])
+        check("③ 次新 30 根 -> 裁 (too_new, 在池也照裁: 60 根是 module2 的硬起步)",
+              by.get("too_new") == ["301999"])
         check("④ 退市无K线 -> 裁 (absent)", by.get("absent") == ["000004"])
-        check("④' 在池却一根K线都没有 -> 裁 (gap, 但 fetch_hist 会为它回落联网)",
-              by.get("gap") == ["600002"])
-        check("裁后只剩两只, 且保留入参顺序", keep == ["600000", "000022"])
+        # 09-08 首版把 gap 也裁了 —— 与卡的规则("保留 universe_at 内的代码")相反, 且阶段A
+        # 从此不会为它调 fetch_hist, fetch_hist 里那条"只有 gap 才回落联网"的分支成了死代码。
+        check("④' 在池却一根K线都没有 -> **留下** (gap: 库说它今天在市, 由 fetch_hist 回落联网)",
+              "600002" in keep and "gap" not in dropped)
+        check("裁后剩三只, 且保留入参顺序", keep == ["600000", "000022", "600002"])
         check("裁前裁后数对得上", len(keep) + sum(len(v) for v in dropped.values()) == len(codes))
+        check("gap 票在取数层仍会回落联网 (没有库就没有 'skipped')",
+              ds._store_verdict_one("600002", 913) == "gap")
         meta = ds.store_pool_meta()
         check("留痕: 新鲜度截止日取自库内交易日历 (末 10 个交易日)",
               meta["fresh_after"] == days[-10] and meta["min_bars"] == 60)
@@ -668,6 +676,145 @@ def test_store_universe_filter():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_pool_trim_basis_and_rollback():
+    """裁池的**对外口径 (scan_basis)** 与**回滚口子** —— 09-08 复检补的两处。
+
+    ① scan_basis 存在的唯一理由是让前端/历史快照分清"这一天的分母是新口径还是老口径"。
+       首版 `if not dropped: return universe, ("store_universe" if len(keep)==raw_n ...)`
+       把"没什么可裁"和"没能裁"混为一谈: 库读不出来那天一只都没裁 (分母还是老口径的 5180),
+       却自称 store_universe、n_pool_raw == n_scanned —— 事后对账的人会把 5180 当成"裁后的
+       在市股数", 比没有这个字段更糟。两条降级路径必须标回 raw_spot。
+    ② 回滚开关必须在**服务器上**按得下去: run_a.sh 跑之前 `git reset -q --hard origin/main`,
+       config.py 是被跟踪文件, 值班的人在服务器上改 False 会在下一次 stock-a 启动的头几秒被
+       抹掉且毫无提示 —— 他会以为关掉了其实没关 (09-03/09-07 两次静默事故的同一形态)。
+       所以要有环境变量与停机文件两条不经过 git 的路, 且关闭必须打日志。
+    """
+    print("\n[裁池对外口径 scan_basis + 回滚口子]")
+    import json as _json
+    from ashare import datasource as ds
+    import ashare.config as cfgmod
+    import run_pipeline as rp
+
+    uni = [(f"{600000 + i:06d}", f"票{i}", "行业") for i in range(5180)]
+    codes = [c for (c, _, _) in uni]
+    saved = (ds.bars_from_store_on, ds.store_universe_filter, ds.store_pool_meta,
+             rp.DATA_DIR, CONFIG["tech"].get("pool_by_store"),
+             CONFIG["tech"].get("pool_by_store_off_by"))
+    tmp = tempfile.mkdtemp(prefix="pooltrim_")
+    try:
+        ds.bars_from_store_on = lambda: True
+        ds.store_pool_meta = lambda: {"n_universe": 5216, "fresh_after": "2026-08-25",
+                                      "min_bars": 60, "fresh_trade_days": 10}
+        rp.DATA_DIR = tmp
+        CONFIG["tech"]["pool_by_store"] = True
+
+        # ---- 降级① 点时股票池读不出来 (universe 表空 / 老库 / universe_at 抛错)
+        ds.store_universe_filter = lambda cs, days=None: (list(cs), {}, "价格库点时股票池不可用")
+        out, basis = rp.trim_universe_by_store(uni, "2026-09-08")
+        check("降级①(点时股票池不可用): 一只没裁, 口径必须标回 raw_spot 而不是 store_universe",
+              len(out) == len(uni) and basis == "raw_spot")
+        # ---- 降级② bars 统计 SQL 失败 (库被锁 / 库文件坏)
+        ds.store_universe_filter = lambda cs, days=None: (
+            list(cs), {}, "价格库 bar 统计失败: database is locked")
+        out, basis = rp.trim_universe_by_store(uni, "2026-09-08")
+        check("降级②(bar 统计失败): 一只没裁, 口径标回 raw_spot",
+              len(out) == len(uni) and basis == "raw_spot")
+
+        # ---- 真的裁: 这时候口径才配叫 store_universe, 且名单要落盘
+        cut = {"absent": [{"code": c, "n_bars": 0, "last_bar": None, "status": "D"}
+                          for c in codes[:177]],
+               "too_new": [{"code": c, "n_bars": 25, "last_bar": "2026-09-07", "status": "L"}
+                           for c in codes[177:210]]}
+        gone = {x["code"] for v in cut.values() for x in v}
+        ds.store_universe_filter = lambda cs, days=None: (
+            [c for c in cs if c not in gone], cut, None)
+        out, basis = rp.trim_universe_by_store(uni, "2026-09-08")
+        check("真的裁: 5180 -> 4970, 口径 store_universe",
+              len(out) == 4970 and basis == "store_universe")
+        p = os.path.join(tmp, "pool_cut", "2026-09-08.json")
+        rec = _json.load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
+        check("裁掉的名单按原因落到 data/pool_cut/<run_date>.json (data/ 不进 git)",
+              rec.get("n_pool_raw") == 5180 and rec.get("n_kept") == 4970
+              and rec.get("n_dropped") == 210
+              and sorted(rec.get("dropped") or {}) == ["absent", "too_new"])
+
+        # ---- 过滤器真的跑完了、只是没什么可裁 -> 仍然是新口径
+        ds.store_universe_filter = lambda cs, days=None: (list(cs), {}, None)
+        out, basis = rp.trim_universe_by_store(uni, "2026-09-08")
+        check("无可裁但过滤器跑完了: 口径 store_universe (这才是'没什么可裁')",
+              len(out) == len(uni) and basis == "store_universe")
+
+        # ---- 安全阀: 裁后太少 = 库/尺子出了问题, 不裁, 且口径标回老口径
+        ds.store_universe_filter = lambda cs, days=None: (
+            list(cs)[:100],
+            {"absent": [{"code": c, "n_bars": 0, "last_bar": None, "status": None}
+                        for c in codes[100:]]}, None)
+        out, basis = rp.trim_universe_by_store(uni, "2026-09-08")
+        check("安全阀: 裁后只剩 100/5180 -> 本轮不裁, 口径 raw_spot",
+              len(out) == len(uni) and basis == "raw_spot")
+
+        # ---- 回滚: 关掉之后必须有日志说"被谁关的" (只写 WARNING 的兜底 = 静默失败)
+        import logging as _lg
+
+        class _Cap(_lg.Handler):
+            def __init__(self):
+                super().__init__()
+                self.msgs = []
+
+            def emit(self, r):
+                self.msgs.append(r.getMessage())
+
+        cap = _Cap()
+        rp.log.addHandler(cap)
+        lvl = rp.log.level
+        rp.log.setLevel(_lg.INFO)          # 根 logger 默认 WARNING, 不放行这条 INFO
+        try:
+            CONFIG["tech"]["pool_by_store"] = False
+            CONFIG["tech"]["pool_by_store_off_by"] = "环境变量 ASHARE_POOL_BY_STORE=0"
+            out, basis = rp.trim_universe_by_store(uni, "2026-09-08")
+            check("回滚: 关掉后原样放行 + 口径 raw_spot",
+                  len(out) == len(uni) and basis == "raw_spot")
+            check("回滚不静默: 日志写明被谁关的 (值班的人能确认真的关上了)",
+                  any("已关闭" in m and "ASHARE_POOL_BY_STORE=0" in m for m in cap.msgs))
+        finally:
+            rp.log.removeHandler(cap)
+            rp.log.setLevel(lvl)
+    finally:
+        (ds.bars_from_store_on, ds.store_universe_filter, ds.store_pool_meta,
+         rp.DATA_DIR, CONFIG["tech"]["pool_by_store"],
+         CONFIG["tech"]["pool_by_store_off_by"]) = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- 服务器上按得下去的两条路 (都不经过 git, run_a.sh 的 git reset --hard 抹不掉)
+    saved_env = os.environ.get("ASHARE_POOL_BY_STORE")
+    saved_data_dir = cfgmod.DATA_DIR
+    d2 = tempfile.mkdtemp(prefix="poolsw_")
+    try:
+        cfgmod.DATA_DIR = d2
+        os.environ.pop("ASHARE_POOL_BY_STORE", None)
+        check("默认: 没有环境变量也没有停机文件 -> 开, off_by 为空",
+              cfgmod._pool_by_store_switch(True) == (True, ""))
+        os.environ["ASHARE_POOL_BY_STORE"] = "0"
+        on, why = cfgmod._pool_by_store_switch(True)
+        check("回滚①: 环境变量 ASHARE_POOL_BY_STORE=0 关掉 (systemctl edit stock-a 那条路)",
+              on is False and "ASHARE_POOL_BY_STORE=0" in why)
+        os.environ.pop("ASHARE_POOL_BY_STORE", None)
+        open(os.path.join(d2, "pool_by_store.off"), "w").close()
+        on, why = cfgmod._pool_by_store_switch(True)
+        check("回滚②: 停机文件 data/pool_by_store.off 关掉 (stock 用户不需要 root)",
+              on is False and "pool_by_store.off" in why)
+        os.environ["ASHARE_POOL_BY_STORE"] = "1"
+        check("优先级: 环境变量压过停机文件 (=1 时照开)",
+              cfgmod._pool_by_store_switch(True) == (True, ""))
+    finally:
+        cfgmod.DATA_DIR = saved_data_dir
+        if saved_env is None:
+            os.environ.pop("ASHARE_POOL_BY_STORE", None)
+        else:
+            os.environ["ASHARE_POOL_BY_STORE"] = saved_env
+        shutil.rmtree(d2, ignore_errors=True)
+
+
 def test_zz_no_check_failures():
     """pytest 只看有没有抛异常, 而 check() 是打印不是断言 —— 没有这一条, 上面任何一条
     ✗ FAIL 在 `pytest -q` 里都会被算成绿。放在最后一个 (pytest 按文件顺序跑)。"""
@@ -679,7 +826,8 @@ TESTS = [test_schema_and_v1_upgrade, test_qfq_math, test_load_adjust_modes,
          test_update_daily_by_date, test_update_daily_falls_back,
          test_update_daily_v2_refuses_legacy, test_update_daily_not_ready_guard,
          test_market_units_and_filters, test_source_switch_default,
-         test_stage_a_reads_store, test_store_universe_filter]
+         test_stage_a_reads_store, test_store_universe_filter,
+         test_pool_trim_basis_and_rollback]
 
 
 if __name__ == "__main__":

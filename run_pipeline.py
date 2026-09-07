@@ -141,28 +141,49 @@ def trim_universe_by_store(universe, run_date):
     "扫描数"才是"今天真的扫了这么多只"(约 4,950), 代价是与 09-08 之前的历史快照有口径断层
     (老板 09-07 夜已拍板接受), meta.scan_basis / n_pool_raw 就是给前端留的断层标记。
 
-    **回滚**: CONFIG['tech']['pool_by_store'] = False 即整段关掉, 回到东财原池。
-    安全阀: 裁后不足 3000 只 (或不足原池 60%) 一律判为库/尺子出了问题, 原样放行不裁 ——
-    宁可多扫 200 只退市码, 也不能因为库没更新就把候选池清空。
+    **回滚 (三层, 按优先级)**: ① 服务器上 `sudo systemctl edit stock-a` 加
+    `Environment=ASHARE_POOL_BY_STORE=0`; ② 或 `touch <repo>/data/pool_by_store.off`
+    (stock 用户就能按, 不需要 root); ③ 或 PC 上把 CONFIG['tech']['pool_by_store'] 改 False
+    再 commit+push。**光在服务器上改 config.py 是按不下去的** —— run_a.sh 每次启动前
+    `git reset -q --hard origin/main`, 手改会在下一次 stock-a 起来的头几秒被丢弃, 而且
+    日志里不会有任何异常, 值班的人会以为关掉了其实没关 (见 config.pool_by_store 那段)。
+    无论被哪一层关掉, 日志都会打一行"已关闭 (被谁关的)", 不存在静默关闭。
+
+    安全阀: 裁后不足原池 60% (原池本身有 3000 只以上时再加一道 3000 只的绝对下限) 一律判为
+    库/尺子出了问题, 原样放行不裁 —— 宁可多扫 200 只退市码, 也不能因为库没更新就把候选池清空。
     """
     raw_n = len(universe)
     if not CONFIG["tech"].get("pool_by_store", True):
-        log.info("候选池按库裁: 已由 CONFIG.tech.pool_by_store 关闭, 沿用东财原池 %d 只", raw_n)
+        log.info("候选池按库裁: 已关闭 (%s), 沿用东财原池 %d 只",
+                 CONFIG["tech"].get("pool_by_store_off_by") or "CONFIG.tech.pool_by_store=False",
+                 raw_n)
         return universe, "raw_spot"
     if not ds.bars_from_store_on():
         return universe, "raw_spot"
     try:
-        keep, dropped = ds.store_universe_filter([c for (c, _, _) in universe])
+        keep, dropped, degraded = ds.store_universe_filter([c for (c, _, _) in universe])
     except Exception as e:                                     # noqa: BLE001
-        log.warning("候选池按库裁失败(沿用东财原池): %s", e)
+        log.warning("候选池按库裁失败(沿用东财原池, 口径标回 raw_spot): %s", e)
         return universe, "raw_spot"
-    if not dropped:
-        return universe, ("store_universe" if len(keep) == raw_n else "raw_spot")
-    if len(keep) < max(3000, int(raw_n * 0.6)):
+    # 「没能裁」≠「没什么可裁」: 库读不出来时一只都没裁, 这一轮的分母就还是老口径的 5180,
+    # 对外必须标 raw_spot。09-08 首版在这里只看 dropped 空不空, 于是降级那天 scan_basis
+    # 自称新口径却给老数字 —— 事后对账的人会把 5180 当成"裁后的在市股数", 比没这个字段更糟。
+    if degraded:
+        log.warning("候选池按库裁: 未能按库裁 (%s), 沿用东财原池 %d 只, 对外口径标回 raw_spot",
+                    degraded, raw_n)
+        return universe, "raw_spot"
+    floor = int(raw_n * 0.6)
+    if raw_n >= 3000:            # 原池本身就没到 3000 时(行业成分大面积失败), 上游已有"并入
+        floor = max(floor, 3000)  # 全市场池补齐"那道闸, 这里不该再拿绝对数当尺子
+    if len(keep) < floor:
         log.warning("候选池按库裁: 裁后只剩 %d/%d 只, 明显不对(库未更新?), 本轮不裁", len(keep), raw_n)
         return universe, "raw_spot"
     kept = set(keep)
     out = [t for t in universe if t[0] in kept]
+    if not dropped:
+        # 过滤器真的跑完了, 只是这一池全都在库内在市 —— 是新口径, 照标 store_universe
+        log.info("候选池按库裁: 东财 %d 只全部在库内在市, 无可裁 (口径 store_universe)", raw_n)
+        return out, "store_universe"
     parts = ", ".join(f"{ds.STORE_DROP_REASON_CN.get(k, k)} {len(v)}"
                       for k, v in sorted(dropped.items(), key=lambda kv: -len(kv[1])))
     log.info("候选池按库裁: 东财 %d → 库内在市 %d (裁 %d: %s)",
