@@ -896,6 +896,80 @@ def store_universe_filter(codes, days: int | None = None) -> tuple:
     return (keep, dropped)
 
 
+def backtest_prices_from_store_on() -> bool:
+    """回测/模拟盘/双周取价是否直读价格库 (P2)。
+
+    两个开关都要为真: `source.bars == "tushare"` (库是 Tushare 单源 v2, 有 bars_raw 可锚)
+    + `source.backtest_prices_from_store` (本条链的独立回滚开关)。
+    """
+    if not bars_from_store_on():
+        return False
+    return bool(CONFIG["source"].get("backtest_prices_from_store", True))
+
+
+def _store_max_date() -> str | None:
+    try:
+        return _store_conn().execute("SELECT MAX(d) FROM bars").fetchone()[0]
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+#: 库末日允许落后 `need_date` 多少个**自然日**。比的是 need_date (调用方要重放到的最后一天)
+#: 而不是 today —— 长假里 today-MAX(d) 必然 >7 天, 拿 today 当尺子会在每个国庆/春节的第一天
+#: 把 2,600 只票全推回腾讯, 那正是本卡要消灭的东西。
+STORE_STALE_MAX_DAYS = 7
+
+
+def price_series_from_store(codes: list, start: str,
+                            need_date: str | None = None) -> tuple[dict, list]:
+    """价格库 -> ({code: {dates, ohlc(qfq), raw_close}}, 需要回落联网的代码)。
+
+    一次 JOIN 同时取前复权 (bars) 与原始收盘 (bars_raw): **锚定要原始价** (快照价是当天成交价,
+    与 raw 同口径; qfq 的基准是库内最新一天, 快照日之后的任何除权都会让那天的 qfq 价平移),
+    **收益要前复权** (跨除权只有 qfq 的涨跌幅是真涨跌幅)。两条序列逐位同索引。
+
+    回落名单只含"库说它在市、库里却没有近期 bar"的码; 库判退市/不在池的直接判无数据 ——
+    这些是东财候选池里的历史遗留代码 (09-07 实测 196 只), 联网也只是白跑。
+    """
+    if need_date:
+        mx = _store_max_date()
+        if not mx:
+            log.warning("回测取价: 价格库无 bars, 整批回落联网")
+            return {}, list(codes)
+        lag = (dt.date.fromisoformat(need_date) - dt.date.fromisoformat(mx)).days
+        if lag > STORE_STALE_MAX_DAYS:
+            log.warning("回测取价: 价格库末日 %s 落后目标日 %s %d 天 (>%d), 整批回落联网",
+                        mx, need_date, lag, STORE_STALE_MAX_DAYS)
+            return {}, list(codes)
+    out, fallback, dead = {}, [], 0
+    status = _store_status_map()
+    for code in codes:
+        try:
+            rows = _store_conn().execute(
+                "SELECT b.d, b.o, b.h, b.l, b.c, r.c FROM bars b "
+                "LEFT JOIN bars_raw r ON r.code = b.code AND r.d = b.d "
+                "WHERE b.code=? AND b.d>=? ORDER BY b.d", (code, start)).fetchall()
+        except Exception as e:                                 # noqa: BLE001
+            log.debug("回测取价 读库 %s 失败: %s", code, str(e)[:120])
+            _STORE_TLS.conn = None                             # 连接坏了就丢掉, 下次重开
+            rows = []
+        if len(rows) < 5:
+            if status and status.get(code, "") != "L":
+                dead += 1                                      # 退市/不在池: 不联网
+            else:
+                fallback.append(code)
+            continue
+        out[code] = {
+            "dates": [r[0] for r in rows],
+            "ohlc": np.array([r[1:5] for r in rows], dtype=float),
+            "raw_close": np.array([np.nan if r[5] is None else r[5] for r in rows],
+                                  dtype=float),
+        }
+    log.info("回测取价 读库: 命中 %d / 回落联网 %d / 判退市跳过 %d (共 %d)",
+             len(out), len(fallback), dead, len(codes))
+    return out, fallback
+
+
 def _store_note(kind: str) -> None:
     with _store_stat_lock:
         _store_stat[kind] = _store_stat.get(kind, 0) + 1

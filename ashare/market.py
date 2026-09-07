@@ -38,15 +38,32 @@ def _drop_partial_today() -> str | None:
     return None
 
 
-def fetch_price_series(codes: list, start: str) -> dict:
-    """code -> {"dates":[...], "ohlc": ndarray[N,4] (o,h,l,c)}; 腾讯前复权日线。
-    窗口只有几个月 (<640根), 单请求即可拿全; 盘中运行时丢弃今天未走完的bar。
-    (stock_detail 兜底由核心统一处理, 这里只负责网络取数。)"""
+def fetch_price_series(codes: list, start: str, need_date: str | None = None) -> dict:
+    """回测/模拟盘/双周的取价。
+
+    -> {code: {"dates":[...], "ohlc": ndarray[N,4] 前复权(o,h,l,c),
+               "raw_close": ndarray[N] 原始收盘 (只有走库时才有)}}
+
+    **主路: 直读 data/pricestore.db** (P2, 2026-09-07)。这是阶段A 之后剩下的最后一条逐股网络
+    依赖: 09-07 晚上 2,586 只走腾讯只拿回 657 只 (WAF 配额), 服务器同日 14:00 那轮更是
+    "价格进度 543/543 (拿到 2)" 全靠 stock_detail 兜底 —— 这条路已经烂了。读库实测 0.19 秒。
+    同时多返回一条 `raw_close`: 核心的 `find_anchor` 要用**原始价**匹配快照价 (快照价是当天的
+    成交价; 前复权基准是"库内最新一天", 快照日之后除权就会平移那天的 qfq 价, 打穿 0.25% 容差)。
+
+    回落链 (仅限库里真没有的那几只 / 开关关掉 / 库落后太多): 原来的腾讯前复权日线,
+    窗口只有几个月 (<640根) 单请求拿全; 盘中运行时丢弃今天未走完的bar。
+    (stock_detail 兜底由核心统一处理, 这里只负责取数。)
+    """
     from concurrent.futures import ThreadPoolExecutor
     from . import datasource as ds
     today = dt.date.today().isoformat()
     skip_day = _drop_partial_today()
     res = {}
+
+    if ds.backtest_prices_from_store_on():
+        res, codes = ds.price_series_from_store(codes, start, need_date)
+        if not codes:
+            return res
 
     def one(code):
         try:
@@ -72,12 +89,14 @@ def fetch_price_series(codes: list, start: str) -> dict:
         return code, {"dates": [r[0] for r in rows],
                       "ohlc": np.array([r[1:] for r in rows], dtype=float)}
 
+    n_store = len(res)
     with ThreadPoolExecutor(max_workers=6) as exe:
         for i, (code, ser) in enumerate(exe.map(one, codes), 1):
             if ser:
                 res[code] = ser
             if i % 300 == 0 or i == len(codes):
-                log.info("价格进度 %d/%d (拿到 %d)", i, len(codes), len(res))
+                log.info("价格进度(联网) %d/%d (拿到 %d, 另有 %d 只来自价格库)",
+                         i, len(codes), len(res) - n_store, n_store)
     return res
 
 

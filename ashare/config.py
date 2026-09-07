@@ -51,6 +51,19 @@ CONFIG = {
         # 回滚 = 把默认改回 "fuyao" 并把 data/pricestore_fuyao_bak.db 换回来 —— 两件事必须一起做:
         # v2 库配 fuyao 开关会让 update_daily 拒绝更新 (见 pricestore._update_daily_legacy 的守卫)。
         "bars": os.environ.get("ASHARE_BARS_SOURCE", "tushare"),
+        # 回测/模拟盘/双周的取价 (fetch_price_series) 是否也读价格库 (P2, 2026-09-07)。
+        # 与 "bars" 是**两个**开关: 这条链的锚定口径 (find_anchor 改用原始价) 与阶段A 无关,
+        # 出问题要能单独关掉而不必把整个 bars 源退回 fuyao。关掉 = 退回逐股腾讯前复权。
+        #
+        # **默认 0 (关) 等老板拍板**: 代码与验证都齐了 (锚定 exact 命中 raw 97.5% vs qfq 92.9%,
+        # 抽样 26 笔快照价与 raw 锚定bar 逐值相等、10日收益与手算 raw×因子比一致到 1e-6,
+        # 2,586 只读库 0.19 秒), 但重放 pool 级 win10 从 52.3% 抬到 53.2% (+0.9pp), 超过卡上
+        # 0.5pp 的验收线 —— 差异 100% 归因于"旧口径把入场日提前了 1..6 根bar"(102 笔里 98 笔
+        # 是修复, 2 笔是快照自己存了前复权价), 是**修正不是回归**, 但它会改动对外公布的胜率,
+        # 不该由执行者自己开。开启方式二选一: 这里默认值改成 "1", 或运行环境里设
+        # ASHARE_BACKTEST_PRICES_FROM_STORE=1。详见 stock-core/design/backtest_price_from_store.md。
+        "backtest_prices_from_store":
+            os.environ.get("ASHARE_BACKTEST_PRICES_FROM_STORE", "0") not in ("0", "false", "False"),
         "tushare_token": os.environ.get("TUSHARE_TOKEN", ""),  # 可选, 留空则只用 akshare
         "industry_classification": "东财",   # 行业分类口径: 东财(EastMoney). akshare 的 board_industry_* 即东财一级行业
         "benchmark_index": "sh000300",  # 沪深300, 用于超额收益基准
