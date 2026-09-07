@@ -515,6 +515,24 @@ def _days_in_store(path):
         conn.close()
 
 
+def _meta_of(path):
+    conn = sqlite3.connect(path)
+    try:
+        return dict(conn.execute("SELECT key, value FROM meta").fetchall())
+    finally:
+        conn.close()
+
+
+def _bars_of(path, code):
+    """-> [(d, 前复权收盘), ...] —— 崩溃续跑用例要看的是"哪几天在 bars 里、基准对不对"。"""
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("SELECT d, c FROM bars WHERE code=? ORDER BY d",
+                            (code,)).fetchall()
+    finally:
+        conn.close()
+
+
 def test_update_daily_chunked_catchup():
     """**落后多天必须最早优先分块追平, 中间不许留洞** (2026-09-08 修的静默挖洞)。
 
@@ -613,6 +631,76 @@ def test_update_daily_refuses_over_limit():
     sig = inspect.signature(ps._update_daily_by_date).parameters
     check("生产默认上限 250 个交易日 (≈一年)", sig["max_total_days"].default == 250)
     check("生产默认块大小仍是 40 日", sig["max_days"].default == 40)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_update_daily_resumes_materialize_after_crash():
+    """**块内崩在 materialize 上, 不许在 bars 里留一个日更永远补不回的洞** (09-08 复验缺陷)。
+
+    块内每天写完 bars_raw/adj 就 commit, 但因子变了的票 (除权/新股/缺因子) 只进 changed 集合,
+    要等本块末尾的 materialize 才落 bars。进程若在这中间被 kill (OOM/断电/Ctrl-C):
+    bars_raw 已经推进到块末, 这些票的 bars 却缺了那几天, 而下一次的起点
+    `last = MAX(bars_raw.d)` 已经越过去 —— 靠日更永远补不回, 残存的 bars 还停在除权前的旧
+    基准 (前复权口径静默变错)。修法: 待重物化的代码表跟当天那一笔写进**同一个事务**
+    (`meta._pending_materialize`), materialize 成功才删; 下一次按日增量一开门先补。
+    旧核心 (无面包屑) 跑这条用例: 第二次 update 之后洞还在, 本用例会红。"""
+    print("\n[增量追平: 崩在 materialize 上 -> 下次开门先把 bars 补齐]")
+    days, bars, facs, uni = _catchup_fixture(5)
+    facs = {d: dict(v) for d, v in facs.items()}
+    for dd in days[2:]:                      # 000002 从第 3 天起除权: 因子 1.0 -> 1.25
+        facs[dd]["000002"] = 1.25
+    fake = FakeMarket(bars, facs, days, universe=uni)
+    d = use_tmp_market(fake)
+    path = os.path.join(d, "pricestore.db")
+    _seed_store(days[:1], bars, facs, uni)   # 库停在 days[0], 基准还是 1.0
+
+    real_mat = ps.materialize
+
+    def _boom(*a, **k):
+        raise RuntimeError("模拟进程被 kill (OOM/断电/Ctrl-C): materialize 没跑完")
+
+    crashed = False
+    ps.materialize = _boom
+    try:
+        ps._update_daily_by_date(ps.current(), max_days=40)
+    except RuntimeError:
+        crashed = True
+    finally:
+        ps.materialize = real_mat
+    check("崩溃点确实在 materialize 上 (前面的天已经 commit 过了)", crashed)
+    check("崩溃后 bars_raw 五天齐 (它是逐日提交的)", _days_in_store(path) == days)
+    check("崩溃后除权票的 bars 只有前两天 —— 洞就在这里",
+          [r[0] for r in _bars_of(path, "000002")] == days[:2])
+    check("崩溃后未除权的票不受影响 (走 fresh 逐日直写)",
+          [r[0] for r in _bars_of(path, "000001")] == days)
+    mt = _meta_of(path)
+    check("面包屑跟当天那一笔一起落了库, 点名了待重物化的票",
+          mt.get(ps.PENDING_MAT_KEY) == "000002")
+
+    # 下一次按日增量: 已经没有新交易日了 (last = MAX(bars_raw.d) 已在末日), 靠面包屑修
+    with LogCap() as cap:
+        n2 = ps._update_daily_by_date(ps.current(), max_days=40)
+    check("第二次没有新交易日可补 (证明日更本身补不回这个洞)", n2 == 0)
+    check("日志明说是在替上一次没跑完的重物化收尾",
+          bool(cap.like("没来得及整段重物化")) and bool(cap.like("续跑重物化")))
+    got = _bars_of(path, "000002")
+    check("除权票的 bars 补齐五天, 逐日无空洞", [r[0] for r in got] == days)
+    # 整段重建口径: base = 该股最新因子 1.25; k = f(d)/1.25 -> 前两天 0.8, 后三天 1.0
+    exp = [(days[0], 9.2), (days[1], 10.0), (days[2], 13.5), (days[3], 14.5), (days[4], 15.5)]
+    check("补回来的是新基准下的前复权值 (不是崩溃前的旧基准)",
+          len(got) == len(exp) and all(g[0] == e[0] and close(g[1], e[1])
+                                       for g, e in zip(got, exp)))
+    conn = sqlite3.connect(path)
+    base = conn.execute("SELECT d, factor FROM adj_base WHERE code='000002'").fetchone()
+    conn.close()
+    check("adj_base 也换到了新基准", base == (days[4], 1.25))
+    check("修完面包屑就删掉 (健康库的 meta 里不该有这一行)",
+          ps.PENDING_MAT_KEY not in _meta_of(path))
+    snap = _snapshot_bars(path)
+    check("再跑一次不再重物化, 库逐值不变",
+          ps._update_daily_by_date(ps.current(), max_days=40) == 0
+          and _snapshot_bars(path) == snap
+          and ps.PENDING_MAT_KEY not in _meta_of(path))
     shutil.rmtree(d, ignore_errors=True)
 
 
@@ -1033,6 +1121,7 @@ TESTS = [test_schema_and_v1_upgrade, test_qfq_math, test_load_adjust_modes,
          test_update_daily_v2_refuses_legacy, test_update_daily_not_ready_guard,
          test_update_daily_chunked_catchup, test_update_daily_resume_after_guard,
          test_update_daily_refuses_over_limit,
+         test_update_daily_resumes_materialize_after_crash,
          test_market_units_and_filters, test_source_switch_default,
          test_stage_a_reads_store, test_store_universe_filter,
          test_pool_trim_basis_and_rollback]
