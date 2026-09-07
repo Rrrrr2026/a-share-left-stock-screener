@@ -22,6 +22,8 @@
 运行:  python tests/test_pricestore_v2.py    或    python -m pytest tests/test_pricestore_v2.py -q
 """
 from __future__ import annotations
+import inspect
+import logging
 import os
 import shutil
 import sqlite3
@@ -67,6 +69,7 @@ class FakeMarket:
         self.universe = universe or []
         self.enabled = enabled
         self.legacy_calls = []
+        self.by_date_calls = []            # 按日路径真的问了源哪几天 (追平/拒绝增量用例看它)
 
     def market(self, data_dir):
         return Market(
@@ -74,15 +77,47 @@ class FakeMarket:
             db_path=os.path.join(data_dir, "x.db"),
             fetch_bars_bulk=self._legacy_bulk,
             fetch_index_bars=lambda s: [],
-            fetch_bars_by_date=lambda d: (self.bars.get(d, {}) if self.enabled else None),
+            fetch_bars_by_date=self._by_date,
             fetch_adj_by_date=lambda d: (self.facs.get(d, {}) if self.enabled else None),
             trading_days=lambda a, b: ([d for d in self.days if a <= d <= b]
                                        if self.enabled else None),
             fetch_universe_rows=lambda: self.universe)
 
+    def _by_date(self, d):
+        self.by_date_calls.append(d)
+        return self.bars.get(d, {}) if self.enabled else None
+
     def _legacy_bulk(self, codes, start):
         self.legacy_calls.append((tuple(codes), start))
         return {}
+
+
+class LogCap(logging.Handler):
+    """抓 leftside_core.pricestore 的日志行 —— 分块追平要验的是"补了哪几块", 那句话
+    只在日志里 (返回值只有总 bar 数)。用 with 包住被测调用。"""
+
+    def __init__(self):
+        super().__init__(level=logging.INFO)
+        self.lines = []
+
+    def emit(self, rec):
+        self.lines.append(rec.getMessage())
+
+    def __enter__(self):
+        lg = logging.getLogger("leftside_core.pricestore")
+        self._saved = lg.level                 # pytest 下 root 是 WARNING, INFO 进不到 handler
+        lg.setLevel(logging.INFO)
+        lg.addHandler(self)
+        return self
+
+    def __exit__(self, *exc):
+        lg = logging.getLogger("leftside_core.pricestore")
+        lg.removeHandler(self)
+        lg.setLevel(self._saved)
+        return False
+
+    def like(self, sub):
+        return [l for l in self.lines if sub in l]
 
 
 def use_tmp_market(fake: FakeMarket) -> str:
@@ -443,6 +478,144 @@ def test_update_daily_not_ready_guard():
     shutil.rmtree(d, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- 分块追平 (2026-09-08)
+
+
+def _catchup_fixture(n_days: int, codes=("000001", "000002")):
+    """n_days 个连续交易日 × 两只票, 因子恒定 (只考察追平顺序, 不掺除权)。"""
+    days = [f"2026-06-{i:02d}" for i in range(1, 1 + n_days)]
+    bars = {d: {c: (10.0 + j + i, 11.0 + j + i, 9.0 + j + i, 10.5 + j + i,
+                    100.0 + j, 1000.0 + j) for j, c in enumerate(codes)}
+            for i, d in enumerate(days)}
+    facs = {d: {c: 1.0 for c in codes} for d in days}
+    uni = [(c, "票" + c, "2020-01-01", "", "L") for c in codes]
+    return days, bars, facs, uni
+
+
+def _seed_store(days, bars, facs, uni):
+    """把 days 这几天灌进库并物化 = "库停在 days[-1]"。"""
+    conn = ps._conn()
+    for dd in days:
+        conn.executemany("INSERT OR REPLACE INTO bars_raw VALUES(?,?,?,?,?,?,?,?)",
+                         [(c, dd, *v) for c, v in bars[dd].items()])
+        conn.executemany("INSERT OR REPLACE INTO adj VALUES(?,?,?)",
+                         [(c, dd, f) for c, f in facs[dd].items()])
+    conn.executemany("INSERT OR REPLACE INTO universe(code,name,list_date,delist_date,status) "
+                     "VALUES(?,?,?,?,?)", uni)
+    conn.commit()
+    ps.materialize(None, conn)
+    conn.close()
+
+
+def _days_in_store(path):
+    conn = sqlite3.connect(path)
+    try:
+        return [r[0] for r in conn.execute("SELECT DISTINCT d FROM bars_raw ORDER BY d")]
+    finally:
+        conn.close()
+
+
+def test_update_daily_chunked_catchup():
+    """**落后多天必须最早优先分块追平, 中间不许留洞** (2026-09-08 修的静默挖洞)。
+
+    旧写法是 `days = [d for d in days if d > last][-max_days:]` —— 取待补交易日的**最后**
+    N 天。副本落后 65 天时那一跑写最新 40 天, `MAX(d)` 一步越到末日, 中间 25 天从此
+    再也不会出现在 `days` 里 (下次 last 已是末日), 洞是静默的、越补越像补好了。
+    现在改成 `days[:max_days]` 一块块从最早补, 循环到追平或撞守卫。"""
+    print("\n[增量追平: 最早优先分块, 中间不许留洞]")
+    days, bars, facs, uni = _catchup_fixture(7)          # 1 天种子 + 6 天待补 = 3 块 × 2 日
+    fake = FakeMarket(bars, facs, days, universe=uni)
+    d = use_tmp_market(fake)
+    path = os.path.join(d, "pricestore.db")
+    _seed_store(days[:1], bars, facs, uni)
+    with LogCap() as cap:
+        n = ps._update_daily_by_date(ps.current(), max_days=2)
+    got = _days_in_store(path)
+    check("六个待补日一天不少, 逐日无空洞", got == days)
+    check("MAX(d) 停在最后一个待补日 (不是一步跳到末日)", got[-1] == days[-1])
+    check("返回 6 日 × 2 只 = 12 根", n == 12)
+    check("按顺序从最早的一天开始问源", fake.by_date_calls == days[1:])
+    check("确实分了三块 (2/2/2), 日志把剩余日数写清",
+          cap.like("本块补") == [
+              "价格库增量: 本块补 2026-06-02..2026-06-03 共 2 日, 剩 4 日",
+              "价格库增量: 本块补 2026-06-04..2026-06-05 共 2 日, 剩 2 日",
+              "价格库增量: 本块补 2026-06-06..2026-06-07 共 2 日, 剩 0 日"])
+    conn = sqlite3.connect(path)
+    mt = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+    nb = dict(conn.execute("SELECT code, COUNT(*) FROM bars GROUP BY code").fetchall())
+    conn.close()
+    check("meta.max_trade_date 追平", mt.get("max_trade_date") == days[-1])
+    check("物化 bars 也逐日补齐", nb == {"000001": 7, "000002": 7})
+    check("追平后再跑一次 -> 0 根 (无重复补)", ps._update_daily_by_date(ps.current(), max_days=2) == 0)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_update_daily_resume_after_guard():
+    """守卫在**中途某天**未就绪: 停在那天之前, `MAX(d)` 不越过它; 源恢复后连续再跑,
+    逐块把剩下的补齐, 全程无洞 —— 这正是旧写法做不到的 (它会跳到末日把洞焊死)。"""
+    print("\n[增量追平: 中途撞未就绪守卫 -> 停下, 下次接着补]")
+    days, bars, facs, uni = _catchup_fixture(7)
+    bars = {k: dict(v) for k, v in bars.items()}
+    bars[days[4]].pop("000002")                # 第 4 个待补日只回来 1/2 只 = 50% < 90%
+    fake = FakeMarket(bars, facs, days, universe=uni)
+    d = use_tmp_market(fake)
+    path = os.path.join(d, "pricestore.db")
+    _seed_store(days[:1], bars, facs, uni)
+    with LogCap() as cap:
+        n1 = ps._update_daily_by_date(ps.current(), max_days=2)
+    got1 = _days_in_store(path)
+    check("停在残缺日之前 (补到 days[3] 为止)", got1 == days[:4])
+    check("残缺日一根都没写", days[4] not in got1)
+    check("残缺日之后的日子也不许抢跑 (停下而非跳过)",
+          days[5] not in got1 and days[6] not in got1)
+    check("第一次只补了 3 日 × 2 只", n1 == 6)
+    check("守卫日志报了停在哪天", bool(cap.like("Tushare 当日未就绪")))
+    conn = sqlite3.connect(path)
+    check("meta.max_trade_date 只到最后一个完整日",
+          dict(conn.execute("SELECT key,value FROM meta").fetchall()).get("max_trade_date")
+          == days[3])
+    conn.close()
+    # 源恢复 (Tushare 当天 15-17 点才入库, 下一次调用就该接着补)
+    bars[days[4]]["000002"] = (24.0, 25.0, 23.0, 24.5, 101.0, 1001.0)
+    fake.by_date_calls.clear()
+    with LogCap() as cap2:
+        n2 = ps._update_daily_by_date(ps.current(), max_days=2)
+    got2 = _days_in_store(path)
+    check("第二次从洞口接着补 (不是从末日倒着补)", fake.by_date_calls == days[4:])
+    check("追平且逐日无空洞", got2 == days)
+    check("第二次补了 3 日 × 2 只", n2 == 6)
+    check("第二次也是分块的 (2 + 1)",
+          cap2.like("本块补") == [
+              "价格库增量: 本块补 2026-06-05..2026-06-06 共 2 日, 剩 1 日",
+              "价格库增量: 本块补 2026-06-07..2026-06-07 共 1 日, 剩 0 日"])
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_update_daily_refuses_over_limit():
+    """落后超过 max_total_days 就**拒绝增量、一根不写**, 提示去全量重建 ——
+    免得一次 update 拉几年 (每交易日 2 次 Tushare 调用 + 逐块重物化, 会顶穿看门狗)。"""
+    print("\n[增量追平: 落后超过上限 -> 拒绝增量, 提示 rebuild]")
+    days, bars, facs, uni = _catchup_fixture(7)
+    fake = FakeMarket(bars, facs, days, universe=uni)
+    d = use_tmp_market(fake)
+    path = os.path.join(d, "pricestore.db")
+    _seed_store(days[:1], bars, facs, uni)
+    before = _snapshot_bars(path)
+    with LogCap() as cap:
+        n = ps._update_daily_by_date(ps.current(), max_days=2, max_total_days=5)
+    check("待补 6 日 > 上限 5 -> 返回 0", n == 0)
+    check("一天都没问源 (不是问了再丢)", fake.by_date_calls == [])
+    check("库一根未动", _days_in_store(path) == days[:1] and _snapshot_bars(path) == before)
+    check("日志点名 rebuild 脚本", bool(cap.like("rebuild_a_pricestore_tushare.py")))
+    check("正好等于上限时照常追平 (边界是 >, 不是 >=)",
+          ps._update_daily_by_date(ps.current(), max_days=2, max_total_days=6) == 12
+          and _days_in_store(path) == days)
+    sig = inspect.signature(ps._update_daily_by_date).parameters
+    check("生产默认上限 250 个交易日 (≈一年)", sig["max_total_days"].default == 250)
+    check("生产默认块大小仍是 40 日", sig["max_days"].default == 40)
+    shutil.rmtree(d, ignore_errors=True)
+
+
 def test_market_units_and_filters():
     print("\n[ashare/market: 单位换算与代码过滤]")
     import pandas as pd
@@ -583,9 +756,13 @@ def test_store_universe_filter():
     check("③ 次新 (1..59 根) -> too_new, 在不在池都一样",
           ds.store_verdict(30, "2026-09-07", True, fresh) == "too_new"
           and ds.store_verdict(1, "2026-09-07", False, fresh) == "too_new")
-    check("④ 无 bar: 在池=gap(值得回落联网) / 不在池=absent(退市老代码)",
-          ds.store_verdict(0, None, True, fresh) == "gap"
-          and ds.store_verdict(0, None, False, fresh) == "absent")
+    check("④ 无 bar + 在池 -> gap (值得回落联网)",
+          ds.store_verdict(0, None, True, fresh) == "gap")
+    # 09-08: 原来"不在池且无 bar"一律叫 absent, 注释还统称"历史遗留退市码" —— 把"库说它死了"
+    # 和"库没听说过它"混成一桶。拆桶用例见 tests/test_pool_cut_b2.py (穷举四种 status)。
+    check("④' 无 bar + 不在池: 库明说 D/P -> dead; 库没这一行 -> uncovered",
+          ds.store_verdict(0, None, False, fresh, status="D") == "dead"
+          and ds.store_verdict(0, None, False, fresh, status=None) == "uncovered")
     check("留在池里的裁决 = keep + gap (gap 在 universe_at 里, 按卡的规则必须留)",
           tuple(ds.STORE_KEEP_VERDICTS) == ("keep", "gap"))
 
@@ -626,7 +803,7 @@ def test_store_universe_filter():
     ds._store_pit = None
     try:
         codes = ["600000", "000022", "600001", "301999", "000004", "600002"]
-        keep, dropped, degraded = ds.store_universe_filter(codes)
+        keep, dropped, degraded, kept_detail = ds.store_universe_filter(codes)
         by = {k: sorted(x["code"] for x in v) for k, v in dropped.items()}
         check("过滤器真的跑完了 (第三个返回值 None = 不是降级放行)", degraded is None)
         check("① 在池老票留下", "600000" in keep)
@@ -634,11 +811,15 @@ def test_store_universe_filter():
         check("②' 有K线但过期 -> 裁 (stale)", by.get("stale") == ["600001"])
         check("③ 次新 30 根 -> 裁 (too_new, 在池也照裁: 60 根是 module2 的硬起步)",
               by.get("too_new") == ["301999"])
-        check("④ 退市无K线 -> 裁 (absent)", by.get("absent") == ["000004"])
+        check("④ 退市无K线 -> 裁 (dead: 库明说 status=D, 不是'库没听说过')",
+              by.get("dead") == ["000004"] and "uncovered" not in dropped)
         # 09-08 首版把 gap 也裁了 —— 与卡的规则("保留 universe_at 内的代码")相反, 且阶段A
         # 从此不会为它调 fetch_hist, fetch_hist 里那条"只有 gap 才回落联网"的分支成了死代码。
         check("④' 在池却一根K线都没有 -> **留下** (gap: 库说它今天在市, 由 fetch_hist 回落联网)",
               "600002" in keep and "gap" not in dropped)
+        check("④'' gap 留在池里, 但必须有数 (第四个返回值; 没计数就没人会发现库漏了一批码)",
+              [x["code"] for x in (kept_detail.get("gap") or [])] == ["600002"]
+              and "keep" not in kept_detail)
         check("裁后剩三只, 且保留入参顺序", keep == ["600000", "000022", "600002"])
         check("裁前裁后数对得上", len(keep) + sum(len(v) for v in dropped.values()) == len(codes))
         check("gap 票在取数层仍会回落联网 (没有库就没有 'skipped')",
@@ -698,36 +879,50 @@ def test_pool_trim_basis_and_rollback():
     uni = [(f"{600000 + i:06d}", f"票{i}", "行业") for i in range(5180)]
     codes = [c for (c, _, _) in uni]
     saved = (ds.bars_from_store_on, ds.store_universe_filter, ds.store_pool_meta,
+             ds.store_ruler_freshness,
              rp.DATA_DIR, CONFIG["tech"].get("pool_by_store"),
              CONFIG["tech"].get("pool_by_store_off_by"))
     tmp = tempfile.mkdtemp(prefix="pooltrim_")
     try:
         ds.bars_from_store_on = lambda: True
-        ds.store_pool_meta = lambda: {"n_universe": 5216, "fresh_after": "2026-08-25",
-                                      "min_bars": 60, "fresh_trade_days": 10}
+        ds.store_pool_meta = lambda asof=None: {
+            "n_universe": 5216, "fresh_after": "2026-08-25",
+            "min_bars": 60, "fresh_trade_days": 10}
+        # 尺子新鲜 (库末日=当日): 这一组用例考的是 scan_basis 的降级路径, 不是尺子陈旧;
+        # 陈旧那条单列在 tests/test_pool_cut_b2.py。不打桩的话这里会去读真库 (慢, 且测试
+        # 结果会随本机库的末日漂移)。
+        ds.store_ruler_freshness = lambda asof=None: {
+            "store_max_d": "2026-09-08", "asof": "2026-09-08",
+            "lag_weekdays": 0, "stale": False}
         rp.DATA_DIR = tmp
         CONFIG["tech"]["pool_by_store"] = True
 
         # ---- 降级① 点时股票池读不出来 (universe 表空 / 老库 / universe_at 抛错)
-        ds.store_universe_filter = lambda cs, days=None: (list(cs), {}, "价格库点时股票池不可用")
+        ds.store_universe_filter = lambda cs, days=None: (
+            list(cs), {}, "价格库点时股票池不可用", {})
         out, basis = rp.trim_universe_by_store(uni, "2026-09-08")
         check("降级①(点时股票池不可用): 一只没裁, 口径必须标回 raw_spot 而不是 store_universe",
               len(out) == len(uni) and basis == "raw_spot")
         # ---- 降级② bars 统计 SQL 失败 (库被锁 / 库文件坏)
         ds.store_universe_filter = lambda cs, days=None: (
-            list(cs), {}, "价格库 bar 统计失败: database is locked")
+            list(cs), {}, "价格库 bar 统计失败: database is locked", {})
         out, basis = rp.trim_universe_by_store(uni, "2026-09-08")
         check("降级②(bar 统计失败): 一只没裁, 口径标回 raw_spot",
               len(out) == len(uni) and basis == "raw_spot")
 
         # ---- 真的裁: 这时候口径才配叫 store_universe, 且名单要落盘
-        cut = {"absent": [{"code": c, "n_bars": 0, "last_bar": None, "status": "D"}
-                          for c in codes[:177]],
+        # 09-08: absent 拆成 dead (库明说 D/P) 与 uncovered (库未覆盖), 两桶分别计数落盘。
+        cut = {"dead": [{"code": c, "n_bars": 0, "last_bar": None, "status": "D"}
+                        for c in codes[:163]],
+               "uncovered": [{"code": c, "n_bars": 0, "last_bar": None, "status": None}
+                             for c in codes[163:177]],
                "too_new": [{"code": c, "n_bars": 25, "last_bar": "2026-09-07", "status": "L"}
                            for c in codes[177:210]]}
+        gap_rows = [{"code": c, "n_bars": 0, "last_bar": None, "status": "L"}
+                    for c in codes[210:214]]
         gone = {x["code"] for v in cut.values() for x in v}
         ds.store_universe_filter = lambda cs, days=None: (
-            [c for c in cs if c not in gone], cut, None)
+            [c for c in cs if c not in gone], cut, None, {"gap": gap_rows})
         out, basis = rp.trim_universe_by_store(uni, "2026-09-08")
         check("真的裁: 5180 -> 4970, 口径 store_universe",
               len(out) == 4970 and basis == "store_universe")
@@ -736,10 +931,20 @@ def test_pool_trim_basis_and_rollback():
         check("裁掉的名单按原因落到 data/pool_cut/<run_date>.json (data/ 不进 git)",
               rec.get("n_pool_raw") == 5180 and rec.get("n_kept") == 4970
               and rec.get("n_dropped") == 210
-              and sorted(rec.get("dropped") or {}) == ["absent", "too_new"])
+              and sorted(rec.get("dropped") or {}) == ["dead", "too_new", "uncovered"])
+        check("留痕分桶: dead 163 / uncovered 14 / too_new 33, 不再是一桶 absent 177",
+              (rec.get("counts") or {}).get("dropped")
+              == {"dead": 163, "too_new": 33, "uncovered": 14})
+        check("留痕记 gap: 留在池里但库内无K线的 4 只逐只有名有姓 + 有数",
+              (rec.get("counts") or {}).get("gap") == 4
+              and len((rec.get("kept_no_bars") or {}).get("gap") or []) == 4)
+        check("留痕带恒等式自检: 有K线 4966 + gap 4 + 裁 210 == 原池 5180",
+              (rec.get("counts") or {}).get("keep") == 4966
+              and (rec.get("counts") or {}).get("identity_ok") is True
+              and rec.get("scan_basis") == "store_universe")
 
         # ---- 过滤器真的跑完了、只是没什么可裁 -> 仍然是新口径
-        ds.store_universe_filter = lambda cs, days=None: (list(cs), {}, None)
+        ds.store_universe_filter = lambda cs, days=None: (list(cs), {}, None, {})
         out, basis = rp.trim_universe_by_store(uni, "2026-09-08")
         check("无可裁但过滤器跑完了: 口径 store_universe (这才是'没什么可裁')",
               len(out) == len(uni) and basis == "store_universe")
@@ -747,8 +952,8 @@ def test_pool_trim_basis_and_rollback():
         # ---- 安全阀: 裁后太少 = 库/尺子出了问题, 不裁, 且口径标回老口径
         ds.store_universe_filter = lambda cs, days=None: (
             list(cs)[:100],
-            {"absent": [{"code": c, "n_bars": 0, "last_bar": None, "status": None}
-                        for c in codes[100:]]}, None)
+            {"uncovered": [{"code": c, "n_bars": 0, "last_bar": None, "status": None}
+                           for c in codes[100:]]}, None, {})
         out, basis = rp.trim_universe_by_store(uni, "2026-09-08")
         check("安全阀: 裁后只剩 100/5180 -> 本轮不裁, 口径 raw_spot",
               len(out) == len(uni) and basis == "raw_spot")
@@ -781,6 +986,7 @@ def test_pool_trim_basis_and_rollback():
             rp.log.setLevel(lvl)
     finally:
         (ds.bars_from_store_on, ds.store_universe_filter, ds.store_pool_meta,
+         ds.store_ruler_freshness,
          rp.DATA_DIR, CONFIG["tech"]["pool_by_store"],
          CONFIG["tech"]["pool_by_store_off_by"]) = saved
         shutil.rmtree(tmp, ignore_errors=True)
@@ -792,20 +998,20 @@ def test_pool_trim_basis_and_rollback():
     try:
         cfgmod.DATA_DIR = d2
         os.environ.pop("ASHARE_POOL_BY_STORE", None)
-        check("默认: 没有环境变量也没有停机文件 -> 开, off_by 为空",
-              cfgmod._pool_by_store_switch(True) == (True, ""))
+        check("默认: 没有环境变量也没有停机文件 -> 开, off_by 与 warn 都为空",
+              cfgmod._pool_by_store_switch(True) == (True, "", ""))
         os.environ["ASHARE_POOL_BY_STORE"] = "0"
-        on, why = cfgmod._pool_by_store_switch(True)
+        on, why, warn = cfgmod._pool_by_store_switch(True)
         check("回滚①: 环境变量 ASHARE_POOL_BY_STORE=0 关掉 (systemctl edit stock-a 那条路)",
-              on is False and "ASHARE_POOL_BY_STORE=0" in why)
+              on is False and "ASHARE_POOL_BY_STORE=0" in why and not warn)
         os.environ.pop("ASHARE_POOL_BY_STORE", None)
         open(os.path.join(d2, "pool_by_store.off"), "w").close()
-        on, why = cfgmod._pool_by_store_switch(True)
+        on, why, warn = cfgmod._pool_by_store_switch(True)
         check("回滚②: 停机文件 data/pool_by_store.off 关掉 (stock 用户不需要 root)",
               on is False and "pool_by_store.off" in why)
         os.environ["ASHARE_POOL_BY_STORE"] = "1"
         check("优先级: 环境变量压过停机文件 (=1 时照开)",
-              cfgmod._pool_by_store_switch(True) == (True, ""))
+              cfgmod._pool_by_store_switch(True) == (True, "", ""))
     finally:
         cfgmod.DATA_DIR = saved_data_dir
         if saved_env is None:
@@ -825,6 +1031,8 @@ TESTS = [test_schema_and_v1_upgrade, test_qfq_math, test_load_adjust_modes,
          test_load_v1_fallback, test_universe_at, test_universe_null_list_date,
          test_update_daily_by_date, test_update_daily_falls_back,
          test_update_daily_v2_refuses_legacy, test_update_daily_not_ready_guard,
+         test_update_daily_chunked_catchup, test_update_daily_resume_after_guard,
+         test_update_daily_refuses_over_limit,
          test_market_units_and_filters, test_source_switch_default,
          test_stage_a_reads_store, test_store_universe_filter,
          test_pool_trim_basis_and_rollback]
