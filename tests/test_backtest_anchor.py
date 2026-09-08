@@ -311,6 +311,7 @@ def test_run_pipeline_logs_backtest_price_switch(capsys=None):
     import logging                                               # noqa: PLC0415
     import run_pipeline as rp                                    # noqa: PLC0415
     saved = dict(CONFIG["source"])
+    saved_gate = ds.bars_from_store_on
     recs = []
 
     class _Cap(logging.Handler):
@@ -322,6 +323,9 @@ def test_run_pipeline_logs_backtest_price_switch(capsys=None):
     lv = rp.log.level
     rp.log.setLevel(logging.INFO)
     try:
+        # `bars_from_store_on` 还要求 data/pricestore.db **存在** —— 干净导出树里没有这个
+        # 文件, 所以这里打桩, 让本用例只考"日志说没说清楚", 不去考环境有没有库。
+        ds.bars_from_store_on = lambda: True                     # noqa: SLF001
         CONFIG["source"].update(bars="tushare", backtest_prices_from_store=True,
                                 backtest_prices_from_store_off_by="",
                                 backtest_prices_from_store_switch_warn="")
@@ -333,17 +337,27 @@ def test_run_pipeline_logs_backtest_price_switch(capsys=None):
         assert rp.log_backtest_price_switch() is False
         assert any("读库 关 (停机文件" in m for _l, m in recs), recs
         recs.clear()
-        # bars 源不是 tushare 时这条链被强制关 —— 日志不许说成"三层开关关的"
+        # 强制关的**两个原因必须分开说**: 源不对 vs 源对但库文件不在。09-08 首版把后者也
+        # 写成"不是 tushare", 在没有库的干净导出树上打出「bars='tushare' 不是 tushare」——
+        # 自相矛盾的假话, 会把值班的人指到一个本来就对的配置上去。
+        ds.bars_from_store_on = lambda: False                    # noqa: SLF001
         CONFIG["source"].update(bars="fuyao", backtest_prices_from_store=True,
                                 backtest_prices_from_store_off_by="环境变量 X=1")
         assert rp.log_backtest_price_switch() is False
-        assert any("不是 tushare, 本条链被强制关" in m for _l, m in recs), recs
+        assert any("'fuyao' 不是 tushare, 本条链被强制关" in m for _l, m in recs), recs
+        recs.clear()
+        CONFIG["source"].update(bars="tushare")
+        assert rp.log_backtest_price_switch() is False
+        assert not any("不是 tushare" in m for _l, m in recs), (
+            "源是 tushare 却说它不是 tushare —— 这正是本条要拦的假话: %r" % (recs,))
+        assert any("价格库文件不在" in m for _l, m in recs), recs
         recs.clear()
         # 环境变量写错值 -> 必须有一条 WARNING (config 里 log 不进 journal, 只能在这里打)
-        CONFIG["source"].update(bars="tushare", backtest_prices_from_store_switch_warn="值不认识")
+        CONFIG["source"].update(backtest_prices_from_store_switch_warn="值不认识")
         rp.log_backtest_price_switch()
         assert any(lv2 >= logging.WARNING and "值不认识" in m for lv2, m in recs), recs
     finally:
+        ds.bars_from_store_on = saved_gate                       # noqa: SLF001
         rp.log.removeHandler(h)
         rp.log.setLevel(lv)
         CONFIG["source"].clear()

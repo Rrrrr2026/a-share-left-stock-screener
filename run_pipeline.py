@@ -292,9 +292,16 @@ def log_backtest_price_switch() -> bool:
     on = ds.backtest_prices_from_store_on()
     by = CONFIG["source"].get("backtest_prices_from_store_off_by") or ""
     if not ds.bars_from_store_on():
-        # bars 源不是 tushare 时这条链被 `backtest_prices_from_store_on()` 强制关掉。
+        # `backtest_prices_from_store_on()` 里 bars_from_store_on 不成立时整条链被强制关。
         # 这时候光打三层开关那句会说反话 ("读库 关 (环境变量 ...=1)"), 所以真正的原因排在前面。
-        forced = "CONFIG.source.bars=%r 不是 tushare, 本条链被强制关" % CONFIG["source"].get("bars")
+        # **两个原因必须分开说**: bars 源不是 tushare, 与"源对但库文件根本不在"是两种处置
+        # (前者改配置, 后者去看 pricestore.db 哪去了)。09-08 首版把后者也写成"不是 tushare",
+        # 在没有库文件的干净导出树上当场打出「CONFIG.source.bars='tushare' 不是 tushare」——
+        # 一句自相矛盾的假话, 值班的人会照着它去改一个本来就对的配置。
+        src = str(CONFIG["source"].get("bars") or "")
+        forced = ("CONFIG.source.bars=%r 不是 tushare, 本条链被强制关" % src
+                  if src.lower() != "tushare"
+                  else "价格库文件不在 (%s), 本条链被强制关" % ds._store_path())  # noqa: SLF001
         by = "%s; 三层开关另说: %s" % (forced, by) if by else forced
     elif not by:
         by = "代码默认值 config.DEFAULT_BACKTEST_STORE"
