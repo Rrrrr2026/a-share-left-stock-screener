@@ -81,7 +81,7 @@ _POOL_BY_STORE, _POOL_BY_STORE_OFF_BY, _POOL_BY_STORE_WARN = _pool_by_store_swit
 #: `tests/test_backtest_anchor.py::EXPECTED_DEFAULT` 那一行的期望值。别的地方一个字都不用动。
 #: 单独拎出来是因为 09-08 之前它埋在 `os.environ.get(..., "0")` 的第二个参数里 —— 要翻开关
 #: 得在一坨注释中间找那个字符串字面量, 而且没有任何一处能让单测指着它说"默认值就该是这个"。
-DEFAULT_BACKTEST_STORE = "0"
+DEFAULT_BACKTEST_STORE = "1"   # 2026-09-08 19:40 GM 翻开 (老板 09-08 批 P2; 三场首考过后落地, 09-09 14:00 首用)
 
 
 #: 回测取价读库的**三层开关**, 与上面 `_pool_by_store_switch` 同一套路 (故意长得一样:

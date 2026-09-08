@@ -223,7 +223,7 @@ def test_switch_off_disables_store_path():
 #: 改成 "1" 时, 连同这一行一起改 —— 两行, 别的都不用动。这份摩擦是故意的 (与
 #: test_pricestore_v2.test_source_switch_default 同一套路): 改动对外公布的胜率的那一头,
 #: 不许执行者顺手翻过去而没有任何一条用例红给他看。
-EXPECTED_DEFAULT = "0"
+EXPECTED_DEFAULT = "1"
 
 
 def test_default_is_off_until_boss_signs_off():
