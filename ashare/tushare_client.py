@@ -325,7 +325,10 @@ def index_daily(ts_code: str, start, end=None, **kw) -> pd.DataFrame:
 
 def trade_cal(start, end, exchange: str = "SSE", is_open: str = "1",
               retries: int = MAX_RETRIES, deadline_sec: float = DEADLINE_SEC) -> list:
-    """开市日历 -> ['2026-09-04', ...] 升序 (is_open=None 则返回全部日历日)。
+    """开市日历 -> ['2026-09-04', ...] 升序。**任何参数下都只返开市日**: is_open=None 时服务端
+    会给全部日历日, 但下面随即只留 is_open==1 —— 拿不到 is_open=0 的日子 (2026-09-08 卡 GATE-FIX
+    核实并改正这句, 首版写的"is_open=None 则返回全部日历日"与代码不符; 就绪闸门的覆盖自检因此
+    只能"往 target 之后问开市日", 见 leftside_core.pricestore._calendar_days)。
 
     `retries` / `deadline_sec` 透传给 `query`, 默认就是全局那对常量 (3 次 × 120s 硬期限,
     最坏 3×120 + 退避 2+4 ≈ 366s)。**跑在 systemd 定时器里、又有 TimeoutStartSec 的调用方

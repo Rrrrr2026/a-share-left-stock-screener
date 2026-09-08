@@ -28,6 +28,11 @@
     那天缺的因子永远补不回来)
   · 探针的墙钟预算 (必须小于单元 TimeoutStartSec) 与"两个端点都够才算 ready"的备注列
 
+2026-09-08 卡 GATE-FIX 加的一组 (复验员的 HIGH: 日历「覆盖不到目标日」时自检照样通过):
+  · **空的日历答案必须先证明覆盖**: 自检从"问库末日那天开不开市"(必然为真, 证明不了覆盖) 改成
+    "问 target 之后 CAL_PROBE_DAYS 个自然日内有没有开市日"; 证明不了 -> UNKNOWN(2) 照等。
+    2027-01-04 型 (日历填到 target 之前) / 真周末与 11 天长假 (仍 ready) / 自检抛错 / 已追平零调用
+
 运行:  python tests/test_ready_gate.py    或    python -m pytest tests/test_ready_gate.py -q
 """
 from __future__ import annotations
@@ -274,7 +279,7 @@ def test_calendar_down_is_never_ready():
     `_ready_verdict` 里的含义是"周末/长假 -> 已就绪" —— 于是**镜像挂掉 == 周末**, run_a.sh v2
     的等待循环第一轮就放行, 整条流水线拿昨日库跑完并把昨日行情当今天发布。
     两条路都要锁: ① 日历**抛异常** (改后的生产实现); ② 日历**吞成空列表** (任何还这么写的
-    实现) —— 后者靠 `_calendar_days` 反问一句"库末日那天开不开市"自检出来。
+    实现) —— 后者靠 `_calendar_days` 的覆盖自检 (问 target 之后有没有开市日) 拦下来。
     """
     print("\n[ready] 数据源挂掉时不许给假的'已就绪'")
     d = tempfile.mkdtemp(prefix="ready_down_")
@@ -298,19 +303,135 @@ def test_calendar_down_is_never_ready():
     v = ps.ready_for("20260908")
     check("日历吞成空列表 -> 仍判 UNKNOWN(2) (自检拦下)",
           v["code"] == ps.READY_UNKNOWN and not v["ready"])
-    check("自检确实反问了库末日那天", ("2026-09-07", "2026-09-07") in calls)
+    check("自检问的是 target 之后那一段 (不是库末日那天 —— 那一问必然为真, 证明不了覆盖)",
+          calls[-1][0] == "2026-09-08" and calls[-1][1] > "2026-09-08"
+          and ("2026-09-07", "2026-09-07") not in calls)
     check("理由说清是自检没过", "自检" in v["reason"])
 
-    good = ["2026-09-04", "2026-09-07"]         # 日历活着, 区间内真的没有开市日
+    # 日历活着且**已经填过 09-13** (有 09-14): 区间内真的没有开市日。卡 GATE-FIX 之前这里只写到
+    # 09-07 也能过 —— 那正是"日历填到库末日为止"的样子, 现在那种日历对 09-13 必须判 UNKNOWN。
+    good = ["2026-09-04", "2026-09-07", "2026-09-14"]
     _market(d, trading_days=lambda a, b: [x for x in good if a <= x <= b])
     v = ps.ready_for("2026-09-13")              # 09-13 周日
-    check("真周末 (日历活着) 仍判 ready, 没有被自检误伤", v["ready"] and v["code"] == ps.READY_YES)
+    check("真周末 (日历活着且覆盖到 target 之后) 仍判 ready, 没有被自检误伤",
+          v["ready"] and v["code"] == ps.READY_YES)
 
     n_calls = []
     _market(d, trading_days=lambda a, b: n_calls.append((a, b)) or [x for x in good
                                                                    if a <= x <= b])
     v = ps.ready_for("20260907")
     check("已追平时一次日历都不问 (短路在比日期那一步)", v["ready"] and not n_calls)
+
+
+def test_calendar_coverage_must_be_proven():
+    """**卡 GATE-FIX 的主缺陷 (复验员的 HIGH)**: 空日历答案只有在"日历已经填过 target"时才能当周末。
+
+    上一版 `_calendar_days` 的自检是 `fn(have, have)` —— 问"库末日那天开不开市"。have 是库里真有
+    行情的那天, 日历必然覆盖它, 所以这一问只证明"日历对过去还活着", 证明不了"日历覆盖到 target"。
+    镜像日历若只填到 have 与 target 之间某处 (年末/年初下一年日历还没入库), `fn(next(have), target)`
+    返 [], 旧自检照样放行 -> 闸门给假的"已就绪" -> run_a.sh v2 拿昨日库跑。
+    复验员用真 market.trading_days + 镜像口径复现的是 2027-01-04 型: 库到 01-04, 问 01-05, 日历
+    只填到 01-04。
+
+    锁法: 假日历**只填到 CUT 为止** (CUT 之后一律返 []), 逐条对应卡上的 (a)(b)(c)(d):
+      (a) 日历填到 target 之前 -> 必须 UNKNOWN(2), 且反问的是 target 之后那一段
+      (b) 真周末 / 11 天长假 (日历已覆盖) -> 仍 ready, 不空等
+      (c) 覆盖自检那一问抛异常 -> UNKNOWN(2)
+      (d) 已追平 -> 零次日历调用
+    (e) 变异: 把自检改回 fn(have,have), (a) 必红 —— 见交付里的变异实测。
+    """
+    print("\n[ready] 日历覆盖必须证明 (卡 GATE-FIX / 2027-01-04 型)")
+    import datetime as _dt
+
+    def _cal(open_days, cut):
+        """只填到 cut 为止的镜像日历: 问 cut 之后一律 [] (真 trade_cal 对没入库的区间就是这么答的)。"""
+        calls = []
+
+        def fn(a, b):
+            calls.append((a, b))
+            return [x for x in open_days if a <= x <= b and x <= cut]
+        return fn, calls
+
+    d = tempfile.mkdtemp(prefix="ready_cov_")
+    _seed(d, bars_raw_days=["2026-12-31", "2027-01-04"])       # 库到 2027-01-04 (周一)
+    jan = ["2026-12-31", "2027-01-04", "2027-01-05", "2027-01-06", "2027-01-07", "2027-01-08",
+           "2027-01-11", "2027-01-12", "2027-01-13"]
+
+    # (a) 日历只填到 2027-01-04 (= 库末日), 问 01-05: 旧自检 fn(01-04,01-04) 非空 -> 曾放行
+    fn, calls = _cal(jan, cut="2027-01-04")
+    _market(d, trading_days=fn)
+    v = ps.ready_for("20270105")
+    check("(a) 日历填到 target 之前 (2027-01-04 型) -> UNKNOWN(2), 不放行",
+          v["code"] == ps.READY_UNKNOWN and not v["ready"])
+    check("(a) 理由点名覆盖自检没过", "覆盖自检" in v["reason"])
+    end = (_dt.date(2027, 1, 5) + _dt.timedelta(days=ps.CAL_PROBE_DAYS)).isoformat()
+    check("(a) 反问的是 target 之后那一段 [target, target+CAL_PROBE_DAYS], 不是库末日",
+          ("2027-01-05", end) in calls and ("2027-01-04", "2027-01-04") not in calls)
+    check("(a) 总共只多问了 1 次 (区间 1 次 + 自检 1 次)", len(calls) == 2)
+
+    # (a') 日历填到 have 与 target 之间某处 (12-31): 先追平 12-31 的库问 01-05
+    d2 = tempfile.mkdtemp(prefix="ready_cov2_")
+    _seed(d2, bars_raw_days=["2026-12-30", "2026-12-31"])
+    fn, calls = _cal(jan, cut="2026-12-31")
+    _market(d2, trading_days=fn)
+    v = ps.ready_for("20270105")
+    check("(a') 日历填到 12-31 为止, 库到 12-31 问 01-05 -> UNKNOWN(2)", v["code"] == ps.READY_UNKNOWN)
+    fn, calls = _cal(jan, cut="2027-01-04")                    # 日历再多填一天, 仍不到 target
+    _market(d2, trading_days=fn)
+    v = ps.ready_for("20270105")
+    check("(a') 日历填到 01-04 (库 12-31 -> 缺 01-04): 区间内有开市日 -> NO(1), 不需要自检",
+          v["code"] == ps.READY_NO and v["missing"] == ["2027-01-04"] and len(calls) == 1)
+
+    # (b) 真周末 / 长假, 日历已覆盖到 target 之后 -> ready, 不空等
+    d3 = tempfile.mkdtemp(prefix="ready_cov3_")
+    _seed(d3, bars_raw_days=["2026-09-03", "2026-09-04"])      # 库到周五
+    sep = ["2026-09-03", "2026-09-04", "2026-09-07", "2026-09-08", "2026-09-09"]
+    fn, calls = _cal(sep, cut="2026-12-31")
+    _market(d3, trading_days=fn)
+    v = ps.ready_for("20260906")                                # 周日
+    check("(b) 真周末 (日历覆盖到年末) -> ready(0)", v["ready"] and v["code"] == ps.READY_YES)
+    check("(b) 周末那一路正好 2 次调用 (区间 + 覆盖自检)", len(calls) == 2)
+    fn, calls = _cal(sep, cut="2026-09-07")                     # 日历只多填到下周一
+    _market(d3, trading_days=fn)
+    v = ps.ready_for("20260906")
+    check("(b) 日历哪怕只填到 target 之后第一个开市日 -> 也够证明覆盖, ready(0)", v["ready"])
+    fn, calls = _cal(sep, cut="2026-09-04")                     # 日历只填到库末日 = 复验员那型
+    _market(d3, trading_days=fn)
+    v = ps.ready_for("20260906")
+    check("(b) 同一个周日, 日历只填到库末日 -> UNKNOWN(2) (同一问题在周末的样子)",
+          v["code"] == ps.READY_UNKNOWN)
+
+    d4 = tempfile.mkdtemp(prefix="ready_cov4_")
+    _seed(d4, bars_raw_days=["2027-02-04", "2027-02-05"])      # 春节前最后一个交易日 02-05 (周五)
+    cny = ["2027-02-04", "2027-02-05", "2027-02-17", "2027-02-18"]   # 02-06..02-16 连休 11 个自然日
+    fn, calls = _cal(cny, cut="2027-12-31")
+    _market(d4, trading_days=fn)
+    for tgt in ("20270206", "20270210", "20270216"):            # 假期首日 / 中间工作日 / 末日
+        v = ps.ready_for(tgt)
+        check(f"(b) 11 天长假内问 {tgt} -> ready(0) (窗口 {ps.CAL_PROBE_DAYS} 天盖得住)", v["ready"])
+    check("(b) CAL_PROBE_DAYS 必须盖得住 A 股最长连续休市 (实测 <= 11 个自然日)",
+          ps.CAL_PROBE_DAYS >= 12)
+
+    # (c) 区间那一问返 [] 后, 覆盖自检那一问抛异常 -> UNKNOWN(2)
+    d5 = tempfile.mkdtemp(prefix="ready_cov5_")
+    _seed(d5, bars_raw_days=["2026-09-04"])
+    n = []
+
+    def flaky(a, b):
+        n.append((a, b))
+        if len(n) == 1:
+            return []
+        raise RuntimeError("模拟镜像在第二问时 500")
+
+    _market(d5, trading_days=flaky)
+    v = ps.ready_for("20260906")
+    check("(c) 覆盖自检抛异常 -> UNKNOWN(2)", v["code"] == ps.READY_UNKNOWN and "抛错" in v["reason"])
+
+    # (d) 已追平 -> 一次日历都不问 (与覆盖自检无关, 短路在比日期那一步)
+    fn, calls = _cal(sep, cut="2026-09-04")
+    _market(d3, trading_days=fn)
+    v = ps.ready_for("20260904")
+    check("(d) 已追平 -> ready(0) 且零次日历调用", v["ready"] and not calls)
 
 
 def test_market_trading_days_raises_on_failure():
@@ -460,7 +581,8 @@ TESTS = [test_ready_verdict_three_states, test_iso_day_normalization,
          test_ready_for_end_to_end, test_exit_codes_are_the_contract,
          test_probe_line_and_cal_cache,
          # 2026-09-08 返工 (校验员四条): 数据源挂掉不许给假的"已就绪"
-         test_calendar_down_is_never_ready, test_market_trading_days_raises_on_failure,
+         test_calendar_down_is_never_ready, test_calendar_coverage_must_be_proven,
+         test_market_trading_days_raises_on_failure,
          test_update_by_date_calendar_failure_is_not_caught_up, test_update_by_date_adj_gate,
          test_probe_budget_and_adj_verdict]
 
