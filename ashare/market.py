@@ -260,15 +260,24 @@ def fetch_adj_by_date(trade_date: str):
 
 
 def trading_days(start: str, end: str):
-    """开市日 ['YYYY-MM-DD', ...]; None = 路径未启用 (让 pricestore 回退旧增量)。"""
+    """开市日 ['YYYY-MM-DD', ...]; None = 路径未启用 (让 pricestore 回退旧增量)。
+
+    **取历失败一律往外抛, 不再吞成 `[]`** (2026-09-08 卡 DATA-B 返工): 这里原来是
+    `except -> return []`, 而空列表在下游 `leftside_core.pricestore._ready_verdict` 里的
+    含义是"区间内没有开市日 (周末/长假) -> 已就绪"。于是 **镜像挂掉 == 周末**:
+    `ready` 返回 0 -> run_a.sh v2 的等待循环第一轮就放行 -> 整条流水线拿昨日库跑完 ->
+    榜单/买卖点/`day_*.json` 全带昨天的价并落进回测样本 —— 正是收盘后提前跑要防的那件事
+    (实测: 库停在 09-07、问 09-08、trade_cal 抛 500, 改前 `ready_for` 给 code=0)。
+    同一个空列表还让 `_update_daily_by_date` 打出"库内已到 X, 无新交易日"这句假追平。
+
+    调用方各自接: `ready_for` 接住判 UNKNOWN(2) 不放行, `_update_daily_by_date` 接住
+    停下且不推 meta。**别在这里加 try 把它变回 [] 或 None** —— None 的含义是"路径未启用",
+    会让 pricestore 回退到逐股回看的旧增量 (v2 库上那条路是被拒写的)。
+    """
     if not _tushare_on():
         return None
     from . import tushare_client as tsc
-    try:
-        return tsc.trade_cal(start, end)
-    except Exception as e:      # noqa: BLE001
-        log.warning("trade_cal 失败: %s", str(e)[:120])
-        return []
+    return tsc.trade_cal(start, end)
 
 
 def fetch_universe_rows(list_status: str = "L,D,P") -> list:

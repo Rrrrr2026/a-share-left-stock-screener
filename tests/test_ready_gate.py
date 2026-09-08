@@ -18,6 +18,16 @@
   · `ready_for` 端到端 (临时库 + 假 Market, 零联网), 含 v1 老库回落 bars 取末日
   · 探针 `tools/tushare_ready_probe.py`: 日志行字段齐全; 交易日历缓存命中时**一次调用都不发**
 
+2026-09-08 返工加的四组 (校验员报的四条缺陷, 每条都先复现再上锁):
+  · **数据源挂掉不许给假的"已就绪"**: 日历抛异常 / 日历吞成空列表 两条路都判 UNKNOWN(2)。
+    改前生产的 `ashare.market.trading_days` 是 `except -> return []`, 空列表在 `_ready_verdict`
+    里等于"周末 -> 已就绪", 于是**镜像挂掉 == 周末**, 等待循环第一轮就放行昨日库。
+  · `ashare.market.trading_days` 的失败语义: 往外抛, 不是 [] 也不是 None (None 有另一个含义)
+  · update 侧: 日历取不到时不打"无新交易日"的假追平、不推 `meta.max_trade_date`
+  · **adj_factor 未就绪守卫**: 日线到了、因子没到就不写这一天 (写了 `MAX(bars_raw.d)` 越过去,
+    那天缺的因子永远补不回来)
+  · 探针的墙钟预算 (必须小于单元 TimeoutStartSec) 与"两个端点都够才算 ready"的备注列
+
 运行:  python tests/test_ready_gate.py    或    python -m pytest tests/test_ready_gate.py -q
 """
 from __future__ import annotations
@@ -213,6 +223,229 @@ def test_probe_line_and_cal_cache():
     check("退出码恒 0 (探针失败不该让单元变红)", "return 0" in src and "OnFailure" not in src)
 
 
+# ---------------------------------------------------------------- 数据源挂掉 (2026-09-08 返工)
+
+
+def _market(dirpath, **kw):
+    """临时目录上的假 Market; kw 覆盖任意钩子。"""
+    global _SAVED_MARKET
+    from leftside_core.market import current
+    if _SAVED_MARKET is None:
+        try:
+            _SAVED_MARKET = current()
+        except Exception:                       # noqa: BLE001
+            _SAVED_MARKET = None
+    m = Market(name="ashare", dashboard_dir=dirpath, data_dir=dirpath,
+               db_path=os.path.join(dirpath, "x.db"), **kw)
+    set_market(m)
+    return m
+
+
+def _seed_full(dirpath, day="2026-09-07", n=10):
+    """bars_raw/adj/adj_base/universe 都种上 -> 可以直接跑 _update_daily_by_date。"""
+    codes = [f"{i:06d}" for i in range(1, n + 1)]
+    conn = sqlite3.connect(os.path.join(dirpath, "pricestore.db"))
+    ps._ensure_schema(conn)
+    conn.executemany("INSERT OR REPLACE INTO bars_raw VALUES(?,?,?,?,?,?,?,?)",
+                     [(c, day, 1, 1, 1, 1, 1, 1) for c in codes])
+    conn.executemany("INSERT OR REPLACE INTO adj(code,d,factor) VALUES(?,?,?)",
+                     [(c, day, 1.0) for c in codes])
+    conn.executemany("INSERT OR REPLACE INTO adj_base(code,d,factor) VALUES(?,?,?)",
+                     [(c, day, 1.0) for c in codes])
+    conn.executemany("INSERT OR REPLACE INTO universe(code,name,list_date,delist_date,status) "
+                     "VALUES(?,?,?,?,?)", [(c, c, "2000-01-01", "", "L") for c in codes])
+    conn.commit()
+    conn.close()
+    return codes
+
+
+def _db(dirpath, sql, args=()):
+    conn = sqlite3.connect(os.path.join(dirpath, "pricestore.db"))
+    try:
+        return conn.execute(sql, args).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_calendar_down_is_never_ready():
+    """**本卡返工的主缺陷**: 交易日历调不通时闸门必须判"判不了(2)", 绝不能判"已就绪(0)"。
+
+    生产的 `ashare.market.trading_days` 2026-09-08 之前是 `except -> return []`, 而空列表在
+    `_ready_verdict` 里的含义是"周末/长假 -> 已就绪" —— 于是**镜像挂掉 == 周末**, run_a.sh v2
+    的等待循环第一轮就放行, 整条流水线拿昨日库跑完并把昨日行情当今天发布。
+    两条路都要锁: ① 日历**抛异常** (改后的生产实现); ② 日历**吞成空列表** (任何还这么写的
+    实现) —— 后者靠 `_calendar_days` 反问一句"库末日那天开不开市"自检出来。
+    """
+    print("\n[ready] 数据源挂掉时不许给假的'已就绪'")
+    d = tempfile.mkdtemp(prefix="ready_down_")
+    _seed(d, bars_raw_days=["2026-09-07"])
+
+    def boom(a, b):
+        raise RuntimeError("模拟镜像 500")
+
+    _market(d, trading_days=boom)
+    v = ps.ready_for("20260908")
+    check("日历抛异常 -> UNKNOWN(2), 不是 YES", v["code"] == ps.READY_UNKNOWN and not v["ready"])
+    check("理由里点名日历取失败", "交易日历取失败" in v["reason"])
+
+    calls = []
+
+    def swallow(a, b):                          # 改前生产实现的样子: 失败吞成 []
+        calls.append((a, b))
+        return []
+
+    _market(d, trading_days=swallow)
+    v = ps.ready_for("20260908")
+    check("日历吞成空列表 -> 仍判 UNKNOWN(2) (自检拦下)",
+          v["code"] == ps.READY_UNKNOWN and not v["ready"])
+    check("自检确实反问了库末日那天", ("2026-09-07", "2026-09-07") in calls)
+    check("理由说清是自检没过", "自检" in v["reason"])
+
+    good = ["2026-09-04", "2026-09-07"]         # 日历活着, 区间内真的没有开市日
+    _market(d, trading_days=lambda a, b: [x for x in good if a <= x <= b])
+    v = ps.ready_for("2026-09-13")              # 09-13 周日
+    check("真周末 (日历活着) 仍判 ready, 没有被自检误伤", v["ready"] and v["code"] == ps.READY_YES)
+
+    n_calls = []
+    _market(d, trading_days=lambda a, b: n_calls.append((a, b)) or [x for x in good
+                                                                   if a <= x <= b])
+    v = ps.ready_for("20260907")
+    check("已追平时一次日历都不问 (短路在比日期那一步)", v["ready"] and not n_calls)
+
+
+def test_market_trading_days_raises_on_failure():
+    """源头那一半: `ashare.market.trading_days` 不许再把取历失败吞成 []。"""
+    print("\n[ready] ashare.market.trading_days 的失败语义")
+    from ashare import tushare_client as tsc
+    orig_cal, orig_on = tsc.trade_cal, _amkt._tushare_on
+    try:
+        _amkt._tushare_on = lambda: True
+
+        def boom(*a, **k):
+            raise tsc.TushareTransport("trade_cal: 模拟镜像 500", "trade_cal", 500)
+
+        tsc.trade_cal = boom
+        raised = None
+        try:
+            got = _amkt.trading_days("2026-09-08", "2026-09-08")
+        except Exception as e:                  # noqa: BLE001
+            raised, got = e, "raised"
+        check("trade_cal 抛错时 trading_days 往外抛 (不是 [] 也不是 None)",
+              raised is not None and got == "raised")
+        check("抛的是原异常类型 (调用方能分类)", isinstance(raised, tsc.TushareError))
+        _amkt._tushare_on = lambda: False
+        check("源开关关着仍返回 None (= 路径未启用, 语义没被改掉)",
+              _amkt.trading_days("2026-09-08", "2026-09-08") is None)
+    finally:
+        tsc.trade_cal, _amkt._tushare_on = orig_cal, orig_on
+
+
+def test_update_by_date_calendar_failure_is_not_caught_up():
+    """update 侧: 日历取不到时不许打"库内已到 X, 无新交易日"这句假追平, 也不许推 meta。"""
+    print("\n[update] 交易日历取不到 -> 停下, 不假追平")
+    d = tempfile.mkdtemp(prefix="upd_cal_")
+    _seed_full(d)
+
+    def boom(a, b):
+        raise RuntimeError("模拟镜像 500")
+
+    m = _market(d, trading_days=boom,
+                fetch_bars_by_date=lambda dd: {}, fetch_adj_by_date=lambda dd: {})
+    n = ps._update_daily_by_date(m)
+    check("返回 0 (不是 None —— None 会让调用方回退逐股回看那条禁路)", n == 0)
+    check("meta.max_trade_date 一个字都没写",
+          _db(d, "SELECT COUNT(*) FROM meta WHERE key='max_trade_date'") == 0)
+    check("bars_raw 末日原样", _db(d, "SELECT MAX(d) FROM bars_raw") == "2026-09-07")
+
+
+def test_update_by_date_adj_gate():
+    """adj_factor 没到齐就不许写这一天 —— 写了 MAX(d) 越过去, 那天的因子永远补不回来。"""
+    print("\n[update] 复权因子未就绪守卫")
+    day, days = "2026-09-08", ["2026-09-07", "2026-09-08"]
+    d = tempfile.mkdtemp(prefix="upd_adj_")
+    codes = _seed_full(d)
+    bars = {c: (1.0, 1.0, 1.0, 1.0, 100.0, 100.0) for c in codes}
+    cal = lambda a, b: [x for x in days if a <= x <= b]                 # noqa: E731
+
+    m = _market(d, trading_days=cal, fetch_bars_by_date=lambda dd: bars,
+                fetch_adj_by_date=lambda dd: {})                       # 因子端点还是空的
+    ps._update_daily_by_date(m)
+    check("daily 够了但 adj 是空的 -> 这天一根都不写",
+          _db(d, "SELECT COUNT(*) FROM bars_raw WHERE d=?", (day,)) == 0)
+    check("库末日仍是昨天 (下次还会回来补这天)",
+          _db(d, "SELECT MAX(d) FROM bars_raw") == "2026-09-07")
+    v = ps.ready_for(day.replace("-", ""))
+    check("闸门因此也判'还没到'(1), 等待循环会继续等", v["code"] == ps.READY_NO)
+
+    d2 = tempfile.mkdtemp(prefix="upd_adj_ok_")
+    codes = _seed_full(d2)
+    m = _market(d2, trading_days=cal, fetch_bars_by_date=lambda dd: bars,
+                fetch_adj_by_date=lambda dd: {c: 1.0 for c in codes})   # 因子也到齐
+    ps._update_daily_by_date(m)
+    check("两个端点都够 -> 正常写入这一天",
+          _db(d2, "SELECT COUNT(*) FROM bars_raw WHERE d=?", (day,)) == len(codes))
+    check("因子也落了库", _db(d2, "SELECT COUNT(*) FROM adj WHERE d=?", (day,)) == len(codes))
+
+    d3 = tempfile.mkdtemp(prefix="upd_adj_part_")
+    codes = _seed_full(d3)                                  # 10 只在市 -> 守卫线 9 只
+    m = _market(d3, trading_days=cal, fetch_bars_by_date=lambda dd: bars,
+                fetch_adj_by_date=lambda dd: {c: 1.0 for c in codes[:8]})   # 只到 8 只
+    ps._update_daily_by_date(m)
+    check("因子只到 8/10 (< 90%) -> 仍然不写这天",
+          _db(d3, "SELECT COUNT(*) FROM bars_raw WHERE d=?", (day,)) == 0)
+
+
+def test_probe_budget_and_adj_verdict():
+    """探针: 墙钟预算 (别把单元耗到 systemd 超时) + 备注列两个端点都算。"""
+    print("\n[probe] 墙钟预算与 ready 判据")
+    import importlib.util
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "tools", "tushare_ready_probe.py")
+    spec = importlib.util.spec_from_file_location("_ts_probe_budget", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    check("BUDGET_SEC 必须小于单元的 TimeoutStartSec=5min=300s", mod.BUDGET_SEC < 300)
+    check("单次调用期限 × 3 个端点 + 起动余量仍在预算内",
+          mod.CALL_DEADLINE_SEC * 3 + 20 <= mod.BUDGET_SEC)
+    check("预算用完时 count_rows 不发调用, 记 err=budget",
+          mod.count_rows("daily", "20260908", 0.0) == (None, None, "daily:budget"))
+    check("预算用完时 is_open_day 也不发调用",
+          mod.is_open_day("20260908", os.path.join(tempfile.mkdtemp(), "no.json"), 0.0)
+          == ("?", 0))
+
+    check("两端都够 -> ready", mod.verdict(5209, 5558, 5218) == "ready")
+    check("因子还没到 -> not-ready(adj) (不是 ready)",
+          mod.verdict(5209, 0, 5218) == "not-ready(adj)")
+    check("日线还没到 -> not-ready(daily)", mod.verdict(10, 5558, 5218) == "not-ready(daily)")
+    check("两个都没到 -> 点名两个", mod.verdict(0, 0, 5218) == "not-ready(daily+adj)")
+    check("端点调不通 (None) 不算 ready", mod.verdict(5209, None, 5218) == "not-ready(adj)")
+    check("日志表头写明两个端点都要够", "adj >= listed" in mod.HEADER)
+
+    tmp = tempfile.mkdtemp(prefix="probe_fail_")
+    cache = os.path.join(tmp, "probe.log.cal.json")
+    with open(cache, "w", encoding="utf-8") as f:
+        json.dump({"20260908": f"?{mod.CAL_MAX_FAILS}"}, f)
+    check("当天日历连失够多次后不再问 (省掉每 5 分钟一次的空跑)",
+          mod.is_open_day("20260908", cache) == ("?", 0))
+    from ashare import tushare_client as tsc
+    orig = tsc.trade_cal
+
+    def boom(*a, **k):
+        raise RuntimeError("模拟镜像 500")
+
+    try:
+        tsc.trade_cal = boom
+        with open(cache, "w", encoding="utf-8") as f:
+            json.dump({"20260908": "?1"}, f)
+        check("还没连失够次数时仍会再问一次", mod.is_open_day("20260908", cache) == ("?", 1))
+        with open(cache, encoding="utf-8") as f:
+            check("失败也写缓存, 连失计数 +1 (改前只在成功时写, 于是每 5 分钟重走最慢那条路)",
+                  json.load(f).get("20260908") == "?2")
+    finally:
+        tsc.trade_cal = orig
+
+
 def test_zz_no_check_failures():
     """pytest 只看有没有抛异常, 而 check() 是打印不是断言 —— 没有这一条, 上面任何一条
     ✗ FAIL 在 `pytest -q` 里都会被算成绿。放在最后一个 (pytest 按文件顺序跑)。"""
@@ -225,7 +458,11 @@ def test_zz_no_check_failures():
 
 TESTS = [test_ready_verdict_three_states, test_iso_day_normalization,
          test_ready_for_end_to_end, test_exit_codes_are_the_contract,
-         test_probe_line_and_cal_cache]
+         test_probe_line_and_cal_cache,
+         # 2026-09-08 返工 (校验员四条): 数据源挂掉不许给假的"已就绪"
+         test_calendar_down_is_never_ready, test_market_trading_days_raises_on_failure,
+         test_update_by_date_calendar_failure_is_not_caught_up, test_update_by_date_adj_gate,
+         test_probe_budget_and_adj_verdict]
 
 
 if __name__ == "__main__":

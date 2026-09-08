@@ -323,9 +323,17 @@ def index_daily(ts_code: str, start, end=None, **kw) -> pd.DataFrame:
     return df
 
 
-def trade_cal(start, end, exchange: str = "SSE", is_open: str = "1") -> list:
-    """开市日历 -> ['2026-09-04', ...] 升序 (is_open=None 则返回全部日历日)。"""
+def trade_cal(start, end, exchange: str = "SSE", is_open: str = "1",
+              retries: int = MAX_RETRIES, deadline_sec: float = DEADLINE_SEC) -> list:
+    """开市日历 -> ['2026-09-04', ...] 升序 (is_open=None 则返回全部日历日)。
+
+    `retries` / `deadline_sec` 透传给 `query`, 默认就是全局那对常量 (3 次 × 120s 硬期限,
+    最坏 3×120 + 退避 2+4 ≈ 366s)。**跑在 systemd 定时器里、又有 TimeoutStartSec 的调用方
+    必须自己收紧这两个值** —— 366s 已经单独超过 stock-tsprobe 的 5min 启动超时, 镜像滴流
+    那天会让单元被 systemd 判 timeout/failed (2026-09-08 卡 DATA-B 返工据此加的这两个参数)。
+    """
     df = query("trade_cal", fields="cal_date,is_open", exchange=exchange,
+               retries=retries, deadline_sec=deadline_sec,
                start_date=_ymd(start), end_date=_ymd(end), is_open=is_open)
     if not len(df) or "cal_date" not in df.columns:
         return []
