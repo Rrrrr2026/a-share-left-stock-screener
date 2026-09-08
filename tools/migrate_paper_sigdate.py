@@ -26,6 +26,18 @@ scale 也跟着偏 —— 09-08 复核实测: 换成 raw 锚定后这批仍然 6
 抄来的", 不是"两个价差不多"; 一设容差就会把 08-21 与 08-24 收盘恰好接近的票也卷进来。
 `cat == "quality"` 的信号没有快照价 (`cand` 只有 code/name), **一律不动**, 单独列出。
 
+## 改判要动的三个半字段 (`final` 那半个是 09-08 复检补上的)
+
+`sig_date` / `id` / 留痕字段 `sig_date_migrated_from` 之外, 还必须**删掉 `final` 缓存**:
+`leftside_core.paper.update_portfolio` 对 `s.get("final")` 为真的信号**直接返回缓存, 不再
+重新模拟** (paper.py 的 `if s.get("final"): rows.append(...); continue`)。只改日子而不清
+缓存, 那条信号会带着按**错误信号日**算出来的成交日/出场日/盈亏一直留在账本里 —— 而迁移的
+全部目的就是修这个, 等于白改。删掉之后下一次 `update_portfolio` 会按新的 `sig_date` 重新
+锚定、重新模拟, 走完整窗口后再自己缓存回来 (幂等设计, 缓存本来就是可再生的)。
+被删的缓存原样抄进 `final_dropped` 留痕 (改前的 status/成交日/收益都在里面, 想对账不用翻
+备份), 对账表里也逐条列出来。本机账本 62 条里有 1 条带 final; 服务器那份是另一份文件
+(字节数与 md5 都不同), 数量要在那边现跑 dry-run 才知道。
+
 ## 用法
 
     python -X utf8 tools/migrate_paper_sigdate.py                 # dry-run (默认)
@@ -81,10 +93,16 @@ def classify(state: dict, px_wrong: dict, px_right: dict) -> dict:
         code = s.get("code")
         cand = s.get("cand") or {}
         px = cand.get("price")
+        fin = s.get("final") or None
         row = {"i": i, "id": s.get("id"), "cat": s.get("cat"), "code": code,
                "name": s.get("name"), "sig_date_old": s.get("sig_date"),
                "price": None if px is None else float(px),
-               "px_2026_08_21": px_wrong.get(code), "px_2026_08_24": px_right.get(code)}
+               "px_2026_08_21": px_wrong.get(code), "px_2026_08_24": px_right.get(code),
+               # 冻结缓存: 改判时必须一并删掉, 否则 update_portfolio 直接返回它, 永不重算
+               "has_final": bool(fin),
+               "final_status": (fin or {}).get("status"),
+               "final_fill_date": (fin or {}).get("fill_date"),
+               "final_ret": (fin or {}).get("ret")}
         if s.get("cat") == "quality" or not px:
             row["verdict"] = "no_price"          # 优质榜信号没有快照价, 判不了 -> 不动
             res["quality"].append(row)
@@ -146,15 +164,26 @@ def main() -> int:
             for v in ("both_match", "only_0821", "no_match"))))
     print("  优质榜无快照价    : %d 条 (不判)" % len(res["quality"]))
     print("  id 会撞车 (待人工) : %d 条" % len(res["id_clash"]))
+    n_fin = sum(1 for r in res["move"] if r["has_final"])
+    print("  其中带 final 冻结缓存 : %d 条 -> **一并删缓存**, 否则 update_portfolio 直接"
+          "返回旧结果、永远不按新 sig_date 重算" % n_fin)
 
     print("\n--- 逐条对账 (改判的 %d 条) ---" % len(res["move"]))
-    print("%-4s %-9s %-8s %-6s %-9s %-9s %-9s %s" % (
-        "#", "cat", "code", "价", "08-21价", "08-24价", "新sig_date", "新 id"))
+    print("%-4s %-9s %-8s %-6s %-9s %-9s %-9s %-32s %s" % (
+        "#", "cat", "code", "价", "08-21价", "08-24价", "新sig_date", "新 id", "final"))
     for n, r in enumerate(res["move"], 1):
-        print("%-4d %-9s %-8s %-6s %-9s %-9s %-9s %s" % (
+        print("%-4d %-9s %-8s %-6s %-9s %-9s %-9s %-32s %s" % (
             n, r["cat"], r["code"], r["price"],
             "—" if r["px_2026_08_21"] is None else r["px_2026_08_21"],
-            r["px_2026_08_24"], r["sig_date_new"], r["id_new"]))
+            r["px_2026_08_24"], r["sig_date_new"], r["id_new"],
+            ("删缓存(%s)" % r["final_status"]) if r["has_final"] else "—"))
+    fins = [r for r in res["move"] if r["has_final"]]
+    if fins:
+        print("\n--- 会被删掉的 final 冻结缓存 (%d 条; 删掉后下次 update_portfolio 自会重算) ---"
+              % len(fins))
+        for r in fins:
+            print("    %s  status=%s fill_date=%s ret=%s  -> 原样存进 final_dropped 留痕"
+                  % (r["id"], r["final_status"], r["final_fill_date"], r["final_ret"]))
     if res["id_clash"]:
         print("\n--- id 撞车 (**不自动改**, 需要人拍) ---")
         for r in res["id_clash"]:
@@ -183,16 +212,24 @@ def main() -> int:
         return 0
     os.makedirs(os.path.dirname(bak), exist_ok=True)
     shutil.copy2(ledger, bak)
+    n_fin_dropped = 0
     for r in res["move"]:
         s = state["signals"][r["i"]]
         s["sig_date"] = RIGHT_DATE
         s["id"] = r["id_new"]
         s["sig_date_migrated_from"] = WRONG_DATE          # 留痕: 这条被改过, 谁都查得到
+        # **必须删 final**: update_portfolio 见 final 为真就直接返回缓存、不再重新模拟,
+        # 只改日子不清缓存 = 这条信号永远留着按错误信号日算出来的成交日/出场日/盈亏。
+        # 缓存是可再生的 (走完完整窗口会自己写回来), 但删之前把原值抄进 final_dropped 留痕。
+        if s.get("final"):
+            s["final_dropped"] = s.pop("final")
+            n_fin_dropped += 1
     tmp = ledger + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)
     os.replace(tmp, ledger)
-    print("\n已改判 %d 条; 备份 %s" % (len(res["move"]), bak))
+    print("\n已改判 %d 条 (其中删掉 final 冻结缓存 %d 条 -> 存进 final_dropped); 备份 %s"
+          % (len(res["move"]), n_fin_dropped, bak))
     print("回滚 (PowerShell): Copy-Item -Force '%s' '%s'" % (bak, ledger))
     print("回滚 (bash)      : cp -f '%s' '%s'" % (bak, ledger))
     return 0

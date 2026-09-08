@@ -16,7 +16,9 @@
 运行:  python tests/test_backtest_anchor.py   或   python -m pytest tests/test_backtest_anchor.py -q
 """
 from __future__ import annotations
+import copy
 import datetime as dt
+import json
 import os
 import sqlite3
 import sys
@@ -518,8 +520,12 @@ def test_xd_rebased_closes_is_raw_times_factor_ratio():
 
 
 def _mk_xd_store(path: str) -> None:
-    """最小价格库: 600061 在 2026-07-01 除权 (9.8854 -> 10.1171), 000001 一直没除权,
-    603201 名字带 XD 但**库里没有 06-30 那根** (走"拿不到原始价 -> 只打 xd 标记"那条路)。"""
+    """最小价格库 (2026-06-29/30 与 07-01 三根):
+      600061  名字带 XD, 库里有 06-30 那根 (6.55), 因子 9.8854 -> 10.1171 (07-01 除权)
+      603201  名字带 XD, **库里没有 06-30 那根** -> 库里读不到原始收盘 (basis=unknown)
+      000002  名字**不带** XD, 但因子 1.0 -> 1.1 (07-01 除权) -> 只能靠因子那条证据判出来
+      000001  两条证据都不命中 (对照组: 一个字段都不许加)
+    """
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE bars_raw(code TEXT,d TEXT,o REAL,h REAL,l REAL,c REAL,v REAL,"
                  "amt REAL,PRIMARY KEY(code,d)) WITHOUT ROWID")
@@ -529,8 +535,10 @@ def _mk_xd_store(path: str) -> None:
     for d, f61 in (("2026-06-29", 9.8854), ("2026-06-30", 9.8854), ("2026-07-01", 10.1171)):
         rows_r.append(("600061", d, 6.5, 6.6, 6.4, 6.55 if d == "2026-06-30" else 6.6, 1.0, 1.0))
         rows_r.append(("000001", d, 10.0, 10.0, 10.0, 10.0, 1.0, 1.0))
+        rows_r.append(("000002", d, 20.0, 20.0, 20.0, 20.0, 1.0, 1.0))
         rows_a.append(("600061", d, f61))
         rows_a.append(("000001", d, 3.0))
+        rows_a.append(("000002", d, 1.0 if d < "2026-07-01" else 1.1))
         rows_a.append(("603201", d, 2.5229 if d < "2026-07-01" else 2.5764))
     conn.executemany("INSERT INTO bars_raw VALUES(?,?,?,?,?,?,?,?)", rows_r)
     conn.executemany("INSERT INTO adj VALUES(?,?,?)", rows_a)
@@ -538,40 +546,129 @@ def _mk_xd_store(path: str) -> None:
     conn.close()
 
 
-def test_xd_snapshot_price_rewritten_to_raw():
-    """**生成侧**: 除权日的候选把 price 改记原始价 + price_basis, 拿不到原始价才打 xd。
+def _xd_cands() -> list:
+    """生产形状的候选 —— **带齐同基准的兄弟价位字段**。
 
-    这是 2026-09-08 生产同款样本上**唯一**那笔"新口径更差"的根治法: 600061 XD国投资
-    2026-06-30 快照存 6.40 = 6.55 × 9.8854/10.1171 (除权后的昨收), 既不是原始收盘也不是
-    任何一天的成交价。历史文件一个字节不改, 只修今后写出来的快照。
+    首版的用例只给了 code/name/price 三个键, 于是"改 price 会把它与 support/box/plan 的
+    基准拆成两套"这条**结构上根本考不到**, 校验员是拿真实快照记录才发现的。这里逐字照抄
+    day_2026-07-01.json 里那两条真记录的字段, 谁再想动价, 用例立刻红。
     """
+    return [
+        {"code": "600061", "name": "XD国投资", "price": 6.40, "atr_pct": 3.1,
+         "support_price": 6.4503, "breakdown_price": 5.82, "dist_support_pct": -0.7865,
+         "box_hi": 6.72, "box_lo": 6.18, "high_52w": 8.5, "low_52w": 5.4,
+         "plan": {"kind": "pullback", "mode": "support", "entry_ref": 6.4503,
+                  "entry_low": 6.3729, "entry_high": 6.5471, "stop_price": 5.7909}},
+        {"code": "603201", "name": "XD常润股", "price": 13.67, "atr_pct": 4.2,
+         "support_price": 13.89, "breakdown_price": 10.0007},
+        {"code": "000002", "name": "万科A", "price": 20.00, "atr_pct": 2.0,
+         "support_price": 19.5, "breakdown_price": 18.0},
+        {"code": "000001", "name": "平安银行", "price": 10.00, "atr_pct": 1.5,
+         "support_price": 9.8, "breakdown_price": 9.0},
+    ]
+
+
+def _run_xd_fix(slim: dict, store_path: str) -> dict:
     from ashare import export_data as ex                         # noqa: PLC0415
-    path = os.path.join(tempfile.mkdtemp(prefix="cardR34_"), "pricestore.db")
-    _mk_xd_store(path)
-    slim = {"meta": {"run_date": "2026-07-01", "data_date": "2026-06-30"},
-            "candidates": [
-                {"code": "600061", "name": "XD国投资", "price": 6.40},
-                {"code": "603201", "name": "XD常润股", "price": 13.67},
-                {"code": "000001", "name": "平安银行", "price": 10.00}]}
     saved_bars = CONFIG["source"].get("bars")
     try:
         CONFIG["source"]["bars"] = "tushare"
-        with _use_store(path):
-            res = ex.xd_fix_snapshot_prices(slim)
+        with _use_store(store_path):
+            return ex.xd_fix_snapshot_prices(slim)
     finally:
         CONFIG["source"]["bars"] = saved_bars
-    by_code = {c["code"]: c for c in slim["candidates"]}
-    assert res["n_xd"] == 2 and res["n_repriced"] == 1 and res["n_flagged"] == 1, res
-    assert res["by_name"] == 2 and res["by_factor"] == 2, "名称与因子两条独立证据都该命中"
-    a = by_code["600061"]
-    assert a["price"] == 6.55 and a["price_basis"] == "raw_close", a
-    assert a["price_qfq_rebased"] == 6.40, "被换掉的原值必须留痕, 否则事后对不了账"
-    assert "xd" not in a, "拿到了原始价就不该再打 xd (那是兜底路)"
-    b = by_code["603201"]
-    assert b["xd"] is True and b["price"] == 13.67, "拿不到原始价 -> 只打标记, 不许瞎改价"
-    c = by_code["000001"]
-    assert set(c) == {"code", "name", "price"}, f"没除权的候选一个字段都不该加: {c}"
-    assert slim["meta"]["xd_fix"]["n_xd"] == 2, "meta 必须留汇总 —— 静默改价是禁止的"
+
+
+def test_xd_snapshot_only_flags_never_reprices():
+    """**生成侧只打 `xd` 标记, 一个价都不许改** (2026-09-08 复检后砍掉的那条改价路)。
+
+    首版把除权日候选的 `price` 改记原始收盘。校验实测这会出两条人命:
+      ① `price` 与 `support_price` / `breakdown_price` / `box_hi` / `box_lo` / 存档 `plan`
+         的四个价位出自**同一条前复权序列**, 只换 price 的基准 -> 下游
+         `scale = qfq[anchor]/snap_px` 把计划价位整体平移一个除权因子比 (实测 600061
+         -2.29%, 603201 的 mode 由 market 翻成 support), 而 `0.2<scale<5.0` 拦不住;
+      ② 拿去查库的 `data_date` 不过修正表, 在服务器那两份错值副本上写进的是**错的那一天**
+         的收盘 (600061 会被写成 07-01 的 6.64 —— 一个**未来一天**的价)。
+    所以现在只剩"打标记"这一条路。本用例的候选带齐了兄弟价位字段, 谁再动价立刻红。
+    """
+    path = os.path.join(tempfile.mkdtemp(prefix="cardR34_"), "pricestore.db")
+    _mk_xd_store(path)
+    cands = _xd_cands()
+    before = copy.deepcopy(cands)
+    slim = {"meta": {"run_date": "2026-07-01", "data_date": "2026-06-30"},
+            "candidates": cands}
+    res = _run_xd_fix(slim, path)
+
+    by_code = {c["code"]: c for c in cands}
+    # ---- 1. 每一条候选的**所有原有字段逐值不变**, 新增的只许是 {"xd": True}
+    for old in before:
+        now = by_code[old["code"]]
+        added = set(now) - set(old)
+        assert added <= {"xd"}, f"{old['code']} 多出了字段 {added} —— 只许加 xd"
+        for k, v in old.items():
+            assert now[k] == v, f"{old['code']}.{k} 被改动: {v!r} -> {now[k]!r}"
+    assert by_code["600061"]["price"] == 6.40, "**改价路已删**: 6.40 不许变成 6.55/6.64"
+    for c in cands:                    # 首版留下的两个字段必须彻底消失
+        assert "price_basis" not in c and "price_qfq_rebased" not in c, c
+
+    # ---- 2. 命中的三只都打上标记, 没命中的一个字段都不加
+    assert by_code["600061"].get("xd") is True and by_code["603201"].get("xd") is True
+    assert by_code["000002"].get("xd") is True, "名字不带 XD, 只能靠因子那条证据判出来"
+    assert set(by_code["000001"]) == set(next(
+        c for c in before if c["code"] == "000001")), "没除权的候选一个字段都不该加"
+
+    # ---- 3. meta 汇总 (证据留在这里, 不需要靠改价来留痕)
+    assert res["n_xd"] == 3 and res["n_flagged"] == 3, res
+    assert res["by_name"] == 2 and res["by_factor"] == 3, res
+    assert "n_repriced" not in res, "改价路连计数都不该再有"
+    diag = {r["code"]: r for r in res["codes"]}
+    assert diag["600061"]["store_raw_close"] == 6.55
+    assert diag["600061"]["basis"] == "rebased", "6.40 vs 6.55 差 2.29% -> 是除权后的昨收"
+    assert diag["603201"]["basis"] == "unknown", "库里没有那根 -> 判不了, 不许瞎猜"
+    assert diag["000002"]["by"] == "factor" and diag["600061"]["by"] == "name+factor"
+    assert slim["meta"]["xd_fix"]["n_xd"] == 3, "meta 必须留汇总"
+
+
+def test_xd_generation_reads_corrected_data_date():
+    """拿去查库的 `data_date` **必须过 `SNAPSHOT_DATA_DATE_FIX` 修正表**。
+
+    首版直接读 `meta["data_date"]`, 而那张表存在的唯一理由就是这个字段错过两次。后果在
+    服务器那两份仍是错值的副本上是实打实的: `day_2026-07-01.json` 的 meta 写着 07-01,
+    于是因子窗口 [07-01, 07-01] 塌成一天 (因子判全灭), 而库里查到的"那天的收盘"是 6.64
+    —— 比快照晚一天的价。修正表把它拨回 06-30 之后, 查到的才是 6.55。
+    """
+    path = os.path.join(tempfile.mkdtemp(prefix="cardR34fix_"), "pricestore.db")
+    _mk_xd_store(path)
+    slim = {"meta": {"run_date": "2026-07-01", "data_date": "2026-07-01"},   # <- 已知错值
+            "candidates": _xd_cands()}
+    res = _run_xd_fix(slim, path)
+    assert res["data_date"] == "2026-06-30", (
+        f"标注日没过修正表: 实得 {res['data_date']!r}, 该是 2026-06-30")
+    assert res["data_date_note"], "修正了就必须留说明 (静默改日子和静默改价一样禁止)"
+    diag = {r["code"]: r for r in res["codes"]}
+    assert diag["600061"]["store_raw_close"] == 6.55, (
+        "查的是修正后那天的 bar; 6.6 = 07-01 的收盘 = 比快照晚一天的价")
+    assert res["by_factor"] == 3, "窗口 [06-30, 07-01] 张得开, 三只的因子都变过"
+
+
+def test_xd_flag_is_harmless_when_price_is_plain_raw():
+    """多打的 `xd` 标记必须**无害** —— 这是"宁可多标"这个取舍成立的前提。
+
+    生产上 36 份快照里 33 份 `data_date == run_date`, 那种天因子窗口塌成一天、因子判恒 0,
+    只剩名称前缀在判; 而名称前缀那条会把"当天除权、快照价本来就是当天原始收盘"的票也标上。
+    这种票走 `xd_rebased_closes` 必须锚到与不打标记**完全相同**的那根 bar, 否则"多标一个
+    没关系"就不成立了 —— 601995 在 day_2026-08-24.json 里正是这种形状 (33.62 本来就对)。
+    """
+    n = 30
+    dates = [(dt.date(2026, 1, 5) + dt.timedelta(days=i)).isoformat() for i in range(n)]
+    raw = np.array([10.0 + 0.1 * i for i in range(n)])       # 逐根不同, 锚定不会歧义
+    f = np.where(np.arange(n) < 12, 1.0, 1.0 / 0.97)         # 除权在第 12 根 (远离锚点)
+    ser = {"dates": dates, "ohlc": np.column_stack([raw * f / f[-1]] * 4), "raw_close": raw}
+    for i in (19, 20, 25):
+        snap_px = float(raw[i])                              # 快照价 = 该根的原始收盘
+        a_off = bt.find_anchor(bt.anchor_closes(ser, xd=False), i, snap_px)
+        a_on = bt.find_anchor(bt.anchor_closes(ser, xd=True), i, snap_px)
+        assert a_off == a_on == i, f"idx {i}: 打标记 {a_on} vs 不打 {a_off}, 都该是 {i}"
 
 
 def test_xd_flag_survives_into_anchoring():
@@ -587,6 +684,62 @@ def test_xd_flag_survives_into_anchoring():
         f"没有 xd 标记时锚在诱饵上 -> 次日成交 {eps_no[0]['fill_date']}")
     assert eps_xd[0]["fill_date"] == ser["dates"][20], (
         f"带 xd 标记时应锚回第 19 根 -> 次日成交 {eps_xd[0]['fill_date']}")
+
+
+def test_xd_flag_does_not_move_plan_levels():
+    """打标记只该改"锚到哪根 bar", **计划价位与 scale 的基准不许动**。
+
+    这是首版改价路真正的杀伤面: `reconstruct_plan` 吃 price 与 support/box/plan 的绝对
+    价位, `simulate` 再拿 `scale = qfq[anchor]/snap_px` 把它们搬进 qfq 空间。price 换了
+    基准而计划价位没换 -> 入场带与止损位整体平移。用**无量纲的 level/snap_px** 比 (它就是
+    乘 scale 之后的相对位置), 过完生成侧修法必须逐值不变。
+    """
+    path = os.path.join(tempfile.mkdtemp(prefix="cardR34plan_"), "pricestore.db")
+    _mk_xd_store(path)
+    before = _xd_cands()
+    slim = {"meta": {"run_date": "2026-07-01", "data_date": "2026-06-30"},
+            "candidates": copy.deepcopy(before)}
+    _run_xd_fix(slim, path)
+    for old, new in zip(before, slim["candidates"]):
+        p0, p1 = bt.reconstruct_plan(old), bt.reconstruct_plan(new)
+        assert (p0 is None) == (p1 is None), old["code"]
+        if p0 is None:
+            continue
+        assert p0.get("mode") == p1.get("mode"), (
+            f"{old['code']}: 入场剧本被改了 {p0.get('mode')} -> {p1.get('mode')}")
+        for k in ("entry_ref", "entry_low", "entry_high", "stop"):
+            r0, r1 = p0[k] / float(old["price"]), p1[k] / float(new["price"])
+            assert abs(r0 - r1) < 1e-12, (
+                f"{old['code']}.{k} 相对 snap_px 偏移了 {(r1 / r0 - 1) * 100:+.3f}% "
+                f"—— 说明 price 与计划价位的基准被拆成了两套")
+
+
+def test_paper_registration_carries_xd_flag():
+    """模拟盘那条链**注册时**就得把 `xd` 抄进账本 —— 否则 `_simulate_signal` 里读它恒为假。
+
+    `_latest_signals` 用 `CAND_KEYS` 白名单给候选瘦身, 首版没把 "xd" 加进去, 于是写进
+    `data/paper_portfolio.json` 的 cand 里永远没有这个键, 锚定侧那行 `cand.get("xd")`
+    对新注册的信号是死代码。账本是三条消费链里**唯一注册一次之后再也不回看快照**的一条,
+    锚错了事后只能靠迁移脚本补 —— 正是本卡在补的那 62 条的同一失败形态。
+    """
+    from leftside_core import paper as pp                        # noqa: PLC0415
+    assert "xd" in pp.CAND_KEYS, "CAND_KEYS 少了 xd -> 账本里永远拿不到这个标记"
+    tmpd = tempfile.mkdtemp(prefix="cardR34pp_")
+    cand = {"code": "600061", "name": "XD国投资", "tag": "🕳 深跌抄底", "price": 6.4,
+            "atr_pct": 3.1, "support_price": 6.4503, "xd": True}
+    old_ls, old_paths = pp.bt.load_snapshots, pp._paths
+    try:
+        pp.bt.load_snapshots = lambda: [{"as_of": "2026-06-30", "cands": [cand]}]
+        pp._paths = lambda: (tmpd, os.path.join(tmpd, "p.json"),
+                             os.path.join(tmpd, "p.js"))
+        _as_of, sigs = pp._latest_signals()
+        state = {"signals": [], "daily": []}
+        n = pp._register(state, sigs)
+    finally:
+        pp.bt.load_snapshots, pp._paths = old_ls, old_paths
+    assert n == 1 and state["signals"], sigs
+    assert state["signals"][0]["cand"].get("xd") is True, (
+        "账本里那份 cand 丢了 xd: %r" % state["signals"][0]["cand"])
 
 
 # ---------------------------------------------------------------- 模拟盘 sig_date 迁移
@@ -632,6 +785,61 @@ def test_migrate_paper_sigdate_classify():
     assert state["signals"][0]["id"] == "dip:A:2026-08-21"
 
 
+def test_migrate_paper_sigdate_drops_final_cache():
+    """改判 `sig_date` 的同时**必须删掉 `final` 冻结缓存**, 否则这条迁移等于白做。
+
+    `leftside_core.paper.update_portfolio` 对 `s.get("final")` 为真的信号**直接返回缓存,
+    不再重新模拟**。首版的 --apply 只写 sig_date / id / 留痕字段, 于是任何已被冻结的迁移
+    对象会带着按**错误信号日**算出来的成交日/出场日/盈亏一直留在账本里 —— 而迁移的全部
+    目的就是修这个。缓存是可再生的 (走完完整窗口会自己写回来), 但删之前要留痕。
+    这里在**一次性临时账本**上真跑 --apply (真账本 data/paper_portfolio.json 一个字节不碰)。
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "tools"))
+    import migrate_paper_sigdate as mg                           # noqa: PLC0415
+    repo = tempfile.mkdtemp(prefix="cardR34mg_")
+    hist = os.path.join(repo, "dashboard", "history")
+    os.makedirs(hist)
+    os.makedirs(os.path.join(repo, "data"))
+    for day, cands in (("2026-08-21", [{"code": "C", "price": 9.0}]),
+                       ("2026-08-24", [{"code": "A", "price": 2.0},
+                                       {"code": "C", "price": 1.0}])):
+        with open(os.path.join(hist, "day_%s.json" % day), "w", encoding="utf-8") as f:
+            json.dump({"candidates": cands}, f)
+    frozen = {"status": "stopped", "fill_date": "2026-08-24", "ret": -0.07}
+    ledger = os.path.join(repo, "data", "paper_portfolio.json")
+    with open(ledger, "w", encoding="utf-8") as f:
+        json.dump({"signals": [
+            {"id": "dip:A:2026-08-21", "cat": "dip", "code": "A",
+             "sig_date": "2026-08-21", "cand": {"code": "A", "price": 2.0},
+             "final": frozen},                                    # 冻结的 -> 要被解冻
+            {"id": "dip:C:2026-08-21", "cat": "dip", "code": "C",
+             "sig_date": "2026-08-21", "cand": {"code": "C", "price": 9.0},
+             "final": dict(frozen)},                              # 不迁 -> 缓存不许动
+        ]}, f)
+    argv = sys.argv
+    try:
+        sys.argv = ["migrate_paper_sigdate.py", "--repo", repo, "--apply"]
+        assert mg.main() == 0
+    finally:
+        sys.argv = argv
+    with open(ledger, encoding="utf-8") as f:
+        after = {s["code"]: s for s in json.load(f)["signals"]}
+    a = after["A"]
+    assert a["sig_date"] == "2026-08-24" and a["id"] == "dip:A:2026-08-24"
+    assert a["sig_date_migrated_from"] == "2026-08-21"
+    assert "final" not in a, "改了日子却留着 final -> update_portfolio 永远返回旧结果"
+    assert a["final_dropped"] == frozen, "删掉的缓存必须原样留痕, 否则事后对不了账"
+    c = after["C"]
+    assert c["sig_date"] == "2026-08-21" and c["final"] == frozen, (
+        "没被改判的信号缓存一个字都不许动")
+    # 备份确实先写了, 且是改动前那一份
+    baks = sorted(os.listdir(os.path.join(repo, "data", "backups")))
+    assert baks, "--apply 必须先备份"
+    with open(os.path.join(repo, "data", "backups", baks[-1]), encoding="utf-8") as f:
+        assert json.load(f)["signals"][0]["final"] == frozen, "备份该是改动**前**的账本"
+
+
 TESTS = [test_anchor_uses_raw_not_qfq, test_anchor_closes_tolerates_nan,
          test_default_is_off_until_boss_signs_off,
          test_return_across_ex_div_uses_qfq, test_store_hit_and_per_code_fallback,
@@ -645,9 +853,14 @@ TESTS = [test_anchor_uses_raw_not_qfq, test_anchor_closes_tolerates_nan,
          test_backtest_store_switch_three_layers,
          test_run_pipeline_logs_backtest_price_switch,
          test_xd_rebased_closes_is_raw_times_factor_ratio,
-         test_xd_snapshot_price_rewritten_to_raw,
+         test_xd_snapshot_only_flags_never_reprices,
+         test_xd_generation_reads_corrected_data_date,
+         test_xd_flag_is_harmless_when_price_is_plain_raw,
          test_xd_flag_survives_into_anchoring,
-         test_migrate_paper_sigdate_classify]
+         test_xd_flag_does_not_move_plan_levels,
+         test_paper_registration_carries_xd_flag,
+         test_migrate_paper_sigdate_classify,
+         test_migrate_paper_sigdate_drops_final_cache]
 
 
 if __name__ == "__main__":
