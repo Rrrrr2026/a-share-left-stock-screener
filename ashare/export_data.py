@@ -256,6 +256,127 @@ def write_dashboard_js(run_date: str | None = None) -> str:
 HISTORY_DIR = os.path.join(os.path.dirname(DASHBOARD_DATA_JS), "history")
 
 
+#: 东财在除权/除息当天给名字加的前缀 (XD 除息 / XR 除权 / DR 除权除息)。**不联网就能判**,
+#: 是价格库读不到时唯一的 XD 线索; 库在的时候只当作第二条独立证据。
+XD_NAME_PREFIXES = ("XD", "XR", "DR")
+
+#: 快照价与库里原始收盘的容差 —— 与 `leftside_core.backtest.ANCHOR_TOL_EXACT` 同一个 0.25%,
+#: 免得"生成侧认为对上了"而"锚定侧认为没对上"。
+_XD_TOL = 0.0025
+
+
+def _xd_probe_store(codes: list, data_date: str, run_date: str) -> tuple[dict, set]:
+    """价格库 -> ({code: data_date 那天的原始收盘}, {在 (data_date, run_date] 里除过权的 code})。
+
+    只读、失败即放弃 (返回空): 这是快照的**锦上添花**, 绝不能因为库出问题就写不出快照。
+    """
+    from . import datasource as ds
+    raw_at: dict = {}
+    xd: set = set()
+    if not codes or not data_date:
+        return raw_at, xd
+    conn = ds._store_conn()
+    hi = run_date or data_date
+    for i in range(0, len(codes), 400):
+        chunk = codes[i:i + 400]
+        ph = ",".join("?" * len(chunk))
+        for code, c in conn.execute(
+                f"SELECT code, c FROM bars_raw WHERE d=? AND code IN ({ph})",
+                [data_date, *chunk]):
+            if c and float(c) > 0:
+                raw_at[code] = float(c)
+        # 因子在 [data_date, run_date] 这个窗口里变过 = 快照那天导出的前复权基准已经被除权
+        # 平移过, 于是榜单里的 price (取自序列最后一根) 是一个**除权后的昨收**。
+        for code, fmin, fmax in conn.execute(
+                f"SELECT code, MIN(factor), MAX(factor) FROM adj "
+                f"WHERE d>=? AND d<=? AND code IN ({ph}) GROUP BY code",
+                [data_date, hi, *chunk]):
+            if fmin is not None and fmax is not None and abs(float(fmax) - float(fmin)) > 1e-9:
+                xd.add(code)
+    return raw_at, xd
+
+
+def xd_fix_snapshot_prices(slim: dict) -> dict:
+    """**除权日快照的生成侧修法** (2026-09-08 卡 R3-4, GM 决定①)。
+
+    病灶: 榜单里的 `price` 来自阶段A 取回的**前复权**序列的最后一根。前复权的基准是"拉取
+    那一天", 所以只要某只票**在拉取那天除权**、而序列最后一根是前一天, 存进快照的就是一个
+    **除权后的昨收** —— 它既不等于那天的原始收盘, 也不是任何一天的成交价。实证
+    (2026-07-01 那份快照, 服务器与 PC 两份副本都一样):
+        600061 XD国投资  快照 6.40 = 6.55 × 9.8854/10.1171 (raw 收盘 6.55)
+        603201 XD常润股  快照 13.67 = 13.96 × 2.5229/2.5764 (raw 收盘 13.96)
+    这两笔是生产同款样本上 raw 锚定仅有的 2 条非 exact, 其中 600061 就是重放里**唯一**
+    那笔"新口径更差" (raw 锚定退到 06-26, near 1.72%, 反而错一格)。也就是说 0.9pp 里
+    唯一一条反向证据的根因在**快照生成**, 不在取价/锚定口径。
+
+    修法 (只改生成侧, **历史文件一个字节都不动**):
+      · 判 XD 两条独立证据 —— ① 名字以 XD/XR/DR 开头 (东财除权日给的前缀, 不联网就能判);
+        ② 价格库里该票的复权因子在 [data_date, run_date] 里变过。任一条命中即视为 XD。
+      · 命中且库里有 data_date 那根的原始收盘 -> `price` 改记**原始价**, 打
+        `price_basis="raw_close"`; 价真的被换掉时另存 `price_qfq_rebased` = 原值 (可追溯,
+        将来要对账"当时导出的是什么"不用去翻库)。
+      · 命中但拿不到原始价 (库没这只/没这天/库比快照旧) -> 只打 `xd: true`,
+        让锚定侧改用 `leftside_core.backtest.xd_rebased_closes` 的 "raw × 因子比" 序列比,
+        而不是拿一个不同基准的价去撞 0.25% 的容差。
+      · 没命中的候选一个字段都不加 (快照体积敏感; 也让"带标记"本身就是信息)。
+
+    meta 里留一行 `xd_fix` 汇总 (n_xd / n_repriced / n_flagged / codes), 事后能一眼看出
+    某一天到底动了谁 —— 静默改价是本队明令禁止的。
+    -> 汇总 dict (也写进 slim["meta"]["xd_fix"])。
+    """
+    meta = slim.get("meta") or {}
+    cands = slim.get("candidates") or []
+    data_date = str(meta.get("data_date") or meta.get("run_date") or "")[:10]
+    run_date = str(meta.get("run_date") or data_date)[:10]
+    out = {"data_date": data_date, "n_xd": 0, "n_repriced": 0, "n_flagged": 0,
+           "by_name": 0, "by_factor": 0, "codes": [], "store_ok": False}
+    if not cands or not data_date:
+        return out
+    codes = [c["code"] for c in cands if c.get("code")]
+    raw_at, xd_store = {}, set()
+    try:
+        if CONFIG["source"].get("bars") == "tushare":
+            raw_at, xd_store = _xd_probe_store(codes, data_date, run_date)
+            out["store_ok"] = True
+    except Exception as e:                                     # noqa: BLE001
+        log.warning("除权日快照修正: 读价格库失败, 只按名称前缀判 (%s)", e)
+    for c in cands:
+        code, px = c.get("code"), c.get("price")
+        if not code or not px or float(px) <= 0:
+            continue
+        by_name = str(c.get("name") or "").strip().upper().startswith(XD_NAME_PREFIXES)
+        by_factor = code in xd_store
+        if not (by_name or by_factor):
+            continue
+        out["n_xd"] += 1
+        out["by_name"] += int(by_name)
+        out["by_factor"] += int(by_factor)
+        rec = {"code": code, "name": c.get("name"), "snap_price": float(px),
+               "by": ("name" if by_name else "") + ("+factor" if by_factor else "")}
+        raw = raw_at.get(code)
+        if raw is None:
+            c["xd"] = True                       # 拿不到原始价 -> 交给锚定侧的 raw×因子比
+            out["n_flagged"] += 1
+            rec["action"] = "flag_xd"
+        else:
+            c["price_basis"] = "raw_close"
+            if abs(float(px) / raw - 1.0) > _XD_TOL:
+                c["price_qfq_rebased"] = float(px)
+                c["price"] = round(raw, 4)
+                out["n_repriced"] += 1
+                rec["action"] = "reprice"
+                rec["raw_close"] = raw
+            else:
+                rec["action"] = "already_raw"
+        out["codes"].append(rec)
+    meta["xd_fix"] = out
+    if out["n_xd"]:
+        log.info("除权日快照修正: %d 只 XD/XR/DR (名称判 %d, 因子判 %d) -> 改记原始价 %d, "
+                 "只打 xd 标记 %d", out["n_xd"], out["by_name"], out["by_factor"],
+                 out["n_repriced"], out["n_flagged"])
+    return out
+
+
 def write_history_snapshot(run_date: str | None = None) -> str | None:
     """把某个 run_date 的候选榜写成"瘦身版"历史快照 (无K线明细/深度档案,
     体积 ~1MB), 供前端的日期切换器回看历史扫描结果:
@@ -267,6 +388,12 @@ def write_history_snapshot(run_date: str | None = None) -> str | None:
         return None
     slim = {"meta": payload["meta"], "industries": payload["industries"],
             "candidates": payload["candidates"], "columns": payload["columns"]}
+    # 除权日的候选: price 记原始价 (或打 xd 标记), 否则回放锚定会撞上一个不同基准的价。
+    # 只动**这一份将要落盘的快照**, dashboard_data.js 那份是另一次 build_payload, 不受影响。
+    try:
+        xd_fix_snapshot_prices(slim)
+    except Exception as e:                                     # noqa: BLE001
+        log.warning("除权日快照修正失败(快照照常写出, 该日 XD 票的锚定可能偏一格): %s", e)
     os.makedirs(HISTORY_DIR, exist_ok=True)
     path = os.path.join(HISTORY_DIR, f"day_{rd}.json")
     with open(path, "w", encoding="utf-8") as f:

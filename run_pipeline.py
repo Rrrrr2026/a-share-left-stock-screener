@@ -274,6 +274,34 @@ def trim_universe_by_store(universe, run_date):
     return out, basis
 
 
+def log_backtest_price_switch() -> bool:
+    """回测/模拟盘/双周取价读不读价格库 —— 每轮必须有一行说清"是哪一头, 被谁定的"。
+
+    这条链 (P2) 与阶段A 的 `bars` 源是**两个**开关: 它改的是 `fetch_price_series` 的取价
+    与 `find_anchor` 的锚定口径 (raw 而不是 qfq), 出问题要能单独关掉。三层优先级
+    环境变量 `ASHARE_BACKTEST_PRICES_FROM_STORE` > 停机文件 `data/backtest_store.off` >
+    代码默认值 `config.DEFAULT_BACKTEST_STORE` —— 判定与提示语见 config._backtest_store_switch()。
+
+    **为什么非要打这一行**: 这一头切过去, 对外公布的胜率会动 (生产同款样本实测 win10
+    52.3%→53.2%)。哪天有人对着两份数字问"这轮到底走的哪条路", 日志里必须当场答得出来,
+    而不是回去翻 config 的默认值 —— 服务器上那个默认值还可能被环境变量/停机文件盖掉。
+    """
+    warn = CONFIG["source"].get("backtest_prices_from_store_switch_warn")
+    if warn:
+        log.warning("回测取价 · 开关: %s", warn)
+    on = ds.backtest_prices_from_store_on()
+    by = CONFIG["source"].get("backtest_prices_from_store_off_by") or ""
+    if not ds.bars_from_store_on():
+        # bars 源不是 tushare 时这条链被 `backtest_prices_from_store_on()` 强制关掉。
+        # 这时候光打三层开关那句会说反话 ("读库 关 (环境变量 ...=1)"), 所以真正的原因排在前面。
+        forced = "CONFIG.source.bars=%r 不是 tushare, 本条链被强制关" % CONFIG["source"].get("bars")
+        by = "%s; 三层开关另说: %s" % (forced, by) if by else forced
+    elif not by:
+        by = "代码默认值 config.DEFAULT_BACKTEST_STORE"
+    log.info("回测取价: 读库 %s (%s)", "开" if on else "关", by)
+    return on
+
+
 def run(full_market: bool, use_cache: bool):
     # 全局socket兜底超时: 任何库(akshare内部等)没设超时的阻塞读, 60秒后抛异常
     # 走重试, 而不是永远挂死。2026-08-13/17/18/19 连续四天 13:30 任务卡死在
@@ -638,6 +666,7 @@ def run(full_market: bool, use_cache: bool):
         ex.write_starmap_js()
     except Exception as e:
         log.warning("watch_data 导出失败: %s", e)
+    log_backtest_price_switch()
     try:
         from ashare import backtest as bt
         bt.run_backtest()

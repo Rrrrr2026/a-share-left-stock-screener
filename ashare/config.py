@@ -74,6 +74,50 @@ def _pool_by_store_switch(default: bool = True) -> tuple:
 
 
 _POOL_BY_STORE, _POOL_BY_STORE_OFF_BY, _POOL_BY_STORE_WARN = _pool_by_store_switch(True)
+
+
+#: **回测/模拟盘/双周取价读库 (P2) 的代码默认值 —— 就是这一行。**
+#: 2026-09-09 GM 翻开关时**只改这一个字符** ("0" -> "1"), 外加
+#: `tests/test_backtest_anchor.py::EXPECTED_DEFAULT` 那一行的期望值。别的地方一个字都不用动。
+#: 单独拎出来是因为 09-08 之前它埋在 `os.environ.get(..., "0")` 的第二个参数里 —— 要翻开关
+#: 得在一坨注释中间找那个字符串字面量, 而且没有任何一处能让单测指着它说"默认值就该是这个"。
+DEFAULT_BACKTEST_STORE = "0"
+
+
+#: 回测取价读库的**三层开关**, 与上面 `_pool_by_store_switch` 同一套路 (故意长得一样:
+#: 值班的人只需要记住一种口径)。优先级 环境变量 > 停机文件 > 代码默认值。
+#:   ① `sudo systemctl edit stock-a` 加 `Environment=ASHARE_BACKTEST_PRICES_FROM_STORE=0`;
+#:   ② `touch <repo>/data/backtest_store.off` (data/ 不在 git 里, run_a.sh 的
+#:      `git reset --hard` 抹不掉; stock 用户自己就能按, 不需要 root);
+#:   ③ PC 上改 DEFAULT_BACKTEST_STORE 再 commit+push。
+#: **光在服务器上改这个文件是按不下去的** —— run_a.sh 每次启动前 `git reset -q --hard
+#: origin/main`, 手改会在下一次 stock-a 起来的头几秒被静默丢弃 (与 pool_by_store 同因)。
+#: **环境变量只认 6 个值**: 关 = 0/false/off, 开 = 1/true/on (大小写不敏感)。别的值一律
+#: **不当数**, 返回第三个元素 warn 由 run_pipeline log.warning 出来, 然后按默认路径走 ——
+#: "按下去没反应却没有任何一行字说它没反应" 是本队记了三次的失败形态, 这里不再重复。
+#: 无论最后是哪一层定的, run_pipeline 在回测/模拟盘/双周之前都会打一行
+#: "回测取价: 读库 开/关 (被谁定的)", 不存在静默切换。
+def _backtest_store_switch(default: str = DEFAULT_BACKTEST_STORE) -> tuple:
+    """-> (是否读库, 被谁定的, 环境变量写错时的告警文本)。三个元素都可离线单测。"""
+    raw = os.environ.get("ASHARE_BACKTEST_PRICES_FROM_STORE")
+    v = (raw or "").strip().lower()
+    warn = ""
+    if v in ("0", "false", "off"):
+        return False, f"环境变量 ASHARE_BACKTEST_PRICES_FROM_STORE={v}", ""
+    if v in ("1", "true", "on"):
+        return True, f"环境变量 ASHARE_BACKTEST_PRICES_FROM_STORE={v}", ""
+    if v:                       # 写了东西, 但不是这 6 个值之一 -> 不当数, 但必须响
+        warn = (f"环境变量 ASHARE_BACKTEST_PRICES_FROM_STORE={raw!r} 不是可识别的值 "
+                f"(只认 0/1/true/false/on/off, 大小写不敏感), 本轮**忽略它**按默认处理; "
+                f"要关回测读库请用 ASHARE_BACKTEST_PRICES_FROM_STORE=0 或 "
+                f"touch {DATA_DIR}/backtest_store.off")
+    off_file = os.path.join(DATA_DIR, "backtest_store.off")
+    if os.path.exists(off_file):
+        return False, f"停机文件 {off_file}", warn
+    return str(default).strip().lower() in ("1", "true", "on"), "", warn
+
+
+_BT_STORE, _BT_STORE_OFF_BY, _BT_STORE_WARN = _backtest_store_switch()
 # 仪表盘读取的数据文件 (导出为 JS, 直接 <script> 引入, 双击 HTML 即可打开, 无需服务器)
 DASHBOARD_DATA_JS = os.path.join(DASHBOARD_DIR, "dashboard_data.js")
 
@@ -97,7 +141,10 @@ CONFIG = {
         # 与 "bars" 是**两个**开关: 这条链的锚定口径 (find_anchor 改用原始价) 与阶段A 无关,
         # 出问题要能单独关掉而不必把整个 bars 源退回 fuyao。关掉 = 退回逐股腾讯前复权。
         #
-        # **默认 0 (关)。2026-09-08 复验后仍然关, 而且这次是按预登记的规则关的。**
+        # **默认 0 (关) —— 但默认值本身已经搬到模块顶上的 `DEFAULT_BACKTEST_STORE` 那一行,
+        # 并配了 `_backtest_store_switch()` 三层开关 (环境变量 > 停机文件 > 这个默认值)。**
+        # 2026-09-09 GM 翻开关 = 改那一个字符 + tests 里 EXPECTED_DEFAULT 那一行, 别处不动。
+        #
         # GM 当天定的开关裁决规则是三条同时满足才翻开: (a) anchor 门 pass (b) 重放里
         # "新口径更差" = 0 笔 (c) pool 级最差 |Δ| <= 0.5pp。修正两份错标快照的 meta、把演示
         # 种子快照排除出回放样本之后全量重跑 research/validate_backtest_anchor.py, 实测:
@@ -106,7 +153,22 @@ CONFIG = {
         #       06-30 收盘 6.40, 既不等于 raw 收盘 6.55 也不是当天成交价, raw 锚定退到 06-26
         #       (near 1.72%) 反而错了一格; qfq 锚定因为基准恰好没再变而蒙对。
         #   (c) **0.9pp** —— win10 52.3% -> 53.2% (参与判定的分段最差 1.6pp: ☑️次强左侧 n=757)
-        # 所以 (b)(c) 未过 -> 保持关, 等老板拍。
+        #
+        # **2026-09-08 卡 R3-4: 在生产同款样本 (只读 scp 下来的服务器 35 份快照, 比 PC 多 5 份、
+        # 含两组周末重跑的重复 as_of) 上复算, 三个数逐条重现**
+        # (`research/validate_backtest_anchor.py --history-dir <服务器副本>`):
+        #   (a) pass —— raw exact **99.98%** (8,619/8,621), 干净样本占比 100%; 且服务器那两份
+        #       快照的 meta 仍是错值, 修正表 SNAPSHOT_DATA_DATE_FIX 在它们身上**真的生效了**
+        #       (FIXED_DATA_DATE 两条: 07-01→06-30, 08-21→08-24), 证明修正走代码这条路到得了生产。
+        #   (b) **1 笔**, 仍是 600061 @ 06-30 (来源 day_2026-07-01.json), 根因在快照不在开关。
+        #   (c) **0.9pp** (win10 52.3%→53.2%), 参与判定的分段最差 **1.6pp** (☑️次强左侧 n=757/754)。
+        #   成交日变化 **95 笔**归因: 修复(旧口径锚错) 64 / 两边都exact但锚到不同bar 30 /
+        #   两边exact且同一根bar 0 / **新口径更差 1** / 两边都没命中 0 / 来自错标快照 0。
+        # **GM 裁决: 这 0.9pp 按「修正」读, 不按「回归」读** —— 95 笔里 94 笔 (64+30) 是把入场日
+        # 从"早 1~6 根 bar"拨回快照价真正来自的那根, 只有 1 笔更差, 而那 1 笔的根因是快照在除权日
+        # 存了**除权后的昨收** (生成侧问题, 见 export_data 的 XD 修法), 不是取价/锚定口径的问题。
+        # 开关本身没有被这三个数否掉; **今天 (09-08) 仍然保持关的唯一理由是排期**: 14:00 那轮
+        # 已经同时上了「换库 + 裁池 + 日更分块」三个变量, 不叠第四个。09-09 再翻。
         #
         # **旧注释里"102 笔里 98 笔是修复, 2 笔是快照自己存了前复权价"这句归因已被推翻**, 别再引用:
         # 那 102 笔里有 44 笔的价来自两份 meta.data_date 与内容不符的快照 (07-01 41 / 08-24 3),
@@ -130,10 +192,15 @@ CONFIG = {
         #
         # 其余三项验证依旧干净: 抽样 26 笔快照价与 raw 锚定bar 逐值相等、10日收益与手算
         # raw×因子比一致到 1e-6; 2,457 只读库 0.195 秒; pytest 全绿。
-        # 开启方式二选一: 这里默认值改成 "1", 或运行环境里设 ASHARE_BACKTEST_PRICES_FROM_STORE=1。
+        # 开启/关闭方式见 `_backtest_store_switch()` 上面那段 (三层, 与裁池开关同口径)。
         # 详见 stock-core/design/backtest_price_from_store.md。
-        "backtest_prices_from_store":
-            os.environ.get("ASHARE_BACKTEST_PRICES_FROM_STORE", "0") not in ("0", "false", "False"),
+        "backtest_prices_from_store": _BT_STORE,
+        # 被哪一层定的 (环境变量 / 停机文件), 空串 = 用的代码默认值。只用于日志, 不允许静默切换。
+        "backtest_prices_from_store_off_by": _BT_STORE_OFF_BY,
+        # 环境变量写了个不认识的值时的告警文本 (空串 = 没问题)。由 run_pipeline 在回测那一步
+        # log.warning 打出来 —— config 在 basicConfig 之前就 import 完了, 在这里直接 log 会走
+        # lastResort 只落到 stderr, 进不了 journal 的正文 (与 pool_by_store_switch_warn 同因)。
+        "backtest_prices_from_store_switch_warn": _BT_STORE_WARN,
         "tushare_token": os.environ.get("TUSHARE_TOKEN", ""),  # 可选, 留空则只用 akshare
         "industry_classification": "东财",   # 行业分类口径: 东财(EastMoney). akshare 的 board_industry_* 即东财一级行业
         "benchmark_index": "sh000300",  # 沪深300, 用于超额收益基准
