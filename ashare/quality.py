@@ -32,12 +32,19 @@ import os
 
 import numpy as np
 
-from .config import DASHBOARD_DIR, DATA_DIR
+from .config import DASHBOARD_DIR, DATA_DIR, ROOT_DIR
 
 log = logging.getLogger("ashare.quality")
 
 QL_JS = os.path.join(DASHBOARD_DIR, "quality_data.js")
 QL_JSON = os.path.join(DATA_DIR, "quality_result.json")
+# 上一版真榜的逐字节副本 (data/ 不进 git, 服务器上 run_a.sh 的 `git reset --hard` 动不到它)。
+# 为什么要它 (2026-09-09 卡 QL-EMPTY): dashboard/quality_data.js 是 git 跟踪文件, 服务器每天 14:00
+# 先 reset 到 origin/main —— HEAD 里那份是 08-28 的榜 —— 再跑流水线覆盖。所以"不写文件让旧榜留着"
+# 在服务器上留下的不是昨天的榜, 是 08-28 的榜 (09-09 只读核过: git ls-files -v 为 H, HEAD meta.date
+# 2026-08-28)。不发布的日子要把真正的上一版榜摆回去, 候选有三处, 取 meta.date 最新且 picks 非空的。
+QL_LAST_GOOD = os.path.join(DATA_DIR, "quality_last_good.js")
+QL_DOCS_JS = os.path.join(ROOT_DIR, "docs", "quality_data.js")     # PC 每日 auto_update 提交的发布副本
 
 N_PERIODS = 20           # 报告期深度 (~5年: 4个完整年度同比要第5个年报做基数)
 PE_MAX = 31.0            # 用户指定: PE-TTM 上限
@@ -181,20 +188,101 @@ def _long_hist(code: str):
     return (df["high"].to_numpy(float), df["close"].to_numpy(float))
 
 
-def build_quality(top_n: int = TOP_N) -> dict | None:
-    from . import datasource as ds
-    reports = ds.fetch_profit_reports(N_PERIODS)
-    if not reports:
-        log.warning("业绩报表批量为空, 优质榜跳过")
-        return None
-    spot = ds.fetch_spot_snapshot()
-    spot_map = {}
-    if spot is not None and not spot.empty:
-        for _, r in spot.iterrows():
-            spot_map[str(r.get("code", "")).zfill(6)] = r.to_dict()
+def _coverage_problem(cov: dict, n_expected: int = N_PERIODS) -> str | None:
+    """报告期覆盖够不够出榜 —— 不够就返回一句写明缺了哪几期的理由, 够返回 None。
+    三条 (2026-09-09 卡 QL-EMPTY, 离线重放 PC 13:30 那份 20 期全到的报表为证):
+      · 最新一期抓取失败且无回退 → 不发: 单季差分会悄悄退到上一季, 出一份"看着正常的旧榜" (只缺
+        20260630 时入池 145, 与真榜 154 几乎分不出来);
+      · 任一期抓取失败且无回退 → 不发: 20 期窗口里恰好 5 个年报, 少任何一个年报, 每只票的 4 年
+        同比都算不出 (只缺 20251231 → 入池 53); 服务器 16:12 那轮缺 10 期 → 11350 只全部跳过, 入池 0;
+      · 到齐的期 (今天抓到 + 按策略沿用盘上 + 回退到更早一天) < 应有 - 1 → 不发。允许少的那一期只能
+        是"源站说还没有数据"的新报告期 (季末后头两周 stock_yjbb_em 对新的期返回空表, 不是故障)。"""
+    expected = list(cov.get("expected") or [])
+    covered = set(cov.get("ok") or []) | set(cov.get("fallback") or [])
+    empty = set(cov.get("empty") or [])
+    if not expected:
+        return "报告期列表为空"
+    if expected[0] not in covered and expected[0] not in empty:
+        return f"最新报告期 {expected[0]} 缺失 (抓取失败且无回退)"
+    failed = [p for p in expected if p not in covered and p not in empty]
+    if failed:
+        return "报告期抓取失败且无回退: " + ", ".join(failed)
+    if len(covered) < n_expected - 1:
+        missing = [p for p in expected if p not in covered]
+        return (f"报告期只到齐 {len(covered)}/{n_expected}"
+                + (" (缺: " + ", ".join(missing) + ")" if missing else ""))
+    return None
 
-    # 行业映射 + 行业内最近年度营收排名
-    ind_of, ind_rev = {}, {}
+
+def _parse_ql_js(path: str) -> dict | None:
+    """读 quality_data.js (window.__QL__ = {...};) -> dict; 没有/解析不了 -> None。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            txt = f.read()
+    except OSError:
+        return None
+    txt = txt.strip()
+    if txt.startswith("window.__QL__"):
+        txt = txt[txt.index("=") + 1:]
+    txt = txt.strip().rstrip(";").strip()
+    try:
+        obj = json.loads(txt)
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _pick_carry(cands: list) -> tuple | None:
+    """cands = [(标签, 路径, 解析后的 dict 或 None), ...] 按优先级排列 -> 取 meta.date 最新且 picks 非空的那份;
+    同日取排在前面的。一份非空的都没有 -> None。"""
+    best = None
+    for label, path, obj in cands:
+        if not obj or not obj.get("picks"):
+            continue
+        d = str((obj.get("meta") or {}).get("date") or "")
+        if best is None or d > best[0]:
+            best = (d, label, path)
+    return best
+
+
+def _carry_last_good() -> str | None:
+    """不发布的日子: 把"上一版真榜"摆在 dashboard/quality_data.js 上 (见 QL_LAST_GOOD 那段注释)。
+    候选: 当前看板文件 / data/quality_last_good.js / docs/quality_data.js; 当前那份已经是最新非空榜就一字不写。
+    返回沿用的榜的日期; 三处都没有非空榜返回 None (只告警, 不造榜)。"""
+    import shutil
+    cands = [("dashboard", QL_JS, _parse_ql_js(QL_JS)),
+             ("last_good", QL_LAST_GOOD, _parse_ql_js(QL_LAST_GOOD)),
+             ("docs", QL_DOCS_JS, _parse_ql_js(QL_DOCS_JS))]
+    best = _pick_carry(cands)
+    if best is None:
+        log.warning("优质榜: 没有可沿用的旧榜 (看板文件/上次真榜副本/docs 副本都没有非空榜), 看板文件原样不动")
+        return None
+    date, label, path = best
+    if label == "dashboard":
+        log.info("优质榜看板保留 %s 的榜 (当前文件就是最新的非空榜, 不写)", date)
+        return date
+    try:
+        shutil.copyfile(path, QL_JS)
+        log.info("优质榜看板沿用 %s 的榜 (来源 %s: %s)", date, label, path)
+    except OSError as e:
+        log.warning("优质榜沿用旧榜失败 (%s -> %s): %s", path, QL_JS, e)
+        return None
+    return date
+
+
+def _refuse(reason: str, n_screened: int, n_pool, n_picks) -> None:
+    """空榜/缺期不发布: 一行 error 写明缘由与三个数, 三个产物文件 (quality_data.js / quality_result.json /
+    history/quality_<date>.json) 一个都不写, 看板摆回上一版真榜。返回 None 给 run_pipeline (它只 warning 不阻断)。"""
+    log.error("优质榜不发布 (保留上一版榜, 三个产物文件都不写): %s | 全市场 %d, 入池 %s, 榜单 %s",
+              reason, n_screened,
+              "未评" if n_pool is None else n_pool, "未评" if n_picks is None else n_picks)
+    _carry_last_good()
+    return None
+
+
+def _industry_map(ds) -> dict:
+    """行业映射 {code: 行业名}; 接口挂了返回能拿到的部分 (龙头判定降级), 不抛。"""
+    ind_of = {}
     try:
         inds = ds.fetch_industry_list()
         names = list(inds["industry"]) if inds is not None and "industry" in inds.columns \
@@ -207,6 +295,14 @@ def build_quality(top_n: int = TOP_N) -> dict | None:
                 ind_of[str(r["code"]).zfill(6)] = ind
     except Exception as e:
         log.warning("行业映射构建失败(龙头判定降级): %s", e)
+    return ind_of
+
+
+def _score_rows(reports: dict, spot_map: dict, ind_of: dict) -> list:
+    """七道门槛 + 评分, 纯函数 (不联网): 过 4 条门槛的票 -> rows (未排序)。逻辑与 2026-09-09 之前的
+    build_quality 内联段逐字相同, 拆出来是为了能离线复现"缺哪几期 → 入池几只"。"""
+    # 行业内最近年度营收排名
+    ind_rev = {}
     for code, rep in reports.items():
         _, rev_a = _latest_annual(rep["periods"], rep["rev_cum"])
         ind = ind_of.get(code)
@@ -300,6 +396,30 @@ def build_quality(top_n: int = TOP_N) -> dict | None:
             "accel": accel,
             "gates": gates, "n_pass": n_pass, "score": round(score, 1),
         })
+    return rows
+
+
+def build_quality(top_n: int = TOP_N) -> dict | None:
+    """出榜入口。**空榜与缺期一律不发布** (2026-09-09 卡 QL-EMPTY): 报告期覆盖不全 / 入池 0 / 榜单 0 时
+    不写 quality_data.js、quality_result.json、history/quality_<日期>.json 三个文件, 打一行 error
+    写明缺了哪几期与入池数, 看板摆回上一版真榜, 返回 None。正常榜的 meta 带 periods_* 供事后核。"""
+    from . import datasource as ds
+    reports, cov = ds.fetch_profit_reports_ex(N_PERIODS)
+    problem = _coverage_problem(cov, N_PERIODS)
+    rows, n_pool = [], None
+    if reports:
+        spot = ds.fetch_spot_snapshot()
+        spot_map = {}
+        if spot is not None and not spot.empty:
+            for _, r in spot.iterrows():
+                spot_map[str(r.get("code", "")).zfill(6)] = r.to_dict()
+        ind_of = _industry_map(ds)
+        rows = _score_rows(reports, spot_map, ind_of)
+        n_pool = len(rows)
+    if problem:
+        return _refuse("报告期覆盖不全 — " + problem, len(reports), n_pool, None)
+    if not rows:
+        return _refuse("入池 0 (没有一只票过 4 条门槛)", len(reports), 0, 0)
 
     rows.sort(key=lambda r: (-r["n_pass"], -(r["score"] or 0)))
     short = rows[:SHORTLIST]
@@ -316,6 +436,8 @@ def build_quality(top_n: int = TOP_N) -> dict | None:
                                              else (6.0 if rd >= RD_OK else 0.0)), 1)
     short.sort(key=lambda r: (-r["n_pass"], -(r["score"] or 0)))
     picks = short[:top_n]
+    if not picks:
+        return _refuse("榜单 0", len(reports), len(rows), 0)
     try:
         from . import prob20
         prob20.annotate(picks, _long_hist, conditional=False, key="p20")
@@ -326,11 +448,20 @@ def build_quality(top_n: int = TOP_N) -> dict | None:
         "meta": {"date": dt.date.today().isoformat(),
                  "generated": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
                  "n_screened": len(reports), "n_pool": len(rows),
-                 "n_crown": n_crown, "pe_max": PE_MAX, "roe_min": ROE_MIN},
+                 "n_crown": n_crown, "pe_max": PE_MAX, "roe_min": ROE_MIN,
+                 # 报告期覆盖留痕 (事后核 "这榜是用哪几期算的"): ok = 今天抓到或按策略沿用盘上的期,
+                 # fallback = 今天抓取失败、用了更早一天同期数据的期, empty = 源站说还没数据的新期,
+                 # failed 在发布出来的榜里必为空 (非空就不会走到这里)。
+                 "periods_expected": len(cov.get("expected") or []),
+                 "periods_ok": list(cov.get("ok") or []),
+                 "periods_fallback": list(cov.get("fallback") or []),
+                 "periods_empty": list(cov.get("empty") or []),
+                 "periods_failed": list(cov.get("failed") or [])},
         "picks": picks,
     }
     json.dump(result, open(QL_JSON, "w", encoding="utf-8"), ensure_ascii=False)
-    # 每日榜单落盘到 history/, 供"榜单战绩"回测 (优质榜不在候选快照里, 需自己留痕)
+    # 每日榜单落盘到 history/, 供"榜单战绩"回测 (优质榜不在候选快照里, 需自己留痕)。只在真榜时写:
+    # 留痕是"当天榜单当天什么样", 空榜不是榜 (数据总览把 picks 为空的留痕与缺失同级判陈旧)。
     try:
         hdir = os.path.join(DASHBOARD_DIR, "history")
         os.makedirs(hdir, exist_ok=True)
@@ -353,8 +484,17 @@ def build_quality(top_n: int = TOP_N) -> dict | None:
         f.write("window.__QL__ = ")
         json.dump(result, f, ensure_ascii=False)
         f.write(";\n")
-    log.info("优质榜: 全市场 %d, 入池 %d, 榜单 %d (👑全过 %d)",
-             len(reports), len(rows), len(picks), n_crown)
+    try:
+        import shutil
+        os.makedirs(os.path.dirname(QL_LAST_GOOD), exist_ok=True)
+        shutil.copyfile(QL_JS, QL_LAST_GOOD)     # 真榜副本, 不发布的日子从这里摆回看板
+    except OSError as e:
+        log.warning("优质榜真榜副本落盘失败: %s", e)
+    log.info("优质榜: 全市场 %d, 入池 %d, 榜单 %d (👑全过 %d); 报告期 到齐 %d/%d (回退 %d, 空 %d)",
+             len(reports), len(rows), len(picks), n_crown,
+             len(result["meta"]["periods_ok"]) + len(result["meta"]["periods_fallback"]),
+             result["meta"]["periods_expected"], len(result["meta"]["periods_fallback"]),
+             len(result["meta"]["periods_empty"]))
     return result
 
 

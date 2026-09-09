@@ -337,14 +337,22 @@ def _call_with_deadline(fn, args, kwargs, deadline_sec):
         _pool_reset()
         raise TimeoutError(f"{getattr(fn, '__name__', fn)} 超过 {deadline_sec}s 硬期限 (工作进程已终止)")
 
-def call_with_retry(fn, *args, **kwargs):
+def call_with_retry(fn, *args, _retries: int | None = None, _backoff: float | None = None,
+                    **kwargs):
     """对一个 akshare 调用做 限频sleep + 重试 + 超时容错。失败抛出最后一次异常。
     硬期限超时不重试 (源站已进入挂死态, 重试只会再白等) — 直接标记东财不可用并抛出,
-    调用方走既有回退 (腾讯/新浪/缓存/回落)。"""
+    调用方走既有回退 (腾讯/新浪/缓存/回落)。
+
+    `_retries` / `_backoff` 是**只给本函数**的关键字 (不透传给 fn): 总尝试次数 / 退避基数 (秒),
+    缺省取 CONFIG["fetch"] 的 max_retries / retry_backoff_sec。给"一期一次调用、失败代价大"
+    的批量端点 (业绩报表 stock_yjbb_em, 2026-09-09 卡 QL-EMPTY) 多留一次带退避的重试用 ——
+    走的还是这同一条链, 调用方不许自己再套裸循环。最后一次失败后不再空等退避。"""
     f = CONFIG["fetch"]
     last_exc = None
     deadline = f.get("hard_deadline_sec", _HARD_DEADLINE_SEC)
-    for attempt in range(f["max_retries"]):
+    n_try = int(_retries) if _retries else f["max_retries"]
+    backoff = float(_backoff) if _backoff is not None else f["retry_backoff_sec"]
+    for attempt in range(n_try):
         try:
             time.sleep(f["sleep_sec"])
             return _call_with_deadline(fn, args, kwargs, deadline)
@@ -358,9 +366,11 @@ def call_with_retry(fn, *args, **kwargs):
             raise
         except Exception as e:  # noqa
             last_exc = e
-            wait = f["retry_backoff_sec"] * (2 ** attempt)
+            if attempt + 1 >= n_try:
+                break
+            wait = backoff * (2 ** attempt)
             log.debug("retry %d/%d after error: %s (sleep %.1fs)",
-                      attempt + 1, f["max_retries"], e, wait)
+                      attempt + 1, n_try, e, wait)
             time.sleep(wait)
     raise last_exc
 
@@ -2304,55 +2314,204 @@ def _report_periods(n: int = 12) -> list:
     return [f"{c:%Y%m%d}" for c in cand[:n]]
 
 
-def fetch_profit_reports(n_periods: int = 12) -> dict:
-    """批量抓最近 n 个报告期的业绩报表(东财, 每期一次调用覆盖全市场)。
-    返回 {code: {"periods": [...升序 'YYYY-MM-DD'], "ni_cum": [...], "rev_cum": [...]}}
-    ni = 归母净利润(累计, 元), rev = 营业总收入(累计, 元)。整体按天缓存。"""
-    key = _cache_key("yjbb_bulk", n_periods, dt.date.today().isoformat())
-    c = _cache_load(key)
-    if c is not None:
-        return c if isinstance(c, dict) else {}
-    out: dict = {}
-    n_failed = 0
-    for p in _report_periods(n_periods):
+# ---- 按报告期落盘的业绩报表 (2026-09-09 卡 QL-EMPTY) ----------------------------------------
+# 事故: 09-09 14:00 东财 stock_yjbb_em 限频, 20 期里 10 期抓取失败 (含 2022-2025 四个年报与三个
+# 半年报), 每只票的单季差分与年度同比都算不出 → 优质榜 全市场 11350 / 入池 0 的空榜被发布。旧做法
+# 是整批按天缓存、且"任一期失败就不落缓存", 于是失败的日子什么都没留下, 下一次照样从零打 20 次。
+# 报告期数据日内不变, 老报告期几乎永远不变 —— 所以改成**逐期落盘**到 data/yjbb_periods/<期>.pkl:
+#   · 最新 YJBB_FRESH_PERIODS 期 (正在披露/刚披露完) 每天刷新一次; 同一天内第二次调用直接用盘上的
+#     (流水线里阶段B 预热 n=12 与优质榜 n=20 是同一天两次, 以前各打一遍端点);
+#   · 更老的期落盘一次长期复用, 每 YJBB_OLD_PERIOD_TTL_DAYS 天才刷新一次 (年报会重述上年数);
+#   · 抓取失败 → 回退到盘上同期旧文件 (打 info); 盘上没有再翻 data/cache 里旧的整批缓存
+#     yjbb_bulk_*.pkl (第一天的底子, 它们只在 20 期全到时才落过盘, 所以每期都是完整的);
+#     两处都没有才判"缺失", 由 fetch_profit_reports_ex 的 coverage 交给调用方决定发不发榜。
+# 不放 data/cache: 服务器 backup.sh 每晚删 cache 里 3 天以上的文件, 这些是数据不是缓存。
+YJBB_PERIOD_DIR = os.path.join(DATA_DIR, "yjbb_periods")
+YJBB_FRESH_PERIODS = 2
+YJBB_OLD_PERIOD_TTL_DAYS = 30
+YJBB_RETRIES = 3            # 每期总尝试次数 (缺省 2 → 3: 多一次带退避的重试, 走 call_with_retry)
+YJBB_BACKOFF_SEC = 3.0      # 退避基数: 3s, 6s
+_LEGACY_BULK_MEMO: dict = {}   # 旧整批缓存文件 -> 已加载对象 (一个进程内每个文件只读一次)
+
+
+def _yjbb_period_path(period: str) -> str:
+    return os.path.join(YJBB_PERIOD_DIR, f"{period}.pkl")
+
+
+def _yjbb_period_load(period: str) -> dict | None:
+    """盘上某一期: {"period": 'YYYYMMDD', "fetched_on": 'YYYY-MM-DD', "rows": {code: (ni, rev, roe)}}; 没有/坏了 → None。"""
+    path = _yjbb_period_path(period)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+    except Exception as e:      # noqa: BLE001
+        log.warning("yjbb 报告期文件损坏, 忽略 %s: %s", path, e)
+        return None
+    if not isinstance(obj, dict) or not isinstance(obj.get("rows"), dict) or not obj["rows"]:
+        return None
+    return obj
+
+
+def _yjbb_period_save(period: str, rows: dict, fetched_on: str) -> None:
+    """先写临时文件再原子改名 (与 _cache_save 同法); 失败不影响主流程。"""
+    os.makedirs(YJBB_PERIOD_DIR, exist_ok=True)
+    path = _yjbb_period_path(period)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            pickle.dump({"period": period, "fetched_on": fetched_on, "rows": rows}, f)
+        os.replace(tmp, path)
+    except Exception as e:      # noqa: BLE001
+        log.warning("yjbb 报告期落盘失败 %s: %s", period, e)
         try:
-            raw = call_with_retry(_ak().stock_yjbb_em, date=p)
-        except Exception as e:
-            log.warning("yjbb 报告期 %s 抓取失败: %s", p, e)
-            n_failed += 1
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:       # noqa: BLE001
+            pass
+
+
+def _yjbb_rows_from_raw(raw) -> dict:
+    """东财业绩报表一期的 DataFrame -> {code: (归母净利累计, 营业总收入累计, 加权ROE)}; 同一代码多行取最后一行。"""
+    rows: dict = {}
+    if raw is None or len(raw) == 0:
+        return rows
+
+    def _f(v):
+        return None if v is None or (isinstance(v, float) and np.isnan(v)) else float(v)
+
+    for _, r in raw.iterrows():
+        code = str(r.get("股票代码", "")).strip()
+        if not code:
             continue
-        if raw is None or len(raw) == 0:
-            continue
-        log.info("业绩报表 %s: %d 行", p, len(raw))
-        pd_date = f"{p[:4]}-{p[4:6]}-{p[6:]}"
-        for _, r in raw.iterrows():
-            code = str(r.get("股票代码", "")).strip()
-            if not code:
+        rows[code] = (_f(r.get("净利润-净利润")), _f(r.get("营业总收入-营业总收入")),
+                      _f(r.get("净资产收益率")))
+    return rows
+
+
+def _yjbb_legacy_period(period: str):
+    """从 data/cache 里旧的整批缓存 (yjbb_bulk_*.pkl, 新→旧) 找该期 -> (rows, 'YYYY-MM-DD' 文件日期) 或 None。"""
+    pd_date = f"{period[:4]}-{period[4:6]}-{period[6:]}"
+    try:
+        cands = [os.path.join(_CACHE_DIR, n) for n in os.listdir(_CACHE_DIR)
+                 if n.startswith("yjbb_bulk_") and n.endswith(".pkl")]
+    except OSError:
+        return None
+    cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    for path in cands:
+        bulk = _LEGACY_BULK_MEMO.get(path)
+        if bulk is None:
+            try:
+                with open(path, "rb") as f:
+                    bulk = pickle.load(f)
+            except Exception:       # noqa: BLE001
+                bulk = {}
+            _LEGACY_BULK_MEMO[path] = bulk if isinstance(bulk, dict) else {}
+            bulk = _LEGACY_BULK_MEMO[path]
+        rows = {}
+        for code, rep in bulk.items():
+            try:
+                i = rep["periods"].index(pd_date)
+            except (KeyError, ValueError, AttributeError):
                 continue
-            d = out.setdefault(code, {})
-            ni = r.get("净利润-净利润")
-            rev = r.get("营业总收入-营业总收入")
-            roe = r.get("净资产收益率")
+            roe = (rep.get("roe_cum") or [None] * len(rep["periods"]))[i]
+            rows[code] = (rep["ni_cum"][i], rep["rev_cum"][i], roe)
+        if rows:
+            return rows, dt.date.fromtimestamp(os.path.getmtime(path)).isoformat()
+    return None
 
-            def _f(v):
-                return None if v is None or (isinstance(v, float) and np.isnan(v)) else float(v)
 
-            d[pd_date] = (_f(ni), _f(rev), _f(roe))
-        time.sleep(0.3)
+def _yjbb_age_days(fetched_on: str, today: str) -> int:
+    try:
+        return (dt.date.fromisoformat(today) - dt.date.fromisoformat(fetched_on)).days
+    except (TypeError, ValueError):
+        return 10 ** 6
+
+
+def fetch_profit_reports_ex(n_periods: int = 12) -> tuple[dict, dict]:
+    """批量抓最近 n 个报告期的业绩报表 (东财, 每期一次调用覆盖全市场), 逐期落盘 + 缺期回退。
+    返回 (reports, coverage):
+      reports  = {code: {"periods": [...升序 'YYYY-MM-DD'], "ni_cum": [...], "rev_cum": [...], "roe_cum": [...]}}
+                 ni = 归母净利润(累计, 元), rev = 营业总收入(累计, 元)
+      coverage = {"expected": [期 新→旧 'YYYYMMDD'], "ok": [今天抓到/按策略沿用盘上的期],
+                  "fallback": [今天抓取失败、用了更早一天同期数据的期], "empty": [源站答"还没有数据"的期],
+                  "failed": [抓取失败且盘上/旧缓存都没有的期], "source": {期: 数据来自哪里}}
+    发不发榜由调用方按 coverage 决定 (见 quality._coverage_problem); 这里只保证不把缺期悄悄吞掉。"""
+    today = dt.date.today().isoformat()
+    use_cache = bool(CONFIG["source"]["use_cache"])
+    periods = _report_periods(n_periods)
+    cov = {"expected": list(periods), "ok": [], "fallback": [], "empty": [], "failed": [], "source": {}}
+    per_period: dict = {}
+    for i, p in enumerate(periods):
+        have = _yjbb_period_load(p)
+        need_fetch = True
+        if have is not None and use_cache:
+            if i < YJBB_FRESH_PERIODS:
+                need_fetch = have.get("fetched_on") != today
+            else:
+                need_fetch = _yjbb_age_days(have.get("fetched_on"), today) > YJBB_OLD_PERIOD_TTL_DAYS
+        rows, status, src = None, None, None
+        if need_fetch:
+            try:
+                raw = call_with_retry(_ak().stock_yjbb_em, date=p,
+                                      _retries=YJBB_RETRIES, _backoff=YJBB_BACKOFF_SEC)
+                fetched = _yjbb_rows_from_raw(raw)
+                if fetched:
+                    log.info("业绩报表 %s: %d 行", p, len(raw))
+                    rows, status, src = fetched, "ok", "fetched"
+                    _yjbb_period_save(p, rows, today)
+                elif have is not None or _yjbb_legacy_period(p) is not None:
+                    # 数据不会消失: 盘上有数而源站答空, 只能是限频/截断, 按抓取失败走回退
+                    log.warning("yjbb 报告期 %s 源站返回空表但盘上有数, 按抓取失败处理", p)
+                else:
+                    status, src = "empty", "source-empty"      # 新报告期还没开始披露
+            except Exception as e:      # noqa: BLE001
+                log.warning("yjbb 报告期 %s 抓取失败: %s", p, e)
+            time.sleep(0.3)
+        if rows is None and status != "empty":
+            if have is not None:
+                rows = have["rows"]
+                status = "fallback" if need_fetch else "ok"
+                src = f"disk {have.get('fetched_on')}"
+            else:
+                legacy = _yjbb_legacy_period(p)
+                if legacy is not None:
+                    rows, status, src = legacy[0], "fallback", f"legacy-bulk {legacy[1]}"
+                    _yjbb_period_save(p, rows, legacy[1])   # 种进逐期库, 以后不用再翻整批文件
+            if rows is None:
+                status, src = "failed", "none"
+                log.warning("yjbb 报告期 %s 缺失: 抓取失败且盘上/旧缓存均无同期数据", p)
+            elif status == "fallback":
+                log.info("yjbb 报告期 %s 抓取失败, 回退到 %s (%d 只)", p, src, len(rows))
+        cov[status].append(p)
+        cov["source"][p] = src
+        if rows:
+            per_period[p] = rows
+    out: dict = {}
+    for p, rows in per_period.items():
+        pd_date = f"{p[:4]}-{p[4:6]}-{p[6:]}"
+        for code, tup in rows.items():
+            out.setdefault(code, {})[pd_date] = tup
     result = {}
     for code, dd in out.items():
-        periods = sorted(dd)
+        ps = sorted(dd)
         result[code] = {
-            "periods": periods,
-            "ni_cum": [dd[p][0] for p in periods],
-            "rev_cum": [dd[p][1] for p in periods],
-            "roe_cum": [dd[p][2] for p in periods],
+            "periods": ps,
+            "ni_cum": [dd[p][0] for p in ps],
+            "rev_cum": [dd[p][1] for p in ps],
+            "roe_cum": [dd[p][2] for p in ps],
         }
-    # 有报告期抓取失败时不缓存: 缺期会让单季拆解/TTM出现空洞,
-    # 宁可下次重试, 也不能把不完整的批量数据钉一整天
-    if result and n_failed == 0:
-        _cache_save(key, result)
-    return result
+    if cov["failed"] or cov["fallback"] or cov["empty"]:
+        log.warning("业绩报表覆盖: 应 %d 期, 到齐 %d (回退 %d), 空 %d, 缺失 %d%s", len(periods),
+                    len(cov["ok"]) + len(cov["fallback"]), len(cov["fallback"]), len(cov["empty"]),
+                    len(cov["failed"]), (" — 缺失: " + ", ".join(cov["failed"])) if cov["failed"] else "")
+    return result, cov
+
+
+def fetch_profit_reports(n_periods: int = 12) -> dict:
+    """兼容入口 (阶段B 预热 / coilscan 用): 只要报表, 不看覆盖。优质榜必须用 fetch_profit_reports_ex。"""
+    return fetch_profit_reports_ex(n_periods)[0]
 
 
 def _parse_cn_amount(s) -> float | None:
