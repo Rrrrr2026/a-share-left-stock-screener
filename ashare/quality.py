@@ -33,6 +33,7 @@ import os
 import numpy as np
 
 from .config import DASHBOARD_DIR, DATA_DIR, ROOT_DIR
+from .datasource import YJBB_EMPTY_MAX_AGE_DAYS
 
 log = logging.getLogger("ashare.quality")
 
@@ -57,6 +58,18 @@ FIN_INDUSTRIES = ("银行", "保险", "证券", "多元金融")   # 研发强度
 CAP_MIN = 300e8          # 蓝筹门槛: 总市值 >= 300亿
 UPSIDE_MIN = 20.0        # 盈利空间门槛 (PEG法模型值) >= 20%
 JUSTIFIED_PE_LO, JUSTIFIED_PE_HI = 10.0, 35.0
+# 最新报告期允许「源站还没有数据」的期限 (期末后天数; 2026-09-13 卡 QL-EMPTY 回修): 与 datasource 判据 ② 同一个数,
+# 只在那边定义 (首批披露通常在期末后 8-20 天, 最短法定截止 30 天; 45 天后还答无数据只能是源站/限频出了问题)。
+# datasource 记 empty 已经要三条同时成立, 这里再核一遍年龄是第二道防线 (coverage 若来自别处/旧版也拦得住)。
+EMPTY_LATEST_MAX_AGE_DAYS = YJBB_EMPTY_MAX_AGE_DAYS
+# 沿用旧榜时, 榜比这更旧就用 warning 而不是 info: 正常的上一版榜是 1-3 天前的; 一份几周前的榜多半是 git reset
+# 恢复出来的 HEAD 版 (dashboard/quality_data.js 是跟踪文件), 说明 data/quality_last_good.js 与 docs 副本都不在。
+CARRY_STALE_WARN_DAYS = 7
+
+
+def _today() -> dt.date:
+    """今天 (单独成函数是为了让用例钉住日期: 季初形态、旧榜年龄)。"""
+    return dt.date.today()
 
 
 CYCLICAL_KEYS = ("有色", "煤炭", "钢铁", "化工", "化学原料", "化学制品", "化学纤维",
@@ -188,23 +201,49 @@ def _long_hist(code: str):
     return (df["high"].to_numpy(float), df["close"].to_numpy(float))
 
 
-def _coverage_problem(cov: dict, n_expected: int = N_PERIODS) -> str | None:
+def _period_end(p: str) -> dt.date | None:
+    """'YYYYMMDD' -> 期末日期; 解析不了 -> None。"""
+    try:
+        return dt.date(int(p[:4]), int(p[4:6]), int(p[6:8]))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coverage_problem(cov: dict, n_expected: int = N_PERIODS, today: dt.date | None = None) -> str | None:
     """报告期覆盖够不够出榜 —— 不够就返回一句写明缺了哪几期的理由, 够返回 None。
     三条 (2026-09-09 卡 QL-EMPTY, 离线重放 PC 13:30 那份 20 期全到的报表为证):
       · 最新一期抓取失败且无回退 → 不发: 单季差分会悄悄退到上一季, 出一份"看着正常的旧榜" (只缺
         20260630 时入池 145, 与真榜 154 几乎分不出来);
       · 任一期抓取失败且无回退 → 不发: 20 期窗口里恰好 5 个年报, 少任何一个年报, 每只票的 4 年
         同比都算不出 (只缺 20251231 → 入池 53); 服务器 16:12 那轮缺 10 期 → 11350 只全部跳过, 入池 0;
-      · 到齐的期 (今天抓到 + 按策略沿用盘上 + 回退到更早一天) < 应有 - 1 → 不发。允许少的那一期只能
-        是"源站说还没有数据"的新报告期 (季末后头两周 stock_yjbb_em 对新的期返回空表, 不是故障)。"""
+      · 到齐的期 (今天抓到 + 按策略沿用盘上 + 回退到更早一天) < 应有 - 1 → 不发。
+    「源站答空」(empty) 的豁免**只给最新一期, 且只在期末后 EMPTY_LATEST_MAX_AGE_DAYS 天内** (2026-09-13 卡 QL-EMPTY
+      回修 HIGH): 期末当天起到首家披露前, 最新一期在源站本来就是空的 (akshare 对它抛 TypeError, 09-13 实测 20260930;
+      datasource 三条判据同时成立才记 empty) —— 这是每季头 1-3 周的正常形态, 不是故障, 19/20 照常出榜。其它位置的
+      答空 (那些期早已过披露期) 与期末 45 天后的答空都不可能是真的没数据, 视同抓取失败。"""
     expected = list(cov.get("expected") or [])
     covered = set(cov.get("ok") or []) | set(cov.get("fallback") or [])
-    empty = set(cov.get("empty") or [])
+    empty = set(cov.get("empty") or []) - covered
     if not expected:
         return "报告期列表为空"
-    if expected[0] not in covered and expected[0] not in empty:
-        return f"最新报告期 {expected[0]} 缺失 (抓取失败且无回退)"
-    failed = [p for p in expected if p not in covered and p not in empty]
+    today = today or _today()
+    latest = expected[0]
+    if latest not in covered and latest not in empty:
+        return f"最新报告期 {latest} 缺失 (抓取失败且无回退)"
+    tolerated: set = set()
+    if latest in empty:
+        end = _period_end(latest)
+        age = (today - end).days if end else None
+        if age is None or age > EMPTY_LATEST_MAX_AGE_DAYS:
+            return (f"最新报告期 {latest} 源站答空, 但期末已过 "
+                    + (f"{age} 天 (> {EMPTY_LATEST_MAX_AGE_DAYS} 天不可能还没人披露)" if age is not None
+                       else "多久无法判断 (期末日期解析不了)")
+                    + ", 视同抓取失败")
+        tolerated.add(latest)
+    bogus = [p for p in expected if p in empty and p not in tolerated]
+    if bogus:
+        return "报告期源站答空但不是新报告期 (早已过披露期, 视同抓取失败): " + ", ".join(bogus)
+    failed = [p for p in expected if p not in covered and p not in tolerated]
     if failed:
         return "报告期抓取失败且无回退: " + ", ".join(failed)
     if len(covered) < n_expected - 1:
@@ -245,9 +284,18 @@ def _pick_carry(cands: list) -> tuple | None:
     return best
 
 
+def _board_age_days(date_s) -> int | None:
+    """榜的 meta.date 距今几天; 解析不了 -> None。"""
+    try:
+        return (_today() - dt.date.fromisoformat(str(date_s)[:10])).days
+    except (TypeError, ValueError):
+        return None
+
+
 def _carry_last_good() -> str | None:
     """不发布的日子: 把"上一版真榜"摆在 dashboard/quality_data.js 上 (见 QL_LAST_GOOD 那段注释)。
     候选: 当前看板文件 / data/quality_last_good.js / docs/quality_data.js; 当前那份已经是最新非空榜就一字不写。
+    沿用的榜比 CARRY_STALE_WARN_DAYS 还旧 → warning 而不是 info (多半是 reset 恢复出来的 HEAD 版, 另两处副本都不在)。
     返回沿用的榜的日期; 三处都没有非空榜返回 None (只告警, 不造榜)。"""
     import shutil
     cands = [("dashboard", QL_JS, _parse_ql_js(QL_JS)),
@@ -258,12 +306,18 @@ def _carry_last_good() -> str | None:
         log.warning("优质榜: 没有可沿用的旧榜 (看板文件/上次真榜副本/docs 副本都没有非空榜), 看板文件原样不动")
         return None
     date, label, path = best
+    age = _board_age_days(date)
+    stale = age is None or age > CARRY_STALE_WARN_DAYS
+    note = ("" if not stale else
+            f" — 这份榜已 {age} 天旧 (正常的上一版榜只有 1-3 天): 上次真榜副本 {QL_LAST_GOOD} 与 docs 副本都不在?"
+            " 多半是 git reset 恢复出来的 HEAD 版")
+    emit = log.warning if stale else log.info
     if label == "dashboard":
-        log.info("优质榜看板保留 %s 的榜 (当前文件就是最新的非空榜, 不写)", date)
+        emit("优质榜看板保留 %s 的榜 (当前文件就是最新的非空榜, 不写)%s", date, note)
         return date
     try:
         shutil.copyfile(path, QL_JS)
-        log.info("优质榜看板沿用 %s 的榜 (来源 %s: %s)", date, label, path)
+        emit("优质榜看板沿用 %s 的榜 (来源 %s: %s)%s", date, label, path, note)
     except OSError as e:
         log.warning("优质榜沿用旧榜失败 (%s -> %s): %s", path, QL_JS, e)
         return None
@@ -402,7 +456,25 @@ def _score_rows(reports: dict, spot_map: dict, ind_of: dict) -> list:
 def build_quality(top_n: int = TOP_N) -> dict | None:
     """出榜入口。**空榜与缺期一律不发布** (2026-09-09 卡 QL-EMPTY): 报告期覆盖不全 / 入池 0 / 榜单 0 时
     不写 quality_data.js、quality_result.json、history/quality_<日期>.json 三个文件, 打一行 error
-    写明缺了哪几期与入池数, 看板摆回上一版真榜, 返回 None。正常榜的 meta 带 periods_* 供事后核。"""
+    写明缺了哪几期与入池数, 看板摆回上一版真榜, 返回 None。正常榜的 meta 带 periods_* 供事后核。
+
+    **抛错也先把旧榜摆回看板, 再上抛** (2026-09-13 卡 QL-EMPTY 回修 MEDIUM): run_pipeline 对这里的异常只 warning
+    不阻断, 而服务器 14:00 先 `git reset --hard` 把 dashboard/quality_data.js 退成 HEAD 那份 (08-28 的榜, 09-13 只读
+    核过 HEAD 仍是它), 之后 rsync 原样发布 —— 09-04/05/07 三天「argument of type 'float'」抛错时, 站上挂的就是这样
+    一份月前旧榜; 首版的沿用逻辑只挂在拒发路径上, 抛错路径没有。异常本身仍上抛给 run_pipeline 留 traceback; 沿用
+    旧榜自己失败了也不许盖住原异常。"""
+    try:
+        return _build_quality(top_n)
+    except Exception as e:      # noqa: BLE001
+        log.error("优质榜构建抛错 (%s: %s) — 产物文件不再动, 看板先摆回上一版真榜, 异常上抛", type(e).__name__, e)
+        try:
+            _carry_last_good()
+        except Exception as e2:     # noqa: BLE001
+            log.warning("优质榜抛错后沿用旧榜也失败: %s", e2)
+        raise
+
+
+def _build_quality(top_n: int) -> dict | None:
     from . import datasource as ds
     reports, cov = ds.fetch_profit_reports_ex(N_PERIODS)
     problem = _coverage_problem(cov, N_PERIODS)
@@ -445,7 +517,7 @@ def build_quality(top_n: int = TOP_N) -> dict | None:
         log.warning("30日涨20%%概率计算失败: %s", e)
     n_crown = sum(1 for r in picks if r["gates"] and all(r["gates"].values()))
     result = {
-        "meta": {"date": dt.date.today().isoformat(),
+        "meta": {"date": _today().isoformat(),
                  "generated": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
                  "n_screened": len(reports), "n_pool": len(rows),
                  "n_crown": n_crown, "pe_max": PE_MAX, "roe_min": ROE_MIN,

@@ -2300,9 +2300,14 @@ _YJBB_LOCK = _th.Lock()
 _YJBB_MAP: dict | None = None
 
 
+def _today() -> dt.date:
+    """今天。单独成函数是为了让用例把日期钉住 (季初形态等), 不去改 datetime 模块本身。"""
+    return dt.date.today()
+
+
 def _report_periods(n: int = 12) -> list:
-    """最近 n 个财报报告期 (YYYYMMDD, 新→旧)。含当前正在披露的期。"""
-    today = dt.date.today()
+    """最近 n 个财报报告期 (YYYYMMDD, 新→旧)。含当前正在披露的期 (期末当天起就算, 那时源站还没有数据)。"""
+    today = _today()
     periods = []
     y, q_ends = today.year, [(3, 31), (6, 30), (9, 30), (12, 31)]
     cand = []
@@ -2325,12 +2330,22 @@ def _report_periods(n: int = 12) -> list:
 #   · 抓取失败 → 回退到盘上同期旧文件 (打 info); 盘上没有再翻 data/cache 里旧的整批缓存
 #     yjbb_bulk_*.pkl (第一天的底子, 它们只在 20 期全到时才落过盘, 所以每期都是完整的);
 #     两处都没有才判"缺失", 由 fetch_profit_reports_ex 的 coverage 交给调用方决定发不发榜。
+#   · 「源站没有这一期的数据」≠ 抓取失败 (2026-09-13 卡 QL-EMPTY 回修 HIGH): 期末当天起到首家披露前 (一季报 ~4/8,
+#     半年报 ~7/10, 三季报 ~10/10, 年报 ~1 月中旬) 最新一期在源站是空的, 而 akshare 对它**不返回空表, 是解析答复时
+#     抛 TypeError** (2026-09-13 本机实测 20260930 / 20261231, 见 _yjbb_no_data_answer)。三条同时成立才记 "empty":
+#     ① 答复形态是「无数据」(_yjbb_no_data_answer, 或源站真给了空表) ② 期末距今 <= YJBB_EMPTY_MAX_AGE_DAYS 天
+#     ③ 盘上与旧整批缓存都没有该期 (②③ 见 _yjbb_not_new_empty_period); 任一不成立按抓取失败走回退/缺失。
+#     quality._coverage_problem 再只对**最新一期**豁免。首版把这形态记成 failed → 每季头 1-3 周优质榜天天拒发
+#     (旧代码照常出榜), 那是首版引入的回归。
 # 不放 data/cache: 服务器 backup.sh 每晚删 cache 里 3 天以上的文件, 这些是数据不是缓存。
 YJBB_PERIOD_DIR = os.path.join(DATA_DIR, "yjbb_periods")
 YJBB_FRESH_PERIODS = 2
 YJBB_OLD_PERIOD_TTL_DAYS = 30
 YJBB_RETRIES = 3            # 每期总尝试次数 (缺省 2 → 3: 多一次带退避的重试, 走 call_with_retry)
 YJBB_BACKOFF_SEC = 3.0      # 退避基数: 3s, 6s
+# 「新报告期尚无数据」的期限 (期末后天数, 判据 ②): 首批披露通常在期末后 8-20 天, 最短的法定截止是 30 天 (一季报/三季报);
+# 45 天之后源站还答"无数据"只能是源站/限频出了问题, 视同抓取失败 (那时放行 = 少一整季报表冒充新榜)。quality 同用此数。
+YJBB_EMPTY_MAX_AGE_DAYS = 45
 _LEGACY_BULK_MEMO: dict = {}   # 旧整批缓存文件 -> 已加载对象 (一个进程内每个文件只读一次)
 
 
@@ -2429,16 +2444,64 @@ def _yjbb_age_days(fetched_on: str, today: str) -> int:
         return 10 ** 6
 
 
+def _yjbb_no_data_answer(e: BaseException) -> bool:
+    """判据 ①: 这个异常是不是 akshare stock_yjbb_em 对「该报告期源站没有数据」的答复形态。
+    源站对没有数据的期答 HTTP 200 `{"version":null,"result":null,"success":false,"message":"返回数据为空","code":9201}`
+    (2026-09-13 本机 akshare 1.18.60 实测 20260930 与 20261231), akshare **不返回空表**, 在
+    `page_num = data_json["result"]["pages"]` 处抛 TypeError: 'NoneType' object is not subscriptable
+    (服务器 venv 1.18.94 是同一行, 09-13 只读核过)。同一段代码离线打桩过六种答复形态 (2026-09-13):
+      A result=null (真实答复)      → TypeError                                    ✓ 无数据
+      B pages=0, data=null          → ValueError: No objects to concatenate         ✓ 无数据 (pd.concat([]))
+      C pages=1, data=[]            → ValueError: Length mismatch ...               ✓ 无数据 (改列名)
+      D 答复里没有 result 键        → KeyError: 'result'                             ✓ 无数据
+      E 限频吐 HTML 页 / F 空响应体 → requests.exceptions.JSONDecodeError            ✗ 不是 (它同时继承 ValueError 与 OSError)
+    共同点: 无数据 = **解析答复**时的 TypeError / ValueError / LookupError; 网络与限频错误是 OSError 家族 (ConnectionError,
+    requests 的 RequestException 及其 JSONDecodeError), 硬期限超时是 TimeoutError (也是 OSError —— 09-09 服务器限频日
+    20 期缺 10 的真实形态就是它: "stock_yjbb_em 超过 150s 硬期限")。按异常**类**判、不按文本判: akshare 升级改一句话
+    不该让守卫失效。单靠这一条不够 (限频若也答 result=null 就分不开), 所以还要 ②③ (_yjbb_not_new_empty_period)。"""
+    return isinstance(e, (TypeError, ValueError, LookupError)) and not isinstance(e, OSError)
+
+
+def _yjbb_period_end(period: str) -> dt.date | None:
+    """'YYYYMMDD' -> 期末日期; 解析不了 -> None。"""
+    try:
+        return dt.date(int(period[:4]), int(period[4:6]), int(period[6:8]))
+    except (TypeError, ValueError):
+        return None
+
+
+def _yjbb_not_new_empty_period(period: str, have: dict | None, today: dt.date) -> str | None:
+    """判据 ②③: 期末距今 <= YJBB_EMPTY_MAX_AGE_DAYS 天, 且盘上与旧整批缓存都没有该期 (数据不会消失: 昨天抓到过的期
+    今天答"无数据"只能是限频/截断)。两条都成立返回 None (可以记 empty); 否则返回一句原因, 调用方把这期按抓取失败
+    走回退/缺失。误判代价 (2026-09-13 卡 QL-EMPTY 回修): 真限频被记成 empty → 只可能发生在「最新一期、期末 45 天内、
+    这期还一次都没抓到过」这一种局面, 后果是少一期照发 (与旧代码同风险, 且 quality 只放行最新一期); 反过来真无数据
+    被记成 failed → 每季头 1-3 周天天拒发、看板沿用旧榜、留痕断档、总览天天红 —— 前者的代价小得多, 所以取前者。"""
+    end = _yjbb_period_end(period)
+    if end is None:
+        return "期末日期解析不了"
+    age = (today - end).days
+    if age > YJBB_EMPTY_MAX_AGE_DAYS:
+        return f"期末已过 {age} 天 (> {YJBB_EMPTY_MAX_AGE_DAYS} 天不可能还没人披露)"
+    if have is not None:
+        return f"盘上有该期 ({have.get('fetched_on')} 抓的 {len(have['rows'])} 只)"
+    if _yjbb_legacy_period(period) is not None:
+        return "旧整批缓存里有该期"
+    return None
+
+
 def fetch_profit_reports_ex(n_periods: int = 12) -> tuple[dict, dict]:
     """批量抓最近 n 个报告期的业绩报表 (东财, 每期一次调用覆盖全市场), 逐期落盘 + 缺期回退。
     返回 (reports, coverage):
       reports  = {code: {"periods": [...升序 'YYYY-MM-DD'], "ni_cum": [...], "rev_cum": [...], "roe_cum": [...]}}
                  ni = 归母净利润(累计, 元), rev = 营业总收入(累计, 元)
       coverage = {"expected": [期 新→旧 'YYYYMMDD'], "ok": [今天抓到/按策略沿用盘上的期],
-                  "fallback": [今天抓取失败、用了更早一天同期数据的期], "empty": [源站答"还没有数据"的期],
+                  "fallback": [今天抓取失败、用了更早一天同期数据的期],
+                  "empty": [「新报告期尚无数据」的期: 三条同时成立 —— 答复形态是无数据 (空表或 _yjbb_no_data_answer)
+                            + 期末 YJBB_EMPTY_MAX_AGE_DAYS 天内 + 盘上/旧整批都没有该期; 季初的最新一期就是这个形态],
                   "failed": [抓取失败且盘上/旧缓存都没有的期], "source": {期: 数据来自哪里}}
     发不发榜由调用方按 coverage 决定 (见 quality._coverage_problem); 这里只保证不把缺期悄悄吞掉。"""
-    today = dt.date.today().isoformat()
+    today_d = _today()
+    today = today_d.isoformat()
     use_cache = bool(CONFIG["source"]["use_cache"])
     periods = _report_periods(n_periods)
     cov = {"expected": list(periods), "ok": [], "fallback": [], "empty": [], "failed": [], "source": {}}
@@ -2461,13 +2524,29 @@ def fetch_profit_reports_ex(n_periods: int = 12) -> tuple[dict, dict]:
                     log.info("业绩报表 %s: %d 行", p, len(raw))
                     rows, status, src = fetched, "ok", "fetched"
                     _yjbb_period_save(p, rows, today)
-                elif have is not None or _yjbb_legacy_period(p) is not None:
-                    # 数据不会消失: 盘上有数而源站答空, 只能是限频/截断, 按抓取失败走回退
-                    log.warning("yjbb 报告期 %s 源站返回空表但盘上有数, 按抓取失败处理", p)
                 else:
-                    status, src = "empty", "source-empty"      # 新报告期还没开始披露
+                    # 源站真给了空表 (真实 akshare 不会, 见 _yjbb_no_data_answer; 留着是为了不依赖它的实现细节):
+                    # 判据 ① 成立, 再看 ②③ —— 都成立才是"新报告期还没人披露", 否则按抓取失败走回退/缺失
+                    why = _yjbb_not_new_empty_period(p, have, today_d)
+                    if why is None:
+                        status, src = "empty", "source-empty"
+                        log.info("yjbb 报告期 %s 源站返回空表 — 新报告期尚未开始披露 (期末 %d 天内, 盘上/旧缓存均无该期), 记 empty",
+                                 p, YJBB_EMPTY_MAX_AGE_DAYS)
+                    else:
+                        log.warning("yjbb 报告期 %s 源站返回空表, 但%s → 按抓取失败处理", p, why)
             except Exception as e:      # noqa: BLE001
-                log.warning("yjbb 报告期 %s 抓取失败: %s", p, e)
+                # 三条同时成立才记 empty: ① 答复形态是「无数据」(不是网络/限频/超时) ② 期末 45 天内 ③ 盘上/旧整批都没有
+                no_data = _yjbb_no_data_answer(e)
+                why = _yjbb_not_new_empty_period(p, have, today_d) if no_data else None
+                if no_data and why is None:
+                    status, src = "empty", f"source-no-data ({type(e).__name__})"
+                    log.info("yjbb 报告期 %s 源站没有数据 (akshare 解析答复时 %s: %s) — 新报告期尚未开始披露, 记 empty",
+                             p, type(e).__name__, e)
+                elif no_data:
+                    log.warning("yjbb 报告期 %s 源站答复无数据 (%s: %s), 但%s → 按抓取失败处理",
+                                p, type(e).__name__, e, why)
+                else:
+                    log.warning("yjbb 报告期 %s 抓取失败: %s", p, e)
             time.sleep(0.3)
         if rows is None and status != "empty":
             if have is not None:
@@ -2503,9 +2582,12 @@ def fetch_profit_reports_ex(n_periods: int = 12) -> tuple[dict, dict]:
             "roe_cum": [dd[p][2] for p in ps],
         }
     if cov["failed"] or cov["fallback"] or cov["empty"]:
-        log.warning("业绩报表覆盖: 应 %d 期, 到齐 %d (回退 %d), 空 %d, 缺失 %d%s", len(periods),
-                    len(cov["ok"]) + len(cov["fallback"]), len(cov["fallback"]), len(cov["empty"]),
-                    len(cov["failed"]), (" — 缺失: " + ", ".join(cov["failed"])) if cov["failed"] else "")
+        # 只有"空" (季初最新期还没人披露) 是正常形态, 打 info; 有回退/缺失才是 warning
+        emit = log.warning if (cov["failed"] or cov["fallback"]) else log.info
+        emit("业绩报表覆盖: 应 %d 期, 到齐 %d (回退 %d), 空 %d, 缺失 %d%s%s", len(periods),
+             len(cov["ok"]) + len(cov["fallback"]), len(cov["fallback"]), len(cov["empty"]), len(cov["failed"]),
+             (" — 空: " + ", ".join(cov["empty"])) if cov["empty"] else "",
+             (" — 缺失: " + ", ".join(cov["failed"])) if cov["failed"] else "")
     return result, cov
 
 

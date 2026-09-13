@@ -18,10 +18,22 @@
     抓取失败 → 回退同期旧文件 / data/cache 旧整批缓存 (并种进逐期库); 两处都没有才判缺失;
     源站答空但盘上有数 → 按失败回退 (数据不会消失); 新期答空 → empty 不算失败。
   · datasource.call_with_retry 的 _retries/_backoff 只给自己用、不透传给 fn; 硬期限超时仍不重试。
+  · 季初「最新期源站无数据」(2026-09-13 回修 HIGH): 真 akshare 对没有数据的报告期不返回空表, 抛 TypeError
+    ('NoneType' object is not subscriptable, 09-13 实测 20260930/20261231); 三条同时成立才记 empty —— 答复形态是无数据
+    (_yjbb_no_data_answer) + 期末 45 天内 + 盘上/旧整批都没有该期; 只放行最新一期。真限频的两种形态 (09-09 服务器的
+    150s 硬期限 TimeoutError / 源站吐 HTML 的 requests JSONDecodeError) 照旧 failed → 拒发。全链路: 假东财 → 真
+    fetch_profit_reports_ex → 真 build_quality, 10-01 形态出 19/20 的榜。
+  · 抛错日 (2026-09-13 回修 MEDIUM): build_quality 中途抛错 (09-04/05/07 那种 NaN 型 TypeError 或任何异常) → 看板先摆回
+    最新非空榜 (不是 reset 后的 08-28 HEAD 版), 三个产物一个不写, 异常照旧上抛; 沿用旧榜自己失败不盖住原异常; 只剩
+    HEAD 版可沿用时 warning 点名。
 
 变异 (去掉守卫必红, 09-09 实测): build_quality 里去掉 `if problem: return _refuse(...)` → test_build_refuses_*
 红; 去掉 `if not rows:` → test_build_refuses_when_pool_empty 红; fetch 里去掉回退分支 → test_fetch_falls_back_* 红;
 _coverage_problem 恒返 None → 六条覆盖用例红。
+变异 (09-13 回修实测): _yjbb_no_data_answer 恒返 False (去掉识别) → 季初两条 (test_fetch_new_quarter_* /
+test_build_new_quarter_end_to_end_*) 红; 去掉判据 ② (年龄) → test_fetch_no_data_answer_after_45_days_* 红; 去掉判据 ③
+(盘上/旧缓存) → test_fetch_no_data_answer_with_*_falls_back 红; build_quality 不套 try/except → test_build_exception_*
+红; _coverage_problem 去掉年龄核 → test_cov_latest_empty_tolerated_only_within_45_days 红。
 运行:  python -m pytest tests/test_quality_guard.py -q
 """
 from __future__ import annotations
@@ -74,11 +86,22 @@ def test_cov_server_0909_shape_blocks():
     assert msg and PERIODS[0] in msg
 
 
+def _soon_after(p: str, days: int = 10) -> dt.date:
+    """报告期期末后 days 天 (季初形态的"今天"); 不跨下一个期末, 所以 _report_periods 在这天算出的列表与 PERIODS 相同。"""
+    return dt.date(int(p[:4]), int(p[4:6]), int(p[6:8])) + dt.timedelta(days=days)
+
+
+def _pin_today(monkeypatch, day: dt.date):
+    monkeypatch.setattr(ds, "_today", lambda: day)
+    monkeypatch.setattr(q, "_today", lambda: day)
+
+
 def test_cov_new_quarter_empty_is_allowed_once():
     """季末后头两周: 最新期源站还没有数据 (empty, 不是失败) → 19/20 可以出榜; 空两期就不行。"""
-    assert q._coverage_problem(_cov(ok=PERIODS[1:], empty=PERIODS[:1]), 20) is None
-    msg = q._coverage_problem(_cov(ok=PERIODS[2:], empty=PERIODS[:2]), 20)
-    assert msg and "18/20" in msg and PERIODS[1] in msg
+    soon = _soon_after(PERIODS[0])
+    assert q._coverage_problem(_cov(ok=PERIODS[1:], empty=PERIODS[:1]), 20, today=soon) is None
+    msg = q._coverage_problem(_cov(ok=PERIODS[2:], empty=PERIODS[:2]), 20, today=soon)
+    assert msg and PERIODS[1] in msg
 
 
 def test_cov_fallback_counts_as_covered():
@@ -91,22 +114,22 @@ def test_cov_empty_expected_blocks():
 
 
 # ============================================================ 合成报表 (20 期, 稳定增长)
-def _synthetic_reports(n_codes=30, growth=1.2, base=1e8):
+def _synthetic_reports(n_codes=30, growth=1.2, base=1e8, periods=PERIODS):
     """每年增长 growth 倍、季内逐季递增的累计口径报表 → q4/y4 全正, ROE 20。"""
     reports = {}
     for k in range(n_codes):
         code = f"{600000 + k:06d}"
-        periods, ni, rev, roe = [], [], [], []
-        for p in sorted(PERIODS):
+        plist, ni, rev, roe = [], [], [], []
+        for p in sorted(periods):
             y, m = int(p[:4]), p[4:6]
             qi = {"03": 1, "06": 2, "09": 3, "12": 4}[m]
             yr = base * (1 + k * 0.01) * (growth ** (y - 2020))
             cum = sum(yr * (1 + 0.1 * j) for j in range(1, qi + 1))
-            periods.append(f"{p[:4]}-{p[4:6]}-{p[6:]}")
+            plist.append(f"{p[:4]}-{p[4:6]}-{p[6:]}")
             ni.append(cum)
             rev.append(cum * 10)
             roe.append(20.0)
-        reports[code] = {"periods": periods, "ni_cum": ni, "rev_cum": rev, "roe_cum": roe}
+        reports[code] = {"periods": plist, "ni_cum": ni, "rev_cum": rev, "roe_cum": roe}
     return reports
 
 
@@ -417,23 +440,28 @@ def test_fetch_no_cache_refetches_but_still_falls_back(yjbb_box, monkeypatch):
     assert cov["fallback"] == [PERIODS[4]] and not cov["failed"]    # 抓不到照样回退
 
 
-def test_fetch_source_empty_with_disk_data_is_a_failure_not_a_deletion(yjbb_box, caplog):
-    """数据不会消失: 盘上有数而源站答空 (限频/截断) → 按抓取失败回退, 不能把空表当真。"""
-    yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+def test_fetch_source_empty_with_disk_data_is_a_failure_not_a_deletion(yjbb_box, monkeypatch, caplog):
+    """数据不会消失 (判据 ③): 季初、盘上有昨天抓到的最新期, 今天源站答空表 (限频/截断) → 按抓取失败回退, 不能把空表当真。"""
+    soon = _soon_after(PERIODS[0])
+    _pin_today(monkeypatch, soon)
+    yesterday = (soon - dt.timedelta(days=1)).isoformat()
     _seed_period(PERIODS[0], {"600519": (3.0, 30.0, 3.0)}, yesterday)
     yjbb_box.script[PERIODS[0]] = None
     with caplog.at_level(logging.WARNING, logger="ashare.datasource"):
         res, cov = ds.fetch_profit_reports_ex(20)
     assert cov["fallback"] == [PERIODS[0]] and not cov["empty"] and not cov["failed"]
-    assert any("源站返回空表但盘上有数" in r.getMessage() for r in caplog.records)
+    assert cov["source"][PERIODS[0]] == f"disk {yesterday}"
+    assert any("源站返回空表" in r.getMessage() and "盘上有该期" in r.getMessage() for r in caplog.records)
     pd_date = f"{PERIODS[0][:4]}-{PERIODS[0][4:6]}-{PERIODS[0][6:]}"
     assert pd_date in res["600519"]["periods"]
 
 
-def test_fetch_source_empty_without_disk_data_is_empty_not_failed(yjbb_box):
+def test_fetch_source_empty_without_disk_data_is_empty_not_failed(yjbb_box, monkeypatch):
+    _pin_today(monkeypatch, _soon_after(PERIODS[0]))
     yjbb_box.script[PERIODS[0]] = None
     res, cov = ds.fetch_profit_reports_ex(20)
     assert cov["empty"] == [PERIODS[0]] and not cov["failed"] and cov["ok"] == PERIODS[1:]
+    assert cov["source"][PERIODS[0]] == "source-empty"
     assert not os.path.exists(ds._yjbb_period_path(PERIODS[0]))
     assert q._coverage_problem(cov, 20) is None            # 新季头两周的正常形态
     assert yjbb_box.calls.count(PERIODS[0]) == 1           # 空表不是异常, 不触发重试
@@ -492,6 +520,273 @@ def test_retry_sleeps_only_between_attempts(monkeypatch):
     with pytest.raises(ValueError):
         ds.call_with_retry(lambda: None, _retries=3, _backoff=3.0)
     assert [s for s in slept if s] == [3.0, 6.0]
+
+
+# ============================================================ 季初「最新期源站无数据」(2026-09-13 回修 HIGH)
+REAL_FETCH = ds.fetch_profit_reports_ex        # sandbox 会把它打桩掉, 全链路用例要真的那个
+Q_START = dt.date(2026, 10, 1)                 # 09-30 期末刚过, 三季报 ~10/10 才有第一家披露
+# 真 akshare 1.18.60 / 服务器 1.18.94 对没有数据的报告期抛的原样 (09-13 本机实测 20260930 / 20261231):
+NO_DATA_TYPEERROR = TypeError("'NoneType' object is not subscriptable")
+# 09-09 服务器限频日的原样 (20 期缺 10 就是它):
+RATE_LIMIT_TIMEOUT = TimeoutError("stock_yjbb_em 超过 150s 硬期限 (工作进程已终止)")
+
+
+def _json_decode_error():
+    """源站限频吐 HTML 页 / 空响应体时 r.json() 抛的: 同时继承 ValueError 与 OSError。"""
+    import requests
+    return requests.exceptions.JSONDecodeError("Expecting value", "<html>Too many requests</html>", 0)
+
+
+def _write_legacy_bulk(period, rows, when: dt.datetime, name="yjbb_bulk_cafebabe00000000.pkl"):
+    pd_date = f"{period[:4]}-{period[4:6]}-{period[6:]}"
+    bulk = {code: {"periods": [pd_date], "ni_cum": [t[0]], "rev_cum": [t[1]], "roe_cum": [t[2]]}
+            for code, t in rows.items()}
+    path = os.path.join(ds._CACHE_DIR, name)
+    with open(path, "wb") as f:
+        pickle.dump(bulk, f)
+    stamp = time.mktime(when.timetuple())
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def _frames_from_reports(reports):
+    """合成报表 → 假东财每期一张表 (与 _frame 同列名), 让真 fetch_profit_reports_ex 走一遍。"""
+    by_period: dict = {}
+    for code, rep in reports.items():
+        for pd_date, ni, rev, roe in zip(rep["periods"], rep["ni_cum"], rep["rev_cum"], rep["roe_cum"]):
+            by_period.setdefault(pd_date.replace("-", ""), []).append((code, ni, rev, roe))
+    return {p: pd.DataFrame({"股票代码": [r[0] for r in rows], "净利润-净利润": [r[1] for r in rows],
+                             "营业总收入-营业总收入": [r[2] for r in rows], "净资产收益率": [r[3] for r in rows]})
+            for p, rows in by_period.items()}
+
+
+def test_no_data_answer_classifier_by_exception_class():
+    """判据 ①: 按异常类判 —— 解析答复时的 TypeError/ValueError/LookupError 是"无数据"; OSError 家族 (网络/限频/超时,
+    含 requests 的 JSONDecodeError, 它同时是 ValueError) 都不是。"""
+    yes = [NO_DATA_TYPEERROR, ValueError("No objects to concatenate"),
+           ValueError("Length mismatch: Expected axis has 1 elements, new values have 38 elements"),
+           KeyError("result"), IndexError("list index out of range")]
+    no = [_json_decode_error(), ConnectionError("Response ended prematurely"), RATE_LIMIT_TIMEOUT,
+          OSError("socket"), RuntimeError("pool broken")]
+    assert all(ds._yjbb_no_data_answer(e) for e in yes)
+    assert not any(ds._yjbb_no_data_answer(e) for e in no)
+    assert isinstance(_json_decode_error(), ValueError) and isinstance(_json_decode_error(), OSError)
+
+
+def test_not_new_empty_period_three_conditions(yjbb_box):
+    """判据 ②③ 逐条: 期末 45 天内 (第 45 天含, 第 46 天不含) / 盘上无该期 / 旧整批缓存无该期; 期号解析不了也不算。"""
+    p = "20260930"
+    assert ds._yjbb_not_new_empty_period(p, None, dt.date(2026, 9, 30)) is None       # 期末当天 (列表里当天就有它)
+    assert ds._yjbb_not_new_empty_period(p, None, dt.date(2026, 11, 14)) is None      # 第 45 天
+    why = ds._yjbb_not_new_empty_period(p, None, dt.date(2026, 11, 15))               # 第 46 天
+    assert why and "46 天" in why
+    assert "解析" in ds._yjbb_not_new_empty_period("garbage!", None, Q_START)
+    have = {"period": p, "fetched_on": "2026-10-12", "rows": {"600519": (1.0, 2.0, 3.0)}}
+    why = ds._yjbb_not_new_empty_period(p, have, dt.date(2026, 10, 13))
+    assert why and "盘上有该期" in why and "2026-10-12" in why
+    _write_legacy_bulk(p, {"600519": (9.0, 90.0, 33.0)}, dt.datetime(2026, 9, 30, 15, 0))
+    why = ds._yjbb_not_new_empty_period(p, None, Q_START)
+    assert why and "旧整批" in why
+
+
+def test_fetch_new_quarter_no_data_answer_is_empty_not_failed(yjbb_box, monkeypatch, caplog):
+    """季初 (10-01): 最新期 20260930 源站答 result=null → akshare 抛 TypeError → 三条判据都成立 → 记 empty (不落盘,
+    明天再试), 其余 19 期到齐 → 覆盖够出榜; 全程无 warning (这是正常形态)。"""
+    _pin_today(monkeypatch, Q_START)
+    periods = ds._report_periods(20)
+    assert periods[0] == "20260930" and periods[1] == "20260630"
+    yjbb_box.script["20260930"] = NO_DATA_TYPEERROR
+    with caplog.at_level(logging.INFO, logger="ashare.datasource"):
+        res, cov = REAL_FETCH(20)
+    assert cov["empty"] == ["20260930"] and cov["failed"] == [] and cov["fallback"] == []
+    assert cov["ok"] == periods[1:] and cov["source"]["20260930"] == "source-no-data (TypeError)"
+    assert not os.path.exists(ds._yjbb_period_path("20260930"))
+    assert len(res["600519"]["periods"]) == 19 and "2026-09-30" not in res["600519"]["periods"]
+    assert q._coverage_problem(cov, 20) is None
+    assert yjbb_box.calls.count("20260930") == ds.YJBB_RETRIES      # 仍走 call_with_retry 那条链, 不另开旁路
+    msgs = caplog.records
+    assert any(r.levelno == logging.INFO and "20260930 源站没有数据" in r.getMessage() and "TypeError" in r.getMessage()
+               for r in msgs)
+    assert any("空 1, 缺失 0 — 空: 20260930" in r.getMessage() for r in msgs)
+    assert not any(r.levelno >= logging.WARNING for r in msgs), "季初形态是正常形态, 不该有 warning"
+
+
+def test_fetch_no_data_answer_after_45_days_is_failed(yjbb_box, monkeypatch):
+    """判据 ②: 期末第 46 天源站还答无数据 → 不可能是新报告期, 记 failed → 拒发 (理由点名最新期)。"""
+    _pin_today(monkeypatch, dt.date(2026, 11, 15))
+    yjbb_box.script["20260930"] = NO_DATA_TYPEERROR
+    _, cov = REAL_FETCH(20)
+    assert cov["failed"] == ["20260930"] and cov["empty"] == []
+    msg = q._coverage_problem(cov, 20)
+    assert msg and "20260930" in msg and "最新" in msg
+
+
+def test_fetch_no_data_answer_with_disk_data_falls_back(yjbb_box, monkeypatch, caplog):
+    """判据 ③: 昨天已抓到 20260930 (披露已开始), 今天源站答无数据 → 数据不会消失, 按抓取失败回退到昨天的文件。"""
+    _pin_today(monkeypatch, dt.date(2026, 10, 13))
+    _seed_period("20260930", {"600519": (7.0, 70.0, 30.0)}, "2026-10-12")
+    yjbb_box.script["20260930"] = NO_DATA_TYPEERROR
+    with caplog.at_level(logging.WARNING, logger="ashare.datasource"):
+        res, cov = REAL_FETCH(20)
+    assert cov["fallback"] == ["20260930"] and not cov["empty"] and not cov["failed"]
+    assert cov["source"]["20260930"] == "disk 2026-10-12"
+    assert any("20260930 源站答复无数据" in r.getMessage() and "盘上有该期" in r.getMessage() for r in caplog.records)
+    i = res["600519"]["periods"].index("2026-09-30")
+    assert res["600519"]["ni_cum"][i] == 7.0
+    assert q._coverage_problem(cov, 20) is None
+
+
+def test_fetch_no_data_answer_with_legacy_bulk_falls_back(yjbb_box, monkeypatch):
+    """判据 ③ 之二: 逐期库没有, 但 data/cache 旧整批缓存里有该期 → 回退到它 (并种进逐期库), 不记 empty。"""
+    _pin_today(monkeypatch, Q_START)
+    _write_legacy_bulk("20260930", {"600519": (9.0, 90.0, 33.0)}, dt.datetime(2026, 9, 30, 15, 0))
+    yjbb_box.script["20260930"] = NO_DATA_TYPEERROR
+    res, cov = REAL_FETCH(20)
+    assert cov["fallback"] == ["20260930"] and not cov["empty"] and cov["source"]["20260930"] == "legacy-bulk 2026-09-30"
+    assert ds._yjbb_period_load("20260930")["rows"]["600519"] == (9.0, 90.0, 33.0)
+
+
+def test_fetch_rate_limit_forms_stay_failed_in_new_quarter(yjbb_box, monkeypatch):
+    """真限频的两种形态在季初也是 failed → 拒发: 09-09 服务器那种 150s 硬期限 TimeoutError (call_with_retry 不重试,
+    标记东财不可用), 与源站吐 HTML 页时的 requests JSONDecodeError (是 ValueError 但也是 OSError)。"""
+    _pin_today(monkeypatch, Q_START)
+    monkeypatch.setattr(ds, "_em_realtime_down", False)
+    monkeypatch.setattr(ds, "_em_hist_down", False)
+    for exc, n_calls in ((RATE_LIMIT_TIMEOUT, 1), (_json_decode_error(), ds.YJBB_RETRIES)):
+        yjbb_box.script["20260930"] = exc
+        yjbb_box.calls.clear()
+        _, cov = REAL_FETCH(20)
+        assert cov["failed"] == ["20260930"] and cov["empty"] == [], type(exc).__name__
+        assert yjbb_box.calls.count("20260930") == n_calls, type(exc).__name__
+        msg = q._coverage_problem(cov, 20)
+        assert msg and "20260930" in msg and "最新" in msg, type(exc).__name__
+
+
+def test_fetch_source_empty_table_after_45_days_is_failed(yjbb_box, monkeypatch):
+    """源站真给空表这条路 (真实 akshare 不走, 留着不依赖实现细节) 同样受判据 ② 约束。"""
+    _pin_today(monkeypatch, dt.date(2026, 11, 15))
+    yjbb_box.script["20260930"] = None
+    _, cov = REAL_FETCH(20)
+    assert cov["failed"] == ["20260930"] and not cov["empty"]
+
+
+def test_cov_latest_empty_tolerated_only_within_45_days(monkeypatch):
+    """quality 第二道防线: 最新期 empty 只在期末 45 天内放行 (第 45 天含); 不是最新期的 empty 视同失败; 期号解析不了不放行。"""
+    _pin_today(monkeypatch, Q_START)
+    exp = ds._report_periods(20)
+    cov = _cov(ok=exp[1:], empty=exp[:1], expected=exp)
+    assert q._coverage_problem(cov, 20) is None
+    assert q._coverage_problem(cov, 20, today=dt.date(2026, 11, 14)) is None
+    msg = q._coverage_problem(cov, 20, today=dt.date(2026, 11, 15))
+    assert msg and "20260930" in msg and "46 天" in msg
+    cov2 = _cov(ok=[p for p in exp if p != exp[3]], empty=[exp[3]], expected=exp)
+    msg = q._coverage_problem(cov2, 20)
+    assert msg and exp[3] in msg
+    cov3 = _cov(ok=exp[1:], empty=["garbage!"], expected=["garbage!"] + exp[1:])
+    assert "解析" in q._coverage_problem(cov3, 20)
+    assert q.EMPTY_LATEST_MAX_AGE_DAYS == ds.YJBB_EMPTY_MAX_AGE_DAYS == 45
+
+
+def test_build_new_quarter_end_to_end_publishes_19_of_20(sandbox, yjbb_box, monkeypatch, caplog):
+    """季初全链路 (10-01, 假东财 → 真 fetch_profit_reports_ex → 真 build_quality): 最新期 20260930 答 result=null,
+    其余 19 期到齐 → 正常出榜, meta.periods_empty == ['20260930'], 三个产物都写, 日志「到齐 19/20 (回退 0, 空 1)」,
+    全程无 warning。这就是 09-30 (期末当天起) 到首家披露前服务器 14:00 应有的形态。"""
+    _pin_today(monkeypatch, Q_START)
+    periods = ds._report_periods(20)
+    reports = _synthetic_reports(periods=periods[1:])
+    yjbb_box.script = _frames_from_reports(reports)
+    yjbb_box.script["20260930"] = NO_DATA_TYPEERROR
+    yjbb_box.default = ConnectionError("unexpected period")
+    monkeypatch.setattr(ds, "fetch_profit_reports_ex", REAL_FETCH)
+    sandbox["spot"] = _spot(reports)
+    with caplog.at_level(logging.INFO):
+        res = q.build_quality()
+    assert res is not None and len(res["picks"]) == q.TOP_N
+    m = res["meta"]
+    assert m["date"] == "2026-10-01" and m["periods_empty"] == ["20260930"] and m["periods_failed"] == []
+    assert m["periods_ok"] == periods[1:] and m["periods_fallback"] == [] and m["periods_expected"] == 20
+    assert os.path.exists(q.QL_JS) and os.path.exists(q.QL_JSON)
+    assert os.path.exists(os.path.join(str(sandbox["dash"]), "history", "quality_2026-10-01.json"))
+    assert q._parse_ql_js(q.QL_JS)["meta"]["periods_empty"] == ["20260930"]
+    assert any("报告期 到齐 19/20 (回退 0, 空 1)" in r.getMessage() for r in caplog.records)
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records if r.name.startswith("ashare"))
+
+
+# ============================================================ 抛错日也沿用旧榜 (2026-09-13 回修 MEDIUM)
+NAN_TYPEERROR = TypeError("argument of type 'float' is not iterable")      # 09-04/05/07 三天的原样
+
+
+def _no_history_written(box) -> bool:
+    hdir = os.path.join(str(box["dash"]), "history")
+    return not os.path.exists(hdir) or not [n for n in os.listdir(hdir) if n.startswith("quality_")]
+
+
+def test_build_exception_carries_last_good_and_writes_nothing(sandbox, monkeypatch, caplog):
+    """服务器形态: reset 后看板是 08-28 的 HEAD 版, docs 副本是 09-11 的真榜; build_quality 中途抛错 (NaN 型) →
+    看板摆回 09-11 那份, 三个产物一个不写, 异常照旧上抛 (run_pipeline 只 warning 不阻断), 一行 error 点名异常。"""
+    _pin_today(monkeypatch, dt.date(2026, 9, 13))
+    _write_js(q.QL_JS, "2026-08-28", [{"code": "000001"}])
+    _write_js(q.QL_DOCS_JS, "2026-09-11", [{"code": "600519"}])
+    monkeypatch.setattr(q, "_score_rows", lambda *a, **k: (_ for _ in ()).throw(NAN_TYPEERROR))
+    with caplog.at_level(logging.INFO, logger="ashare.quality"), pytest.raises(TypeError, match="float"):
+        q.build_quality()
+    got = q._parse_ql_js(q.QL_JS)
+    assert got["meta"]["date"] == "2026-09-11" and got["picks"][0]["code"] == "600519"
+    assert not os.path.exists(q.QL_JSON) and _no_history_written(sandbox)
+    assert not os.path.exists(q.QL_LAST_GOOD), "抛错日不许把任何东西写成'真榜副本'"
+    errs = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errs) == 1 and "抛错" in errs[0] and "TypeError" in errs[0] and "float" in errs[0]
+    carried = [r for r in caplog.records if "沿用 2026-09-11 的榜" in r.getMessage()]
+    assert len(carried) == 1 and carried[0].levelno == logging.INFO
+
+
+def test_build_exception_keeps_dashboard_when_already_newest(sandbox, monkeypatch):
+    """看板上已是最新非空榜: 抛错 (这次抛在快照那一步, 任何异常都算) → 一字不写。"""
+    _write_js(q.QL_JS, "2026-09-11", [{"code": "600519"}])
+    before = open(q.QL_JS, encoding="utf-8").read()
+    os.utime(q.QL_JS, (1_600_000_000, 1_600_000_000))
+    monkeypatch.setattr(ds, "fetch_spot_snapshot",
+                        lambda force=False: (_ for _ in ()).throw(RuntimeError("spot down")))
+    with pytest.raises(RuntimeError, match="spot down"):
+        q.build_quality()
+    assert open(q.QL_JS, encoding="utf-8").read() == before and os.path.getmtime(q.QL_JS) == 1_600_000_000
+    assert not os.path.exists(q.QL_JSON) and _no_history_written(sandbox)
+
+
+def test_build_exception_without_any_candidate_leaves_no_board(sandbox, monkeypatch, caplog):
+    monkeypatch.setattr(q, "_score_rows", lambda *a, **k: (_ for _ in ()).throw(NAN_TYPEERROR))
+    with caplog.at_level(logging.WARNING, logger="ashare.quality"), pytest.raises(TypeError):
+        q.build_quality()
+    assert not os.path.exists(q.QL_JS)
+    assert any("没有可沿用的旧榜" in r.getMessage() for r in caplog.records)
+
+
+def test_build_exception_carry_failure_does_not_mask_original(sandbox, monkeypatch, caplog):
+    """沿用旧榜自己也炸了 (磁盘满之类): 记一行 warning, 上抛的仍是原来的 TypeError。"""
+    monkeypatch.setattr(q, "_score_rows", lambda *a, **k: (_ for _ in ()).throw(NAN_TYPEERROR))
+    monkeypatch.setattr(q, "_carry_last_good", lambda: (_ for _ in ()).throw(OSError("disk full")))
+    with caplog.at_level(logging.WARNING, logger="ashare.quality"), pytest.raises(TypeError, match="float"):
+        q.build_quality()
+    assert any("沿用旧榜也失败" in r.getMessage() and "disk full" in r.getMessage() for r in caplog.records)
+
+
+def test_carry_warns_when_only_stale_head_board_is_available(sandbox, monkeypatch, caplog):
+    """三处只剩 reset 恢复出来的 08-28 HEAD 版 (data/ 与 docs 副本都不在): 照样沿用它, 但 warning 点名"多半是 HEAD 版",
+    不能一行 info 装作正常; 正常的上一版榜 (2 天前) 仍是 info。"""
+    _pin_today(monkeypatch, dt.date(2026, 9, 13))
+    _write_js(q.QL_JS, "2026-08-28", [{"code": "000001"}])
+    sandbox["cov"] = _cov(ok=PERIODS[1:], failed=PERIODS[:1])
+    with caplog.at_level(logging.INFO, logger="ashare.quality"):
+        assert q.build_quality() is None
+    warn = [r for r in caplog.records if r.levelno == logging.WARNING and "保留 2026-08-28 的榜" in r.getMessage()]
+    assert len(warn) == 1 and "16 天旧" in warn[0].getMessage() and "HEAD 版" in warn[0].getMessage()
+    caplog.clear()
+    _write_js(q.QL_DOCS_JS, "2026-09-11", [{"code": "600519"}])
+    with caplog.at_level(logging.INFO, logger="ashare.quality"):
+        assert q.build_quality() is None
+    info = [r for r in caplog.records if "沿用 2026-09-11 的榜" in r.getMessage()]
+    assert len(info) == 1 and info[0].levelno == logging.INFO
+    assert q._parse_ql_js(q.QL_JS)["meta"]["date"] == "2026-09-11"
 
 
 if __name__ == "__main__":
