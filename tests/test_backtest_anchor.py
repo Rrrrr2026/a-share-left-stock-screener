@@ -775,9 +775,9 @@ def test_migrate_paper_sigdate_classify():
     r = mg.classify(state, px_wrong, px_right)
     assert [x["code"] for x in r["move"]] == ["A"], r["move"]
     assert r["move"][0]["id_new"] == "dip:A:2026-08-24"
-    assert r["move"][0]["only_in_0824"] is True
+    assert r["move"][0]["only_in_to"] is True                    # 09-14 泛化后的键名 (原 only_in_0824)
     assert sorted(x["code"] for x in r["keep"]) == ["B", "C"]
-    assert {x["code"]: x["verdict"] for x in r["keep"]} == {"B": "both_match", "C": "only_0821"}
+    assert {x["code"]: x["verdict"] for x in r["keep"]} == {"B": "both_match", "C": "only_from"}
     assert [x["code"] for x in r["quality"]] == ["D"]
     assert [x["code"] for x in r["id_clash"]] == ["E"], "撞 id 的不许自动改, 要交给人"
     # 判定是纯函数: 不许碰传进来的账本

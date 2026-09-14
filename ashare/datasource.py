@@ -1804,12 +1804,50 @@ def _industry_hist_ths(industry: str) -> pd.DataFrame | None:
 # ===========================================================================
 #  4) 基准指数 (沪深300) 历史收盘  ——  stock_zh_index_daily_em
 # ===========================================================================
+def _bench_from_store() -> pd.DataFrame | None:
+    """价格库 idx_bars -> DataFrame(date, close, open, high, low, volume) 升序; 表空/读失败 None。
+    列集合与联网路径 `rename_normalize` 之后的一致 (ingest_cache_to_pricestore 读 bench 缓存时按列名取)。"""
+    try:
+        rows = _store_conn().execute("SELECT d,o,h,l,c,v FROM idx_bars ORDER BY d").fetchall()
+    except Exception as e:                                     # noqa: BLE001
+        log.debug("价格库 idx_bars 读取失败: %s", str(e)[:120])
+        _STORE_TLS.conn = None
+        return None
+    if not rows:
+        return None
+    df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume"])
+    df["date"] = df["date"].astype(str).str[:10]
+    return df[["date", "close", "open", "high", "low", "volume"]].reset_index(drop=True)
+
+
 def fetch_benchmark_close() -> pd.DataFrame | None:
+    """基准指数 (沪深300) 日线 -> DataFrame(date, close[, open, high, low, volume]) 升序。
+
+    **2026-09-14 卡 DATA-DATE 起: 阶段A 直读价格库时, 指数也优先读库 (idx_bars)**, 与个股同源
+    同步 —— 只要库内指数末日 >= 个股末日 (`pricestore update` 现在把当日指数与个股同一步写进
+    idx_bars), 这里**零联网**。09-14 首个 10:00 跑批的实情: 东财/新浪的指数日线在北京 16:01 还停在
+    09-11 (缓存实证 bench_931fa42f 末两日 09-10/09-11), 而 idx_bars 在 10:01 的 update 步没人写、
+    要等末尾 ingest 才补 —— 两头都旧, 于是 data_date 被标成 09-11。data_date 已改成不再看这里
+    (ashare/datadate.py), 这里只负责把"基准序列"本身尽量做新: 库内落后个股末日时才联网, 联网拿到
+    更新的用联网的, 两头都旧就用较新的那头并让 datadate 的交叉核对打 warning。
+    """
     sym = CONFIG["source"]["benchmark_index"]
     key = _cache_key("bench", sym, dt.date.today().isoformat())
     c = _cache_load(key)
     if c is not None:
         return c
+    store_df = None
+    if bars_from_store_on():
+        store_df = _bench_from_store()
+        smax = _store_max_date()
+        if store_df is not None and smax and str(store_df["date"].iloc[-1]) >= str(smax):
+            log.info("基准指数 %s: 价格库 idx_bars 已到 %s (>= 个股末日 %s), 直读库, 零联网",
+                     sym, store_df["date"].iloc[-1], smax)
+            _cache_save(key, store_df)
+            return store_df
+        if store_df is not None:
+            log.warning("基准指数 %s: 库内 idx_bars 末日 %s 落后个股末日 %s (update 步没拉到当日指数?) "
+                        "— 改走联网源补当日", sym, store_df["date"].iloc[-1], smax)
     raw = None
     for fn, kw in (
         (lambda: _ak().stock_zh_index_daily_em(symbol=sym), {}),
@@ -1823,7 +1861,10 @@ def fetch_benchmark_close() -> pd.DataFrame | None:
             log.debug("benchmark fetch attempt failed: %s", e)
             raw = None
     if raw is None or len(raw) == 0:
-        return None
+        if store_df is not None:
+            log.warning("基准指数 %s: 联网源全部失败, 退回库内 idx_bars (末日 %s)",
+                        sym, store_df["date"].iloc[-1])
+        return store_df
     # 除 date/close 外顺带保留 OHLCV (若源有): 消费方只读 date/close, 多列无害;
     # ingest_cache_to_pricestore 用它把当日指数补进 idx_bars (2026-09-06 A 指数双源)
     df = rename_normalize(raw, {
@@ -1839,6 +1880,10 @@ def fetch_benchmark_close() -> pd.DataFrame | None:
             df[col] = _to_num(df[col])
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
     df = df.sort_values("date").reset_index(drop=True)
+    if store_df is not None and len(df) and str(df["date"].iloc[-1]) < str(store_df["date"].iloc[-1]):
+        log.warning("基准指数 %s: 联网源末日 %s 比库内 idx_bars 末日 %s 还旧, 用库内",
+                    sym, df["date"].iloc[-1], store_df["date"].iloc[-1])
+        df = store_df
     _cache_save(key, df)
     return df
 

@@ -656,7 +656,12 @@ def run(full_market: bool, use_cache: bool):
     log.info("深度档案: 新拉 %d, 回落补齐 %d, 缺口 %d",
              len(_done_codes), n_fb, len(_miss) - n_fb)
 
-    data_date = str(_bench["date"].iloc[-1]) if (_bench is not None and not _bench.empty) else run_date
+    # data_date = 阶段A 用的价格的日期 = 价格库个股末日; 基准指数末日只交叉核对 (09-14 起, 卡 DATA-DATE)。
+    # 以前这里是 `_bench["date"].iloc[-1]` —— 跑批挪到 10:00 CEST 的首日, 个股 10:01 已入库到当天,
+    # 指数序列 (东财/新浪, 与 idx_bars) 却要到跑完才补, 快照/看板/模拟盘登记整批标成上一个交易日。
+    # 定义、交叉核对与自检 (data_date < 库末日 / < 最后收盘日 必 error) 都在 ashare/datadate.py。
+    from ashare import datadate as _dd
+    data_date = _dd.resolve_data_date(_bench, run_date)
     finished = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.log_run(run_date, started, finished, n_scanned, len(final_records),
                selected_inds, "ok", data_date=data_date,

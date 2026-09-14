@@ -280,6 +280,43 @@ def trading_days(start: str, end: str):
     return tsc.trade_cal(start, end)
 
 
+def fetch_index_by_date(trade_date: str):
+    """基准指数 (CONFIG.source.benchmark_index, 沪深300) **某交易日那一根** -> (o,h,l,c,v手);
+    None = 路径未启用 (源开关不是 tushare / 无 token) **或当日源尚无该 bar**。
+
+    给 `leftside_core.pricestore._update_daily_by_date` 用 (2026-09-14 卡 DATA-DATE): 个股按
+    trade_date 入库的同一步把当日指数写进 idx_bars, 流水线开跑时 fetch_benchmark 就含当日。
+    只问 Tushare 镜像的 index_daily 一个端点 (start=end=当日, 1 次调用); 不走腾讯/东财/新浪 ——
+    那三个免费源给的是**盘中也在变的 bar**, 且流水线末尾 ingest_cache_to_pricestore 本来就还有
+    一次补缺机会, 这里不必再叠一层回退。**单位**与 `_index_bars_tushare` 同: vol 就是"手", 不换算。
+    """
+    if not _tushare_on():
+        return None
+    from . import tushare_client as tsc
+    from .config import CONFIG
+    sym = CONFIG["source"].get("benchmark_index", "sh000300")
+    df = tsc.index_daily(sym, trade_date, trade_date)
+    if df is None or len(df) == 0:
+        return None
+    need = {"trade_date", "open", "high", "low", "close", "vol"}
+    if not need <= set(df.columns):
+        log.warning("基准指数 %s: Tushare 当日返回缺列 %s, 放弃", sym, sorted(need - set(df.columns)))
+        return None
+    want = _day_ymd(trade_date)
+    for t in df.itertuples(index=False):
+        if str(t.trade_date)[:10].replace("-", "") != want:
+            continue
+        try:
+            o, h, l, c, v = (float(t.open), float(t.high), float(t.low),
+                             float(t.close), float(t.vol))
+        except (TypeError, ValueError):
+            return None
+        if h < l or min(o, h, l, c) <= 0 or v < 0:
+            return None
+        return (o, h, l, c, v)
+    return None
+
+
 def fetch_universe_rows(list_status: str = "L,D,P") -> list:
     """全市场股票池 (含**退市**) -> [(code,name,list_date,delist_date,status), ...]。
     status: L 上市 / D 退市 / P 暂停上市 (Tushare stock_basic 口径)。"""
@@ -685,5 +722,6 @@ MARKET = set_market(Market(
     # schema v2 按日增量钩子 (未启用时各自返回 None -> pricestore 自动回退旧路径)
     fetch_bars_by_date=fetch_bars_by_date, fetch_adj_by_date=fetch_adj_by_date,
     trading_days=trading_days, fetch_universe_rows=fetch_universe_rows,
+    fetch_index_by_date=fetch_index_by_date,     # 当日指数随个股同一步入库 (卡 DATA-DATE)
     log_prefix="ashare",
 ))

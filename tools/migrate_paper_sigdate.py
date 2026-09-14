@@ -44,6 +44,15 @@ scale 也跟着偏 —— 09-08 复核实测: 换成 raw 锚定后这批仍然 6
     python -X utf8 tools/migrate_paper_sigdate.py --out r.json    # 顺便把对账表落盘
     python -X utf8 tools/migrate_paper_sigdate.py --apply         # 真写 (先自动备份)
 
+**2026-09-14 卡 DATA-DATE 泛化**: 同一形态第二次发生 (跑批挪到 10:00 CEST 的首日, 流水线拿指数末日
+09-11 当 data_date, 36 条信号登记成 sig_date=09-11 而价是 09-14 快照价), 于是把写死的两个日期改成
+参数, 判定规则一个字不变:
+
+    python -X utf8 tools/migrate_paper_sigdate.py --from-date 2026-09-11 --to-date 2026-09-14
+    python -X utf8 tools/migrate_paper_sigdate.py --from-date 2026-09-11 --to-date 2026-09-14 --apply
+
+不给参数时仍是 08-21 -> 08-24 (老默认, 单测钉着)。参照快照按 `<history-dir>/day_<日期>.json` 找。
+
 `--apply` 才写账本, 且写之前一定先把原件复制到
 `data/backups/paper_portfolio.<ts>.json`, 写的时候走**临时文件 + os.replace** 原子替换
 (半个 JSON 比没有 JSON 更糟)。回滚命令由脚本自己打出来, 不用现编。
@@ -58,8 +67,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-WRONG_DATE = "2026-08-21"          # 账本里写着的 (= 快照 meta 当时的错值)
-RIGHT_DATE = "2026-08-24"          # 价格证明的真实数据日
+WRONG_DATE = "2026-08-21"          # 默认: 账本里写着的 (= 快照 meta 当时的错值); --from-date 可换
+RIGHT_DATE = "2026-08-24"          # 默认: 价格证明的真实数据日; --to-date 可换
 
 
 def _load(path: str):
@@ -83,12 +92,17 @@ def snapshot_prices(hist_dir: str, day: str) -> dict:
     return out
 
 
-def classify(state: dict, px_wrong: dict, px_right: dict) -> dict:
-    """-> {"move": [...], "keep": [...], "quality": [...], "id_clash": [...]}。纯函数, 可离线单测。"""
+def classify(state: dict, px_wrong: dict, px_right: dict,
+             wrong_date: str = WRONG_DATE, right_date: str = RIGHT_DATE) -> dict:
+    """-> {"move": [...], "keep": [...], "quality": [...], "id_clash": [...]}。纯函数, 可离线单测。
+
+    行里的 `px_from` / `px_to` = 该 code 在 day_<wrong_date> / day_<right_date> 里的价;
+    verdict ∈ move / both_match / only_from / no_match / no_price / id_clash。
+    """
     existing_ids = {s.get("id") for s in state.get("signals") or []}
     res: dict = {"move": [], "keep": [], "quality": [], "id_clash": []}
     for i, s in enumerate(state.get("signals") or []):
-        if s.get("sig_date") != WRONG_DATE:
+        if s.get("sig_date") != wrong_date:
             continue
         code = s.get("code")
         cand = s.get("cand") or {}
@@ -97,7 +111,7 @@ def classify(state: dict, px_wrong: dict, px_right: dict) -> dict:
         row = {"i": i, "id": s.get("id"), "cat": s.get("cat"), "code": code,
                "name": s.get("name"), "sig_date_old": s.get("sig_date"),
                "price": None if px is None else float(px),
-               "px_2026_08_21": px_wrong.get(code), "px_2026_08_24": px_right.get(code),
+               "px_from": px_wrong.get(code), "px_to": px_right.get(code),
                # 冻结缓存: 改判时必须一并删掉, 否则 update_portfolio 直接返回它, 永不重算
                "has_final": bool(fin),
                "final_status": (fin or {}).get("status"),
@@ -111,11 +125,11 @@ def classify(state: dict, px_wrong: dict, px_right: dict) -> dict:
         hit_right = code in px_right and px_right[code] == px
         hit_wrong = code in px_wrong and px_wrong[code] == px
         if hit_right and not hit_wrong:
-            new_id = "%s:%s:%s" % (s.get("cat"), code, RIGHT_DATE)
+            new_id = "%s:%s:%s" % (s.get("cat"), code, right_date)
             row["verdict"] = "move"
-            row["sig_date_new"] = RIGHT_DATE
+            row["sig_date_new"] = right_date
             row["id_new"] = new_id
-            row["only_in_0824"] = code not in px_wrong
+            row["only_in_to"] = code not in px_wrong
             if new_id in existing_ids:
                 # 同 (cat, code, 08-24) 已经有一条 —— 改过去会撞 id, 交给人看, 不自动合并
                 row["verdict"] = "id_clash"
@@ -124,7 +138,7 @@ def classify(state: dict, px_wrong: dict, px_right: dict) -> dict:
                 res["move"].append(row)
         else:
             row["verdict"] = ("both_match" if (hit_right and hit_wrong)
-                              else ("only_0821" if hit_wrong else "no_match"))
+                              else ("only_from" if hit_wrong else "no_match"))
             res["keep"].append(row)
     return res
 
@@ -136,32 +150,40 @@ def main() -> int:
     ap.add_argument("--history-dir", default=None, help="默认 <repo>/dashboard/history")
     ap.add_argument("--out", default=None, help="把逐条对账表写成 JSON (只读产物, 不是账本)")
     ap.add_argument("--apply", action="store_true", help="真写账本 (默认只 dry-run)")
+    ap.add_argument("--from-date", default=WRONG_DATE,
+                    help="账本里写着的错标信号日 (= 快照 meta 当时的错值), 默认 %s" % WRONG_DATE)
+    ap.add_argument("--to-date", default=RIGHT_DATE,
+                    help="价格证明的真实数据日, 默认 %s" % RIGHT_DATE)
     args = ap.parse_args()
+    wrong_date, right_date = str(args.from_date)[:10], str(args.to_date)[:10]
+    if wrong_date >= right_date:
+        print("--from-date %s 必须早于 --to-date %s" % (wrong_date, right_date))
+        return 2
 
     ledger = args.ledger or os.path.join(args.repo, "data", "paper_portfolio.json")
     hist = args.history_dir or os.path.join(args.repo, "dashboard", "history")
     if not os.path.exists(ledger):
         print("账本不存在: %s" % ledger)
         return 2
-    px_wrong, px_right = snapshot_prices(hist, WRONG_DATE), snapshot_prices(hist, RIGHT_DATE)
+    px_wrong, px_right = snapshot_prices(hist, wrong_date), snapshot_prices(hist, right_date)
     print("账本   : %s" % ledger)
     print("快照目录: %s" % hist)
     print("参照价 : day_%s.json %d 条 / day_%s.json %d 条"
-          % (WRONG_DATE, len(px_wrong), RIGHT_DATE, len(px_right)))
+          % (wrong_date, len(px_wrong), right_date, len(px_right)))
     if not px_right:
-        print("**day_%s.json 读不到候选价, 无法判定, 退出**" % RIGHT_DATE)
+        print("**day_%s.json 读不到候选价, 无法判定, 退出**" % right_date)
         return 2
 
     state = _load(ledger)
     n_all = len(state.get("signals") or [])
-    res = classify(state, px_wrong, px_right)
+    res = classify(state, px_wrong, px_right, wrong_date, right_date)
     n_wrong_day = sum(len(res[k]) for k in ("move", "keep", "quality", "id_clash"))
-    print("\n账本共 %d 条信号, 其中 sig_date=%s 的 %d 条" % (n_all, WRONG_DATE, n_wrong_day))
-    print("  改判 %s -> %s : **%d 条**" % (WRONG_DATE, RIGHT_DATE, len(res["move"])))
+    print("\n账本共 %d 条信号, 其中 sig_date=%s 的 %d 条" % (n_all, wrong_date, n_wrong_day))
+    print("  改判 %s -> %s : **%d 条**" % (wrong_date, right_date, len(res["move"])))
     print("  保持不动         : %d 条 (%s)" % (
         len(res["keep"]), ", ".join(
             "%s=%d" % (v, sum(1 for r in res["keep"] if r["verdict"] == v))
-            for v in ("both_match", "only_0821", "no_match"))))
+            for v in ("both_match", "only_from", "no_match"))))
     print("  优质榜无快照价    : %d 条 (不判)" % len(res["quality"]))
     print("  id 会撞车 (待人工) : %d 条" % len(res["id_clash"]))
     n_fin = sum(1 for r in res["move"] if r["has_final"])
@@ -170,12 +192,13 @@ def main() -> int:
 
     print("\n--- 逐条对账 (改判的 %d 条) ---" % len(res["move"]))
     print("%-4s %-9s %-8s %-6s %-9s %-9s %-9s %-32s %s" % (
-        "#", "cat", "code", "价", "08-21价", "08-24价", "新sig_date", "新 id", "final"))
+        "#", "cat", "code", "价", wrong_date[5:] + "价", right_date[5:] + "价",
+        "新sig_date", "新 id", "final"))
     for n, r in enumerate(res["move"], 1):
         print("%-4d %-9s %-8s %-6s %-9s %-9s %-9s %-32s %s" % (
             n, r["cat"], r["code"], r["price"],
-            "—" if r["px_2026_08_21"] is None else r["px_2026_08_21"],
-            r["px_2026_08_24"], r["sig_date_new"], r["id_new"],
+            "—" if r["px_from"] is None else r["px_from"],
+            r["px_to"], r["sig_date_new"], r["id_new"],
             ("删缓存(%s)" % r["final_status"]) if r["has_final"] else "—"))
     fins = [r for r in res["move"] if r["has_final"]]
     if fins:
@@ -194,7 +217,7 @@ def main() -> int:
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump({"ledger": ledger, "history_dir": hist, "n_signals": n_all,
-                       "wrong_date": WRONG_DATE, "right_date": RIGHT_DATE,
+                       "wrong_date": wrong_date, "right_date": right_date,
                        "applied": bool(args.apply), "backup": bak if args.apply else None,
                        "counts": {k: len(v) for k, v in res.items()},
                        **res}, f, ensure_ascii=False, indent=1)
@@ -215,9 +238,9 @@ def main() -> int:
     n_fin_dropped = 0
     for r in res["move"]:
         s = state["signals"][r["i"]]
-        s["sig_date"] = RIGHT_DATE
+        s["sig_date"] = right_date
         s["id"] = r["id_new"]
-        s["sig_date_migrated_from"] = WRONG_DATE          # 留痕: 这条被改过, 谁都查得到
+        s["sig_date_migrated_from"] = wrong_date          # 留痕: 这条被改过, 谁都查得到
         # **必须删 final**: update_portfolio 见 final 为真就直接返回缓存、不再重新模拟,
         # 只改日子不清缓存 = 这条信号永远留着按错误信号日算出来的成交日/出场日/盈亏。
         # 缓存是可再生的 (走完完整窗口会自己写回来), 但删之前把原值抄进 final_dropped 留痕。
