@@ -16,7 +16,7 @@ PE 切真 TTM + 行业口径统一 的离线自测 (不联网; 2026-09-23 卡 IN
       行业 PE 中位按快照 industry 列分组 (industry_groups_from_spot); 景气分查表 二级名 → 去后缀一级名 (prosperity_for)。
       quality 那边「成分 5000 只也不选」的用例在 test_quality_spot_fallback.py。
   (f) 景气分查表四步 (2026-09-24 卡 IND-PE 回修, 校验员 MEDIUM): 原名 → 去后缀 → 成分反查 (cons_l1_index) → 静态表 ds.F100_TO_L1;
-      表的键值都在东财口径词表内且 128 个 f100 名除 7 个有意不映射外全能查到; NaN 不借分; run() 接线锁源码; 命中统计文案。
+      表的键值都在东财口径词表内且 128 个 f100 名除 10 个有意不映射外全能查到; NaN 不借分; run() 接线锁源码; 命中统计文案。
   (d) 留痕: spot_sources / fill_spot_valuation 每条路都带 pe_basis="ttm"; 看板 dashboard_data.js 与历史快照 day_<日>.json 的
       meta 带 pe_basis / industry_basis; 优质榜 meta 与 history/quality_<日>.json 的在 test_quality_spot_fallback.py。
   (e) PE_TTM_COLUMN_NAMES 里没有会子串命中「市盈率-动态」的名 (rename_normalize 是子串匹配)。
@@ -268,7 +268,7 @@ def test_spot_industry_of_and_groups_and_prosperity_lookup():
 # ============================================================ (f) 景气分查表四步 (2026-09-24 卡 IND-PE 回修)
 def test_f100_to_l1_table_within_vocab_and_covers_every_f100_name():
     """表的键都是 f100 二级名 (EM_F100), 值都是 fetch_industry_list 一级名 (EM_LEVEL1); 键不能已经能靠原名/去后缀查到 (表只装
-    救不回来的); 128 个 f100 名除 F100_L1_UNMAPPED 7 个外都能查到 (回修前 67 个); Tushare 兜底日的别名目标除 TS_INDUSTRY_KEEP
+    救不回来的); 128 个 f100 名除 F100_L1_UNMAPPED 10 个外都能查到 (回修前 67 个; 09-24 渔业/饲料/动物保健Ⅱ 三行被成分缓存反证后挪进不映射); Tushare 兜底日的别名目标除 TS_INDUSTRY_KEEP
     (混装, 有意原样沿用) 与 摩托车及其他 外都能查到 (回修前 14 个查不到)。"""
     pm = {n: 60.0 for n in EM_LEVEL1}
     assert set(ds.F100_TO_L1) <= set(EM_F100) and set(ds.F100_TO_L1.values()) <= set(EM_LEVEL1)
@@ -276,10 +276,11 @@ def test_f100_to_l1_table_within_vocab_and_covers_every_f100_name():
     for k in ds.F100_TO_L1:
         assert k not in pm and industry_base_name(k) not in pm, k               # 表里没有多余行
     miss = sorted(n for n in EM_F100 if rp.prosperity_for(pm, n) is None)
-    assert miss == sorted(ds.F100_L1_UNMAPPED) and len(EM_F100) - len(miss) == 121
+    assert miss == sorted(ds.F100_L1_UNMAPPED) and len(EM_F100) - len(miss) == 118
     targets = {ds.alias_industry(n)[0] for n in TS_NAMES} - {None}
     miss_ts = sorted(t for t in targets if rp.prosperity_for(pm, t) is None)
-    assert miss_ts == sorted(set(ds.TS_INDUSTRY_KEEP) | {"摩托车及其他"})
+    # 09-24: Tushare 名「饲料」的别名目标也是 饲料 (f100 名), 挪进不映射后同样查不到 —— 这是有意的 (不借养殖业的分)
+    assert miss_ts == sorted(set(ds.TS_INDUSTRY_KEEP) | {"摩托车及其他", "饲料"})
 
 
 def test_prosperity_lookup_four_steps_priority_and_nan():
