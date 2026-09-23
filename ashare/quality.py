@@ -54,7 +54,25 @@ DOM_RANK_MAX = 3         # 行业营收排名门槛
 TOP_N = 10               # 每日榜单条数
 SHORTLIST = 30           # 研发强度只对前 N 名逐只补数据 (THS 单线程)
 RD_GOOD, RD_OK = 5.0, 3.0
-FIN_INDUSTRIES = ("银行", "保险", "证券", "多元金融")   # 研发强度豁免
+FIN_INDUSTRIES = ("银行", "保险", "证券", "多元金融")   # 研发强度豁免 (去掉东财级别后缀后精确命中, 见 is_fin_industry)
+# 东财 f100 (批量映射 / 东财直连快照的所属行业) 里金融名带二级后缀: 银行Ⅱ / 证券Ⅱ / 保险Ⅱ (多元金融 没有); 东财成分口径与
+# Tushare 别名表给的是 银行 / 证券 / 保险。豁免判定先去掉级别后缀再精确比 (2026-09-23 卡 QL-SPOT 回修: 首版精确比,
+# 东财日的银行/保险/券商全都不豁免, 白打 THS 研发接口)。"III" 排在 "II" 前面: 先剥长的。
+IND_LEVEL_SUFFIX = ("Ⅱ", "Ⅲ", "Ⅳ", "III", "II")
+
+
+def industry_base_name(name) -> str:
+    """行业名去掉东财二/三级后缀 (银行Ⅱ → 银行, 股份制银行Ⅲ → 股份制银行); 非字符串 → ''。"""
+    s = name.strip() if isinstance(name, str) else ""
+    for suf in IND_LEVEL_SUFFIX:
+        if s.endswith(suf):
+            return s[: -len(suf)].strip()
+    return s
+
+
+def is_fin_industry(name) -> bool:
+    """研发强度豁免的金融行业: 去后缀后**精确**命中 FIN_INDUSTRIES (子串匹配会把 '非银金融' 之类误收)。"""
+    return industry_base_name(name) in FIN_INDUSTRIES
 CAP_MIN = 300e8          # 蓝筹门槛: 总市值 >= 300亿
 UPSIDE_MIN = 20.0        # 盈利空间门槛 (PEG法模型值) >= 20%
 JUSTIFIED_PE_LO, JUSTIFIED_PE_HI = 10.0, 35.0
@@ -65,10 +83,13 @@ EMPTY_LATEST_MAX_AGE_DAYS = YJBB_EMPTY_MAX_AGE_DAYS
 # 沿用旧榜时, 榜比这更旧就用 warning 而不是 info: 正常的上一版榜是 1-3 天前的; 一份几周前的榜多半是 git reset
 # 恢复出来的 HEAD 版 (dashboard/quality_data.js 是跟踪文件), 说明 data/quality_last_good.js 与 docs 副本都不在。
 CARRY_STALE_WARN_DAYS = 7
-# 行业映射 (龙头判定 dom 用的分组) 覆盖低于这么多只就视为不可用 (2026-09-23 卡 QL-SPOT): 全A ~5200 只; 东财成分口径
-# (fetch_industry_list × fetch_industry_cons) 09-21 实测只有 6/90 个行业 485 只 —— 那是"东财成分接口大面积失败"的
-# 形态, 不是一份能拿来排龙头的映射。低于此改用 datasource.fetch_industry_map() (东财 f100 全市场一次; 东财不可达时它
-# 自己退到 Tushare stock_basic, 名字经别名表换成东财口径)。与 run_pipeline 的 3000 只裁池阈值同一口径。
+# 行业映射 (龙头判定 dom 用的分组) 覆盖低于这么多只就视为不可用 (2026-09-23 卡 QL-SPOT; 回修改注释): 全A ~5200 只。
+# **东财成分口径 (fetch_industry_list × fetch_industry_cons) 在生产里从来没到过这个数**: 服务器 journal 09-01 起每一跑都是
+# `东财行业列表失败 RemoteDisconnected` + `候选池: 全行业成分股 62/214/329/…/1041/485/25/0 只 (行业数 0-13)` —— 09-21 的
+# 485 只不是异常, 是常态 (首版把它写成"东财成分接口大面积失败的形态", 错了)。所以 _industry_map_ex 的 ① 实际上永远走不到,
+# 东财日的常态是 ② datasource.fetch_industry_map() 的东财 f100 批量映射 (全市场一次, 二级口径 ~128 组, 与 run_pipeline
+# 市场地位分组同一份; INFO 不 WARNING), 东财不可达时它自己退到 Tushare stock_basic (名字经别名表换成东财口径; WARNING)。
+# 与 run_pipeline 的 3000 只裁池阈值同一口径。
 IND_MAP_MIN_CODES = 3000
 
 
@@ -359,10 +380,14 @@ def _industry_map(ds) -> dict:
 
 def _industry_map_ex(ds) -> tuple:
     """行业映射 + 来源留痕 -> (ind_of, 来源名, info)。东财优先不变:
-      ① 东财成分口径 (_industry_map: fetch_industry_list × fetch_industry_cons) 覆盖 >= IND_MAP_MIN_CODES → 用它;
-      ② 不够 → ds.fetch_industry_map() (东财 push2 f100 全市场一次; 东财不可达时它自己退到 Tushare stock_basic) 覆盖够 → 用它;
-      ③ 都不够 → 谁有用谁 (龙头判定降级, 与 09-23 之前一样)。
-    只有 ① 不够时才会碰 ②, 所以东财成分正常的日子一次 push2/Tushare 调用都不发。"""
+      ① 东财成分口径 (_industry_map: fetch_industry_list × fetch_industry_cons) 覆盖 >= IND_MAP_MIN_CODES → 用它。
+         **生产里 09-01 起从没到过** (每跑 62-1041 只, 见 IND_MAP_MIN_CODES 注释), 留着只是万一成分接口哪天真好了;
+      ② 不够 → ds.fetch_industry_map() (东财 push2 f100 全市场一次, 二级口径 ~128 组 —— 这就是**东财日的常态**, INFO 一行,
+         与 run_pipeline 市场地位分组同一份; 东财不可达时它自己退到 Tushare stock_basic → WARNING) 覆盖够 → 用它;
+      ③ 都不够 → 谁有用谁 (龙头判定降级, warning 点名)。
+    东财日 ② 只多一次 push2delay 批量调用 (按日缓存 ind_map_<日>; run_pipeline 同日已取过就零调用), 零 Tushare 调用。
+    注意 (2026-09-23 回修): 东财日的 dom 分组因此是 f100 二级 (~128 组, 全市场), 与 09-21 之前"成分口径只覆盖 3-13 个一级
+    行业"的部分分组不是同一套 —— 东财恢复那天榜单成员会再变一次, 这是已知口径差异, 不是故障。"""
     ind_of = _industry_map(ds)
     n_em = len(ind_of)
     if n_em >= IND_MAP_MIN_CODES:
@@ -375,8 +400,13 @@ def _industry_map_ex(ds) -> tuple:
     src, info = ds.industry_map_source()
     if len(m) >= IND_MAP_MIN_CODES and src:
         cov_txt = ds._coverage_text(info)      # noqa: SLF001
-        log.warning("行业映射: 东财成分口径只覆盖 %d 只 (< %d), 改用 %s 覆盖 %d/%d 只%s",
-                    n_em, IND_MAP_MIN_CODES, src, len(m), info.get("total", len(m)), (" (" + cov_txt + ")") if cov_txt else "")
+        if src == "东财":
+            # 东财日常态 (卡 QL-SPOT 回修): 成分口径 09-01 起每天都 < 3000, 不是事故, 不该天天 WARNING
+            log.info("行业映射: 东财批量 f100 覆盖 %d 只 (%s; 东财成分口径只 %d 只, 09-01 起常态; 与 run_pipeline 市场地位分组同一份)",
+                     len(m), "按日缓存" if info.get("cached") else (info.get("host") or "东财"), n_em)
+        else:
+            log.warning("行业映射: 东财成分口径只覆盖 %d 只 (< %d), 改用 %s 覆盖 %d/%d 只%s",
+                        n_em, IND_MAP_MIN_CODES, src, len(m), info.get("total", len(m)), (" (" + cov_txt + ")") if cov_txt else "")
         return m, src, {**info, "em_cons_n": n_em}
     # ③ 都不够 → 谁多用谁, 龙头判定降级 (warning 点名两边各多少只; 沉默降级是本队记过三次的失败形态)
     if src and len(m) > n_em:
@@ -544,7 +574,7 @@ def _build_quality(top_n: int) -> dict | None:
     short = rows[:SHORTLIST]
     # 研发强度: 只对短名单逐只取 (THS 单线程, 金融行业豁免)
     for r in short:
-        if r.get("industry") in FIN_INDUSTRIES:
+        if is_fin_industry(r.get("industry")):     # 东财 f100 的 银行Ⅱ/证券Ⅱ/保险Ⅱ 也豁免 (09-23 回修)
             r["rd"] = None
             r["rd_exempt"] = 1
             continue

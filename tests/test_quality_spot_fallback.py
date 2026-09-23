@@ -13,7 +13,10 @@ datasource 的新浪列映射还留着期待) → spot_map 里 pe_ttm/total_mv �
   · fetch_spot_snapshot 出口统一过 _spot_with_fallbacks: 缺估值列 → fill_spot_valuation 用 Tushare daily_basic 补
     pe_ttm/pb/total_mv/float_mv (+换手率/量比), **万元→元** (TS_MV_UNIT); 缺行业列 → fill_spot_industry 用批量行业映射补;
     东财直连快照两样都齐 → 原对象原样返回, 一次 Tushare 调用都不发。
-  · daily_basic 的交易日 = 价格库个股末日 (→ trade_cal → 工作日近似); 当日行数 < 4000 (还没出) → 退回前一交易日 + warning。
+  · daily_basic 的交易日 = 价格库个股末日 (→ trade_cal → 工作日近似); 当日行数 < 4000 (还没出) → 退回前一交易日 + warning;
+    (09-23 回修) 短表本进程 30 分钟后允许再打 (最多 2 次, 端点上限 1+2), 优质榜阶段拿当日; 前一交易日缓存按 72h 读。
+  · (09-23 回修) 东财日常态 = _industry_map_ex ② 东财批量 f100 (成分口径 09-01 起每天 62-1041 只, 从没到过 3000): INFO 不 WARNING,
+    零 Tushare; 研发豁免 is_fin_industry 去掉 f100 的 Ⅱ/Ⅲ 后缀再精确比 (银行Ⅱ 也豁免)。
   · fetch_industry_map: 东财 push2 各主机都不可达 → Tushare stock_basic, 名字经 TS_INDUSTRY_ALIAS 换成东财口径, 记
     映射到东财口径 / 原样沿用 Tushare 名 / 空 三类计数; quality._industry_map_ex: 东财成分 (>=3000 只) → 东财批量/Tushare
     (>=3000) → 谁多用谁 (降级 warning)。
@@ -32,6 +35,7 @@ import datetime as dt
 import logging
 import os
 import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -358,7 +362,7 @@ def test_daily_basic_cache_key_includes_trade_date(ts_box):
 
 # ============================================================ (d) 当日 daily_basic 还没出 → 退前一交易日 + warning
 def test_daily_basic_today_empty_falls_back_to_previous_day(ts_box, caplog):
-    ts_box.daily[D0] = _daily_basic(D0, n_pad=0)                    # 0 行: 北京 15:45 之前的形态
+    ts_box.daily[D0] = _daily_basic(D0, n_pad=0)                    # 0 行: 首取时当日还没出 (Tushare 文档口径 15~17 点更新)
     ts_box.daily[D1] = _daily_basic(D1, {"688578": {"pe_ttm": 13.0, "total_mv": 4_000_000.0}})
     with caplog.at_level(logging.WARNING, logger="ashare.datasource"):
         val, info = ds.fetch_valuation_tushare()
@@ -588,3 +592,146 @@ def test_quality_industry_map_ex_orders_em_cons_then_batch_then_partial(ts_box, 
     ts_box.stock_basic = _stock_basic({"601398": "银行"}, n_pad=100)
     m, src, info = q._industry_map_ex(ds)
     assert src == "东财成分(部分)" and m == small
+
+
+# ============================================================ (f) 09-23 回修: 东财日常态 / 金融后缀 / daily_basic 重试与前一日缓存
+def test_fin_industry_exemption_strips_em_level_suffix():
+    """东财 f100 的 银行Ⅱ/证券Ⅱ/保险Ⅱ 去后缀后精确命中 FIN_INDUSTRIES; 子串相近的 (非银金融) 不收; 非字符串不炸。"""
+    for name in ("银行", "银行Ⅱ", "证券Ⅱ", "保险Ⅱ", "多元金融", "银行 Ⅱ", "银行II", "证券III"):
+        assert q.is_fin_industry(name), name
+    for name in ("非银金融", "银行理财", "化学制药", "", None, float("nan"), "Ⅱ", "股份制银行Ⅲ"):
+        assert not q.is_fin_industry(name), name
+    assert q.industry_base_name("股份制银行Ⅲ") == "股份制银行" and q.industry_base_name(None) == ""
+    assert q.industry_base_name("证券III") == "证券"                       # 先剥长的, 不留 '证券I'
+    # 本机 09-07 批量映射缓存的 128 个 f100 名里, 豁免的恰好是金融四类 (去后缀后 = FIN_INDUSTRIES)
+    assert {q.industry_base_name(n) for n in EM_F100 if q.is_fin_industry(n)} == set(q.FIN_INDUSTRIES)
+    assert sum(1 for n in EM_F100 if q.is_fin_industry(n)) == 4
+
+
+def _em_day(monkeypatch, cons_n=656, batch=None, host="push2delay.eastmoney.com"):
+    """东财日的真实形态: 成分口径只 cons_n 只 (09-15 实测 656 只 / 12 个行业), 东财批量 f100 全市场可达。"""
+    cons = {f"{i:06d}": "化学制药" for i in range(1, cons_n + 1)}
+    monkeypatch.setattr(q, "_industry_map", lambda ds_: cons)
+    if batch is None:
+        batch = {f"{i:06d}": ("银行Ⅱ" if i % 50 == 0 else "化学制药") for i in range(1, 5201)}
+    monkeypatch.setattr(ds, "_industry_map_em_hosts", lambda: (dict(batch), host))
+    monkeypatch.setattr(ds, "fetch_industry_map", REAL_FETCH_INDUSTRY_MAP)
+    return cons, batch
+
+
+def test_industry_map_ex_em_day_norm_is_f100_batch_info_not_warning(ts_box, monkeypatch, caplog):
+    """东财日: 成分 656 只 (< 3000, 09-01 起常态) → ② 东财批量 f100 → 来源 东财, INFO 一行、零 WARNING、零 Tushare 调用。"""
+    cons, batch = _em_day(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="ashare.quality"):
+        m, src, info = q._industry_map_ex(ds)
+    assert src == "东财" and m == batch and info["source"] == "东财" and info["n"] == 5200
+    assert info["em_cons_n"] == 656 and info["host"] == "push2delay.eastmoney.com"
+    assert _msgs(caplog) == []                                              # 不再天天 WARNING
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any(x.startswith("行业映射: 东财批量 f100 覆盖 5200 只 (push2delay.eastmoney.com; 东财成分口径只 656 只, 09-01 起常态")
+               for x in infos)
+    assert ts_box.calls == []
+    # 同日第二个进程读 ind_map 按日缓存: 仍是 INFO, 来源标「按日缓存」
+    monkeypatch.setattr(ds, "_ind_map", None)
+    monkeypatch.setattr(ds, "_industry_map_em_hosts", lambda: (_ for _ in ()).throw(AssertionError("有缓存不该再问 push2")))
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="ashare.quality"):
+        m2, src2, info2 = q._industry_map_ex(ds)
+    assert src2 == "东财" and m2 == batch and info2.get("cached") is True and _msgs(caplog) == []
+    assert any("(按日缓存; 东财成分口径只 656 只" in x for x in [r.getMessage() for r in caplog.records])
+    # 成分口径真到 3000 (①) 仍优先, 且不问批量映射 —— 生产里没出现过, 但路径留着
+    big = {f"{i:06d}": "化学制药" for i in range(1, 3100)}
+    monkeypatch.setattr(q, "_industry_map", lambda ds_: big)
+    monkeypatch.setattr(ds, "fetch_industry_map", lambda: (_ for _ in ()).throw(AssertionError("成分够用时不该问批量映射")))
+    assert q._industry_map_ex(ds)[1] == "东财成分"
+
+
+def test_build_on_em_day_bank_with_suffix_is_rd_exempt(sandbox, monkeypatch, caplog):
+    """东财日全链路: 东财直连快照 (f100 带后缀) + 成分 656 只 + 东财批量可达 → 榜的行业来源 东财, 银行Ⅱ 研发豁免
+    (不打 THS), 其余票照常问研发强度; 零 Tushare 调用; 优质榜数据来源行 = 东财直连 | 东财 | 东财。"""
+    box = sandbox
+    spot = _em_spot(CODES, pb=1.0)
+    spot.loc[spot["code"] == "688578", "industry"] = "银行Ⅱ"
+    box["spot"] = spot
+    batch = {c: "化学制药" for c in CODES}
+    batch["688578"] = "银行Ⅱ"
+    batch.update({f"{i:06d}": "化学制药" for i in range(1, 5001)})
+    _em_day(monkeypatch, batch=batch)
+    asked = []
+    monkeypatch.setattr(q, "_rd_intensity", lambda code: (asked.append(code), None)[1])
+    with caplog.at_level(logging.INFO):
+        res = q.build_quality()
+    assert res is not None and len(res["picks"]) == q.TOP_N
+    m = res["meta"]
+    assert (m["spot_source"], m["valuation_source"], m["industry_source"]) == ("东财直连", "东财", "东财")
+    assert m["industry_map_coverage"]["em_cons_n"] == 656 and m["industry_map_coverage"]["n"] == len(batch)
+    bank = next(p for p in res["picks"] if p["code"] == "688578")
+    assert bank["industry"] == "银行Ⅱ" and bank["rd_exempt"] == 1 and bank["rd"] is None
+    assert bank["gates"]["dom"] and bank["val_model"] == "PB-ROE"           # 分组来自 f100 批量: 独占 '银行Ⅱ' 组 → 龙头
+    assert "688578" not in asked and len(asked) >= 1                         # 银行不打 THS, 其余票照常
+    assert all(c != "688578" for c in asked)
+    assert box["ts"].calls == []
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("优质榜数据来源: 快照 东财直连 | 估值 东财 | 行业 东财 覆盖 %d 只" % len(batch) in x for x in msgs)
+    assert not [x for x in _msgs(caplog) if x.startswith("行业映射")]      # 东财日零「行业映射」WARNING
+
+
+def test_daily_basic_short_retries_after_window_and_caps(ts_box, caplog):
+    """当日短表: 30 分钟内不再打; 过了窗口再试一次, 出了就用当日并落盘; 连着短最多 1 + MAX_RETRIES 次端点调用。"""
+    ts_box.daily[D0] = _daily_basic(D0, n_pad=0)
+    ts_box.daily[D1] = _daily_basic(D1, {"688578": {"pe_ttm": 13.0, "total_mv": 4_000_000.0}})
+    val, info = ds.fetch_valuation_tushare()                                 # 首取 (北京 16:05 形态): 当日 0 行 → 退前一日
+    assert info["trade_date"] == D1 and info["fell_back_from"] == D0 and ts_box.n("daily_basic", trade_date=D0) == 1
+    st = ds._ts_daily_basic_short[D0]
+    assert st["n"] == 0 and st["tries"] == 1
+    val, info = ds.fetch_valuation_tushare()                                 # 窗口内: 当日不再打
+    assert ts_box.n("daily_basic", trade_date=D0) == 1 and info["trade_date"] == D1
+    ds._ts_daily_basic_short[D0]["at"] -= ds.TS_DAILY_BASIC_RETRY_AFTER_SEC   # 时钟拨过 30 分钟 (优质榜阶段)
+    ts_box.daily[D0] = _daily_basic(D0, {"688578": {"pe_ttm": 18.9, "total_mv": 5_058_900.0}})   # 当日出了
+    with caplog.at_level(logging.INFO, logger="ashare.datasource"):
+        val, info = ds.fetch_valuation_tushare()
+    assert info["trade_date"] == D0 and info["fell_back_from"] is None and ts_box.n("daily_basic", trade_date=D0) == 2
+    assert val.set_index("code").loc["688578", "total_mv"] == pytest.approx(5_058_900.0 * 1e4)   # 艾力斯 09-23 真值 506 亿
+    assert any("再试一次 (第 1/2 次重试)" in x for x in _msgs(caplog, logging.INFO))
+    assert D0 not in ds._ts_daily_basic_short
+    d0_pkl = os.path.join(str(ts_box.cache), ds._cache_key("ts_daily_basic", D0) + ".pkl")
+    assert os.path.exists(d0_pkl)
+    ds.fetch_valuation_tushare()
+    assert ts_box.n("daily_basic", trade_date=D0) == 2                        # 之后读缓存
+    # 上限: 连着短 → 首取 + MAX_RETRIES 次重试, 之后不再打
+    ds._ts_daily_basic_short.clear()
+    os.remove(d0_pkl)
+    ts_box.daily[D0] = _daily_basic(D0, n_pad=100)
+    n0 = ts_box.n("daily_basic", trade_date=D0)
+    for _ in range(6):
+        val, info = ds.fetch_valuation_tushare()
+        assert info["trade_date"] == D1
+        if D0 in ds._ts_daily_basic_short:
+            ds._ts_daily_basic_short[D0]["at"] -= ds.TS_DAILY_BASIC_RETRY_AFTER_SEC
+    assert ts_box.n("daily_basic", trade_date=D0) - n0 == 1 + ds.TS_DAILY_BASIC_MAX_RETRIES
+    assert ds._ts_daily_basic_short[D0]["tries"] == 1 + ds.TS_DAILY_BASIC_MAX_RETRIES
+    assert not os.path.exists(d0_pkl)                                        # 短表始终不落盘
+
+
+def test_previous_day_daily_basic_cache_outlives_normal_ttl(ts_box):
+    """前一交易日的 daily_basic 齐了就不会再变: 落盘 20 小时后 (> 普通 TTL 12h) 退回前一日时仍读缓存不重打; 当日那份不享受长 TTL。"""
+    ts_box.daily[D1] = _daily_basic(D1, {"688578": {"pe_ttm": 13.0, "total_mv": 4_000_000.0}})
+    assert ds.fetch_daily_basic_tushare(D1, final=True) is not None
+    d1_pkl = os.path.join(str(ts_box.cache), ds._cache_key("ts_daily_basic", D1) + ".pkl")
+    old = time.time() - 20 * 3600
+    os.utime(d1_pkl, (old, old))
+    assert ds._cache_load(ds._cache_key("ts_daily_basic", D1)) is None        # 普通 TTL: 过期
+    assert ds._cache_load(ds._cache_key("ts_daily_basic", D1), ds.TS_DAILY_BASIC_FINAL_TTL_H) is not None
+    ts_box.daily[D0] = _daily_basic(D0, n_pad=0)
+    n1 = ts_box.n("daily_basic", trade_date=D1)
+    val, info = ds.fetch_valuation_tushare()
+    assert info["trade_date"] == D1 and info["fell_back_from"] == D0 and ts_box.n("daily_basic", trade_date=D1) == n1
+    assert val.set_index("code").loc["688578", "pe_ttm"] == 13.0
+    # 最新交易日那份: 20 小时前的缓存照旧按普通 TTL 重取
+    ts_box.daily[D0] = _daily_basic(D0, {"688578": {"pe_ttm": 18.9}})
+    ds._ts_daily_basic_short.clear()
+    assert ds.fetch_daily_basic_tushare(D0) is not None
+    d0_pkl = os.path.join(str(ts_box.cache), ds._cache_key("ts_daily_basic", D0) + ".pkl")
+    os.utime(d0_pkl, (old, old))
+    n0 = ts_box.n("daily_basic", trade_date=D0)
+    assert ds.fetch_daily_basic_tushare(D0) is not None and ts_box.n("daily_basic", trade_date=D0) == n0 + 1

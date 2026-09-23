@@ -143,14 +143,16 @@ def _cache_key(name: str, *args) -> str:
     return f"{name}_{h}"
 
 
-def _cache_load(key: str):
+def _cache_load(key: str, max_age_h: float | None = None):
+    """读缓存; max_age_h 不给就按 CONFIG cache_ttl_hours (12h)。只有"齐了就不会再变"的东西才该传更长的期限
+    (如前一交易日的 Tushare daily_basic 原始表)。"""
     if not CONFIG["source"]["use_cache"]:
         return None
     path = os.path.join(_CACHE_DIR, key + ".pkl")
     if not os.path.exists(path):
         return None
     age_h = (time.time() - os.path.getmtime(path)) / 3600.0
-    if age_h > CONFIG["source"]["cache_ttl_hours"]:
+    if age_h > (CONFIG["source"]["cache_ttl_hours"] if max_age_h is None else float(max_age_h)):
         return None
     try:
         with open(path, "rb") as f:
@@ -654,11 +656,22 @@ SPOT_EXTRA_FILL_COLS = ("turnover", "volume_ratio")      # 新浪也没有换手
 TS_MV_UNIT = 1e4                    # 万元 → 元
 TS_DAILY_BASIC_MIN_ROWS = 4000      # 全市场 ~5550 行; 低于此 = 当日还没出 / 只出了一部分 → 退回前一交易日
 TS_VALUATION_BACK_DAYS = 2          # 最新交易日没出时最多再往前退几个交易日
+# 当日 daily_basic 还没出时本进程什么时候再试 (2026-09-23 卡 QL-SPOT 回修): Tushare 文档口径 daily_basic「交易日每日 15~17 点
+# 之间更新」(北京); 首版写的「北京 15:45 后才齐」是从 daily 探针 (09-09..11 三天) 外推的, daily_basic 本身从没实测过, 09-24 起
+# 拿 journal 实测。流水线首取在 10:05 CEST (北京 16:05), 优质榜阶段在 ~11:5x CEST (北京 17:5x): 首取没出就记住, 隔
+# TS_DAILY_BASIC_RETRY_AFTER_SEC 后允许再打 (同一交易日本进程最多再打 TS_DAILY_BASIC_MAX_RETRIES 次, 端点调用上限 1+2=3),
+# 让优质榜拿到当日估值; 都没出才退回前一交易日。
+TS_DAILY_BASIC_RETRY_AFTER_SEC = 30 * 60
+TS_DAILY_BASIC_MAX_RETRIES = 2
+# 前一交易日 (及更早) 的 daily_basic 一旦齐了就不会再变: 退回前一日时按这个更长的期限读缓存 (普通 TTL 12h 会让"当日没出 →
+# 退前一日"的早晨把昨天已经拿过的前一日再打一次); 最新交易日那份仍按普通 TTL。
+TS_DAILY_BASIC_FINAL_TTL_H = 72.0
 TS_DAILY_BASIC_FIELDS = "ts_code,trade_date,close,pe,pe_ttm,pb,total_mv,circ_mv,turnover_rate,volume_ratio"
 TS_STOCK_BASIC_FIELDS = "ts_code,symbol,name,industry,market,list_date"
 
 _ts_state = {"valuation_warned": False}       # 「新浪快照无估值列」只 warning 一次 (每次 fetch_spot_snapshot 都会走兜底)
-_ts_daily_basic_short: dict = {}              # trade_date -> 行数: 本进程内已知"当日还没出"的日期, 不重复打端点, 也不落盘
+_ts_daily_basic_short: dict = {}              # trade_date -> {"n": 行数, "at": 上次打端点的时刻, "tries": 已打回短表的次数}:
+                                              # 本进程内已知"当日还没出"的日期, 间隔内不重复打端点, 短表也不落盘
 _ts_lock = threading.Lock()
 
 
@@ -757,18 +770,25 @@ def _valuation_trade_dates(n: int = 1 + TS_VALUATION_BACK_DAYS) -> list:
     return out
 
 
-def fetch_daily_basic_tushare(trade_date) -> pd.DataFrame | None:
+def fetch_daily_basic_tushare(trade_date, final: bool = False) -> pd.DataFrame | None:
     """某交易日全市场 daily_basic **原始表** (ts_code/pe/pe_ttm/pb/total_mv(万元)/circ_mv(万元)/turnover_rate/volume_ratio),
-    按交易日缓存 (缓存键含日期)。行数 < TS_DAILY_BASIC_MIN_ROWS (当日还没出 / 只出了一部分) 的结果**不落盘**、本进程内
-    记住不再打, 留给下一轮重试; 抛错 -> None。"""
+    按交易日缓存 (缓存键含日期); final=True 表示这是比最新交易日更早的一天 (齐了就不会再变), 缓存按
+    TS_DAILY_BASIC_FINAL_TTL_H 读。行数 < TS_DAILY_BASIC_MIN_ROWS (当日还没出 / 只出了一部分) 的结果**不落盘**、本进程内
+    记住: TS_DAILY_BASIC_RETRY_AFTER_SEC 内不再打, 之后允许再试 (最多 TS_DAILY_BASIC_MAX_RETRIES 次; 优质榜阶段比首取晚
+    1.5-2 小时, 多半就能拿到当日); 抛错 -> None。"""
     trade_date = _ymd8(trade_date)
     key = _cache_key("ts_daily_basic", trade_date)
-    c = _cache_load(key)
+    c = _cache_load(key, TS_DAILY_BASIC_FINAL_TTL_H if final else None)
     if c is not None:
         return c
     with _ts_lock:
-        if trade_date in _ts_daily_basic_short:
-            return None
+        st = _ts_daily_basic_short.get(trade_date)
+        if st is not None:
+            waited = time.time() - st["at"]
+            if st["tries"] > TS_DAILY_BASIC_MAX_RETRIES or waited < TS_DAILY_BASIC_RETRY_AFTER_SEC:
+                return None
+            log.info("Tushare daily_basic %s: %d 分钟前只有 %d 行, 再试一次 (第 %d/%d 次重试)",
+                     trade_date, int(waited // 60), st["n"], st["tries"], TS_DAILY_BASIC_MAX_RETRIES)
     try:
         df = _ts_query("daily_basic", trade_date=trade_date, fields=TS_DAILY_BASIC_FIELDS)
     except Exception as e:      # noqa: BLE001
@@ -777,10 +797,13 @@ def fetch_daily_basic_tushare(trade_date) -> pd.DataFrame | None:
     n = 0 if df is None else len(df)
     if n < TS_DAILY_BASIC_MIN_ROWS:
         with _ts_lock:
-            _ts_daily_basic_short[trade_date] = n
-        log.warning("Tushare daily_basic %s 只有 %d 行 (< %d: 当日还没出或只出了一部分), 不缓存",
-                    trade_date, n, TS_DAILY_BASIC_MIN_ROWS)
+            prev = _ts_daily_basic_short.get(trade_date)
+            _ts_daily_basic_short[trade_date] = {"n": n, "at": time.time(), "tries": (prev["tries"] + 1) if prev else 1}
+        log.warning("Tushare daily_basic %s 只有 %d 行 (< %d: 当日还没出或只出了一部分; 文档口径交易日 15~17 点更新), "
+                    "不缓存, %d 分钟后可再试", trade_date, n, TS_DAILY_BASIC_MIN_ROWS, TS_DAILY_BASIC_RETRY_AFTER_SEC // 60)
         return df
+    with _ts_lock:
+        _ts_daily_basic_short.pop(trade_date, None)
     _cache_save(key, df)
     return df
 
@@ -794,14 +817,16 @@ def fetch_valuation_tushare(trade_dates: list | None = None) -> tuple:
     dates = [_ymd8(d) for d in (trade_dates or _valuation_trade_dates())]
     tried = []
     for i, d in enumerate(dates):
-        df = fetch_daily_basic_tushare(d)
+        df = fetch_daily_basic_tushare(d, final=i > 0)       # 前一交易日及更早: 齐了就不会再变, 缓存按长期限读
         n = 0 if df is None else len(df)
         tried.append(f"{d}:{n}行")
         if df is None or n < TS_DAILY_BASIC_MIN_ROWS or "ts_code" not in df.columns:
             continue
         if i > 0:
             log.warning("Tushare daily_basic: 最新交易日 %s 的估值还没出 (%s) → 退回前一交易日 %s (%d 行); "
-                        "北京 15:45 后才齐, 明天这一行不该再出现", dates[0], ", ".join(tried[:-1]), d, n)
+                        "文档口径交易日 15~17 点 (北京) 更新, 本进程 %d 分钟后会对当日再试 (最多 %d 次) —— 优质榜那行若仍是"
+                        "前一交易日且连着几天如此, 查 Tushare 镜像 daily_basic 入库时间",
+                        dates[0], ", ".join(tried[:-1]), d, n, TS_DAILY_BASIC_RETRY_AFTER_SEC // 60, TS_DAILY_BASIC_MAX_RETRIES)
 
         def _col(name):
             return _to_num(df[name]) if name in df.columns else pd.Series(np.nan, index=df.index)
