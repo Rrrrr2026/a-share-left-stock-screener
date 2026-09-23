@@ -505,8 +505,10 @@ def _em_get(path: str, params: dict, timeout: int = 8):
 
 def _spot_from_em_direct() -> pd.DataFrame | None:
     """全A快照: 直连东财 clist 分页拉取(不经 akshare), 带主机故障转移。
-    一次拿到 代码/名称/价格/量额/换手/量比/PE/PB/市值, 即股票池 + 估值字段。"""
-    fields = "f12,f14,f2,f3,f5,f6,f8,f9,f10,f15,f16,f20,f21,f23,f100"  # f100=所属行业
+    一次拿到 代码/名称/价格/量额/换手/量比/PE/PB/市值, 即股票池 + 估值字段。
+    **PE 口径 (2026-09-23 老板拍板 ②)**: pe_ttm ← **f115 (市盈率 TTM)**, 与 Tushare daily_basic.pe_ttm 同口径; f9 (动态市盈率,
+    按最新一期年化) 另存 pe_dynamic 只留痕、不进任何门槛 —— 之前 pe_ttm 装的其实是 f9, 看板标签写着 PE-TTM (见 PE_BASIS)。"""
+    fields = "f12,f14,f2,f3,f5,f6,f8,f9,f10,f15,f16,f20,f21,f23,f100,f115"  # f100=所属行业, f115=市盈率TTM, f9=动态市盈率
     fs = "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048"   # 沪深主板/创业/科创/北交
     rows, pn, pz = [], 1, 200
     total = None
@@ -542,13 +544,9 @@ def _spot_from_em_direct() -> pd.DataFrame | None:
     if total and len(rows) < total * 0.95:
         log.warning("东财快照只取到 %d/%d 只(缺 %.0f%%), 本轮扫描范围偏小",
                     len(rows), total, (1 - len(rows) / total) * 100)
-    df = pd.DataFrame(rows).rename(columns={
-        "f12": "code", "f14": "name", "f2": "price", "f3": "pct_chg",
-        "f5": "volume", "f6": "amount", "f8": "turnover", "f9": "pe_ttm",
-        "f10": "volume_ratio", "f15": "high", "f16": "low",
-        "f20": "total_mv", "f21": "float_mv", "f23": "pb", "f100": "industry"})
+    df = pd.DataFrame(rows).rename(columns=EM_SPOT_COLUMNS)
     keep = [c for c in ("code", "name", "price", "pct_chg", "volume", "amount",
-                        "turnover", "pe_ttm", "volume_ratio", "high", "low",
+                        "turnover", "pe_ttm", "pe_dynamic", "volume_ratio", "high", "low",
                         "total_mv", "float_mv", "pb", "industry") if c in df.columns]
     df = df[keep].copy()
     for col in df.columns:
@@ -558,8 +556,36 @@ def _spot_from_em_direct() -> pd.DataFrame | None:
     if "industry" in df.columns:              # "-" / "" 视为无行业
         df["industry"] = df["industry"].astype(str).str.strip()
         df.loc[df["industry"].isin(["-", "", "nan", "None"]), "industry"] = None
-    log.info("东财快照(直连 %s): %d 只", _em_host_ok, len(df))
+    log.info("东财快照(直连 %s): %d 只%s", _em_host_ok, len(df), _pe_basis_check_text(df))
     return df
+
+
+# 东财 push2 clist 字段 → 快照列 (单独成表是让用例能锁住 f115 → pe_ttm / f9 → pe_dynamic 这两条映射)。
+EM_SPOT_COLUMNS = {
+    "f12": "code", "f14": "name", "f2": "price", "f3": "pct_chg",
+    "f5": "volume", "f6": "amount", "f8": "turnover",
+    "f115": "pe_ttm",           # 市盈率 TTM (老板 2026-09-23 拍板 ②; 与 Tushare daily_basic.pe_ttm 同口径)
+    "f9": "pe_dynamic",         # 动态市盈率, 只留痕 (改前它就是 pe_ttm 列里的数)
+    "f10": "volume_ratio", "f15": "high", "f16": "low",
+    "f20": "total_mv", "f21": "float_mv", "f23": "pb", "f100": "industry",
+}
+
+
+def _pe_basis_check_text(df) -> str:
+    """东财直连快照的 PE 口径自检文本 (只进日志): pe_ttm (f115) / pe_dynamic (f9) 各多少只非空, 两者都有的票 TTM/动态 的中位比。
+    东财恢复那天 journal 里这一段就是「f115 确实是 TTM」的证据: 正常应是 非空数同量级、中位比 ~1.0-1.1 (增长股 TTM 略高);
+    pe_ttm 非空 0 = 字段号错了 (那样 spot_lacks_valuation 会判缺 pe_ttm 并让 Tushare daily_basic 补上, 榜不会拿动态当 TTM)。"""
+    if df is None or "pe_ttm" not in df.columns:
+        return ""
+    ttm = _to_num(df["pe_ttm"])
+    txt = "; PE 口径 ttm (f115 非空 %d" % int(ttm.notna().sum())
+    if "pe_dynamic" in df.columns:
+        dyn = _to_num(df["pe_dynamic"])
+        both = ttm.notna() & dyn.notna() & (dyn > 0) & (ttm > 0)
+        txt += ", f9 动态非空 %d" % int(dyn.notna().sum())
+        if int(both.sum()):
+            txt += ", 两者都有 %d 只 TTM/动态 中位 %.3f" % (int(both.sum()), float((ttm[both] / dyn[both]).median()))
+    return txt + ")"
 
 
 def _spot_from_em() -> pd.DataFrame | None:
@@ -572,6 +598,9 @@ def _spot_from_em() -> pd.DataFrame | None:
         if _is_conn_error(e):
             _mark_em_down(e)
         return None
+    # akshare stock_zh_a_spot_em 只有「市盈率-动态」(f9), 没有 TTM 列 (2026-09-23 老板拍板 ②): 动态**不再**塞进 pe_ttm,
+    # 另存 pe_dynamic 留痕; pe_ttm 缺 → _spot_with_fallbacks/fill_spot_valuation 用 Tushare daily_basic 的 pe_ttm 补。
+    # pe_ttm 的候选名只写 TTM 专名 (rename_normalize 是子串匹配, 「市盈率」会命中「市盈率-动态」, 所以不能列它)。
     df = rename_normalize(raw, {
         "code":         ["代码"],
         "name":         ["名称"],
@@ -583,7 +612,8 @@ def _spot_from_em() -> pd.DataFrame | None:
         "low":          ["最低"],
         "volume_ratio": ["量比"],
         "turnover":     ["换手率"],
-        "pe_ttm":       ["市盈率-动态", "市盈率"],
+        "pe_ttm":       list(PE_TTM_COLUMN_NAMES),
+        "pe_dynamic":   ["市盈率-动态"],
         "pb":           ["市净率"],
         "total_mv":     ["总市值"],
         "float_mv":     ["流通市值"],
@@ -609,6 +639,7 @@ def _spot_from_sina() -> pd.DataFrame | None:
     # (rename_normalize 缺列不报错), 但**别再指望它们出现**: 缺列不是异常, 由 fill_spot_valuation 用 Tushare
     # daily_basic 补 (只 warning 一次「新浪快照无估值列, 改用 Tushare daily_basic 补」), 行业列由
     # fill_spot_industry 补。09-22/23 优质榜入池 0 就是因为这里的列一直是空的、而下游没人补。
+    # 「市盈率」(老版 akshare 才有) 不是 TTM 口径, 2026-09-23 起只留痕到 pe_dynamic, **不进 pe_ttm** (pe_ttm 缺 → Tushare 补)。
     df = rename_normalize(raw, {
         "code":     ["代码"],
         "name":     ["名称"],
@@ -619,7 +650,8 @@ def _spot_from_sina() -> pd.DataFrame | None:
         "high":     ["最高"],
         "low":      ["最低"],
         "turnover": ["换手率"],
-        "pe_ttm":   ["市盈率"],
+        "pe_ttm":   list(PE_TTM_COLUMN_NAMES),
+        "pe_dynamic": ["市盈率"],
         "pb":       ["市净率"],
     })
     if "code" not in df.columns:
@@ -642,15 +674,26 @@ def _spot_from_sina() -> pd.DataFrame | None:
 # 总市值列 → spot_map 里 pe_ttm/total_mv 全空 → 优质榜 pe/cap/up 三门必挂; 行业映射同时挂 → dom 也挂 → 最多过
 # q4/y4/roe 三条 < 4 → 入池 0 → 按 QL-EMPTY 规则拒发、沿用 09-21 的榜。报告期 20/20 到齐, 不是财报或榜逻辑的问题。
 #
-# 兜底原则: **东财优先不变** —— 东财直连快照自带 f9/f20/f21/f23/f100, 什么都不触发, 结果与旧路径一字不差; 只有快照
-# 缺估值列 (新浪; akshare 东财则只缺行业列) 或行业映射不可用时才动 Tushare, 每种 api 每天一次调用 (原始表按日缓存到
+# 兜底原则: **东财优先不变** —— 东财直连快照自带 f115/f20/f21/f23/f100, 什么都不触发; 只有快照
+# 缺估值列 (新浪缺全部; akshare 东财缺 pe_ttm 与行业列) 或行业映射不可用时才动 Tushare, 每种 api 每天一次调用 (原始表按日缓存到
 # data/cache, 与 spot 缓存同法), 经 tushare_client.query 的进程级硬期限 + 限频桶 + 重试。Tushare 也挂 → 什么都不造,
 # 快照原样交出去, 优质榜照 QL-EMPTY 规则拒发沿用旧榜 (不造榜)。
 #
 # **单位**: Tushare daily_basic 的 total_mv / circ_mv 是**万元**, 东财 f20/f21 是**元**, quality.mcap_b = mv/1e8 按元算
 # → 这里乘 TS_MV_UNIT 换成元再交出去 (688578 艾力斯 09-23: 5,058,900 万元 → 5.06e10 元 → 506 亿; 09-21 东财口径 459 亿,
-# 差的是两天涨幅, 同量级)。pe_ttm 取 Tushare pe_ttm (真 TTM; 东财 f9 是动态市盈率, 增长股上 TTM 略高: 艾力斯 18.9 vs 14.9),
-# 亏损股 pe_ttm 为空属正常 (09-23: 5556 行里 3924 非空)。字段名/门槛/评分一律不改。
+# 差的是两天涨幅, 同量级)。pe_ttm 取 Tushare pe_ttm (真 TTM; 亏损股 pe_ttm 为空属正常, 09-23: 5556 行里 3924 非空)。
+# 字段名/门槛/评分一律不改。
+#
+# **PE 口径 (2026-09-23 老板拍板 ②, 卡 IND-PE)**: 快照的 pe_ttm 列**只装 TTM**: 东财直连 f115 / Tushare daily_basic.pe_ttm。
+# 改前东财直连塞的是 f9 (动态市盈率, 最新一期年化), 看板/优质榜标签却写 PE-TTM —— 校验员用 09-21 东财 × 09-23 daily_basic
+# 合并 5556 只可比: 门槛 0<pe<31 有 163 只由不过变过 / 332 只由过变不过 (~9%), 中位 TTM/动态 = 1.088。akshare 东财
+# (stock_zh_a_spot_em 只有「市盈率-动态」) 与新浪 (老版才有「市盈率」, 非 TTM) 兜底**不把动态当 TTM**: 动态另存 pe_dynamic 留痕,
+# pe_ttm 缺 → fill_spot_valuation 用 Tushare daily_basic 补 (只补空列, 已有的 pb/市值不碰), valuation_source 记 tushare_daily_basic。
+# 留痕: spot_sources()/优质榜 meta/看板与快照 meta 都带 pe_basis = PE_BASIS; 历史快照/榜的 meta **没有** pe_basis 的按「动态」解释
+# (东财日) —— 历史文件不改。
+PE_BASIS = "ttm"
+#: 快照源里能当 pe_ttm 用的列名 (rename_normalize 子串匹配, 所以只写 TTM 专名, **绝不**写「市盈率」—— 它会命中「市盈率-动态」)
+PE_TTM_COLUMN_NAMES = ("市盈率-TTM", "市盈率(TTM)", "市盈率TTM", "PE(TTM)", "pe_ttm")
 SPOT_VALUATION_COLS = ("pe_ttm", "pb", "total_mv", "float_mv")
 SPOT_EXTRA_FILL_COLS = ("turnover", "volume_ratio")      # 新浪也没有换手率/量比; daily_basic 同名同单位 (%, 倍) 顺手补
 TS_MV_UNIT = 1e4                    # 万元 → 元
@@ -708,26 +751,32 @@ def spot_source_of(df) -> str:
     return "新浪"
 
 
-def spot_lacks_valuation(df) -> bool:
-    """快照是否缺估值列 (pe_ttm / total_mv 列不存在, 或存在但整列为空)。空表不算缺。"""
+def spot_missing_valuation_cols(df) -> list:
+    """快照缺哪些估值列 (pe_ttm / total_mv 列不存在, 或存在但整列为空) -> 缺的列名列表; 空表不算缺。
+    akshare 东财快照 (只有市盈率-动态) 缺 pe_ttm 不缺 total_mv; 新浪两个都缺; 东财直连 f115 若整列空 (字段号错/源改了)
+    也算缺 pe_ttm —— 这条判据就是「动态永远不会被当 TTM 用」的保险: 缺就让 Tushare daily_basic 补真 TTM。"""
     if df is None or len(df) == 0:
-        return False
-    for c in ("pe_ttm", "total_mv"):
-        if c not in df.columns or not _to_num(df[c]).notna().any():
-            return True
-    return False
+        return []
+    return [c for c in ("pe_ttm", "total_mv") if c not in df.columns or not _to_num(df[c]).notna().any()]
+
+
+def spot_lacks_valuation(df) -> bool:
+    """快照是否缺估值列 (pe_ttm / total_mv 任一列不存在, 或存在但整列为空)。空表不算缺。"""
+    return bool(spot_missing_valuation_cols(df))
 
 
 def spot_sources(df) -> dict:
-    """优质榜 meta 用的来源留痕 -> {spot_source, valuation_source, valuation_trade_date?}。"""
+    """优质榜 meta 用的来源留痕 -> {spot_source, valuation_source, pe_basis, valuation_trade_date?, valuation_filled?}。
+    pe_basis 恒为 PE_BASIS ("ttm"): 快照的 pe_ttm 列只装 TTM (东财 f115 / Tushare pe_ttm), 动态在 pe_dynamic 里。"""
     src = spot_source_of(df)
     if df is None or len(df) == 0:
-        return {"spot_source": src, "valuation_source": None}
+        return {"spot_source": src, "valuation_source": None, "pe_basis": PE_BASIS}
     a = getattr(df, "attrs", None) or {}
     if a.get("valuation_source"):
-        return {"spot_source": src, "valuation_source": str(a["valuation_source"]),
-                "valuation_trade_date": a.get("valuation_trade_date")}
-    return {"spot_source": src, "valuation_source": "缺失" if spot_lacks_valuation(df) else "东财"}
+        return {"spot_source": src, "valuation_source": str(a["valuation_source"]), "pe_basis": PE_BASIS,
+                "valuation_trade_date": a.get("valuation_trade_date"),
+                "valuation_filled": list(a.get("valuation_filled") or [])}
+    return {"spot_source": src, "valuation_source": "缺失" if spot_lacks_valuation(df) else "东财", "pe_basis": PE_BASIS}
 
 
 def _store_trade_days_before(mx: str, n: int) -> list:
@@ -849,17 +898,19 @@ def fill_spot_valuation(spot: pd.DataFrame | None) -> tuple:
     只补整列为空的列, 已有的列一个数都不碰; Tushare 也拿不到 → 快照原样、info.valuation_source = 缺失。"""
     src = spot_source_of(spot)
     if spot is None or len(spot) == 0:
-        return spot, {"spot_source": src, "valuation_source": None}
-    if not spot_lacks_valuation(spot):
-        return spot, {"spot_source": src, "valuation_source": "东财"}
+        return spot, {"spot_source": src, "valuation_source": None, "pe_basis": PE_BASIS}
+    missing = spot_missing_valuation_cols(spot)
+    if not missing:
+        return spot, {"spot_source": src, "valuation_source": "东财", "pe_basis": PE_BASIS}
     if not _ts_state["valuation_warned"]:
         _ts_state["valuation_warned"] = True
-        log.warning("%s快照无估值列 (市盈率/市净率/总市值; 老版 akshare 才有), 改用 Tushare daily_basic 补", src)
+        log.warning("%s快照无估值列 (缺 %s%s), 改用 Tushare daily_basic 补", src, "/".join(missing),
+                    "; 动态市盈率不当 TTM 用" if "pe_dynamic" in spot.columns else "; 市盈率/市净率/总市值 老版 akshare 才有")
     val, info = fetch_valuation_tushare()
     if val is None:
         log.warning("估值列兜底失败: Tushare daily_basic 也不可用 (%s) — 快照仍无估值列, 优质榜将按 QL-EMPTY 规则拒发、沿用旧榜",
                     info.get("error"))
-        return spot, {"spot_source": src, "valuation_source": "缺失", "error": info.get("error")}
+        return spot, {"spot_source": src, "valuation_source": "缺失", "pe_basis": PE_BASIS, "error": info.get("error")}
     out = spot.copy()
     out["code"] = out["code"].astype(str).str.zfill(6)
     v = val.set_index("code")
@@ -881,10 +932,11 @@ def fill_spot_valuation(spot: pd.DataFrame | None) -> tuple:
         out.attrs["spot_source"] = src
         out.attrs["valuation_source"] = "tushare_daily_basic"
         out.attrs["valuation_trade_date"] = info["trade_date"]
+        out.attrs["valuation_filled"] = list(filled)
     except Exception:           # noqa: BLE001
         pass
-    return out, {"spot_source": src, "valuation_source": "tushare_daily_basic",
-                 "valuation_trade_date": info["trade_date"], "valuation_n": n_hit,
+    return out, {"spot_source": src, "valuation_source": "tushare_daily_basic", "pe_basis": PE_BASIS,
+                 "valuation_trade_date": info["trade_date"], "valuation_n": n_hit, "valuation_filled": list(filled),
                  "fell_back_from": info.get("fell_back_from")}
 
 

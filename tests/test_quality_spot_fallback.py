@@ -15,13 +15,14 @@ datasource 的新浪列映射还留着期待) → spot_map 里 pe_ttm/total_mv �
     东财直连快照两样都齐 → 原对象原样返回, 一次 Tushare 调用都不发。
   · daily_basic 的交易日 = 价格库个股末日 (→ trade_cal → 工作日近似); 当日行数 < 4000 (还没出) → 退回前一交易日 + warning;
     (09-23 回修) 短表本进程 30 分钟后允许再打 (最多 2 次, 端点上限 1+2), 优质榜阶段拿当日; 前一交易日缓存按 72h 读。
-  · (09-23 回修) 东财日常态 = _industry_map_ex ② 东财批量 f100 (成分口径 09-01 起每天 62-1041 只, 从没到过 3000): INFO 不 WARNING,
-    零 Tushare; 研发豁免 is_fin_industry 去掉 f100 的 Ⅱ/Ⅲ 后缀再精确比 (银行Ⅱ 也豁免)。
+  · (09-23 卡 IND-PE, 老板拍板 ①) 行业口径唯一 = 东财全市场分类: quality._industry_map_ex 只走 ds.fetch_industry_map() —— 东财批量
+    f100 (INFO) / 东财当日缓存 (INFO) / Tushare stock_basic (WARNING) 三态, **成分口径 (fetch_industry_list × fetch_industry_cons)
+    永不再用, 成分能给 5000 只也不选**; 覆盖 < 3000 标 (部分) 并 WARNING 降级; 研发豁免 is_fin_industry 去掉 f100 的 Ⅱ/Ⅲ 后缀再精确比。
   · fetch_industry_map: 东财 push2 各主机都不可达 → Tushare stock_basic, 名字经 TS_INDUSTRY_ALIAS 换成东财口径, 记
-    映射到东财口径 / 原样沿用 Tushare 名 / 空 三类计数; quality._industry_map_ex: 东财成分 (>=3000 只) → 东财批量/Tushare
-    (>=3000) → 谁多用谁 (降级 warning)。
+    映射到东财口径 / 原样沿用 Tushare 名 / 空 三类计数。
   · Tushare 也挂 → 快照原样、不造数, 优质榜照 QL-EMPTY 拒发沿用旧榜。
-  · quality meta 增 spot_source / valuation_source / valuation_trade_date / industry_source / industry_map_coverage。
+  · quality meta 增 spot_source / valuation_source / valuation_trade_date / industry_source / industry_map_coverage;
+    (卡 IND-PE) 再增 pe_basis = "ttm" / industry_basis = "em_f100" (PE 口径的用例在 test_ind_pe_basis.py)。
 
 对照数 (服务器 09-23 真数据, 见 CHRONICLE): 688578 艾力斯 daily_basic total_mv 5,058,900 万元 → 506 亿 (09-21 东财 459 亿,
 差两天涨幅 +9.3%); 300750 宁德时代 1.39e8 万元 → 13,928 亿 (09-21 13,748)。用例里用 4,590,000 万元 → mcap_b 459 钉住换算。
@@ -32,6 +33,7 @@ datasource 的新浪列映射还留着期待) → spot_map 里 pe_ttm/total_mv �
 """
 from __future__ import annotations
 import datetime as dt
+import json
 import logging
 import os
 import sys
@@ -298,8 +300,8 @@ def test_spot_source_detection_by_columns_and_attrs():
     assert ds.spot_lacks_valuation(hollow)                          # 列在但整列空 = 缺
     assert ds.spot_source_of(None) == "无" and not ds.spot_lacks_valuation(None)
     assert not ds.spot_lacks_valuation(sina.iloc[0:0])              # 空表不算缺 (上游自己会报股票池为空)
-    assert ds.spot_sources(em) == {"spot_source": "东财直连", "valuation_source": "东财"}
-    assert ds.spot_sources(sina)["valuation_source"] == "缺失"
+    assert ds.spot_sources(em) == {"spot_source": "东财直连", "valuation_source": "东财", "pe_basis": "ttm"}
+    assert ds.spot_sources(sina)["valuation_source"] == "缺失" and ds.spot_sources(sina)["pe_basis"] == "ttm"
 
 
 # ============================================================ (a) 估值列兜底: 单位 / 列 / 只警告一次 / 缓存
@@ -318,7 +320,9 @@ def test_fill_valuation_from_tushare_converts_wan_to_yuan(ts_box, caplog):
     assert info["valuation_source"] == "tushare_daily_basic" and info["valuation_trade_date"] == D0
     assert info["fell_back_from"] is None and info["spot_source"] == "新浪"
     assert out.attrs["valuation_source"] == "tushare_daily_basic" and out.attrs["spot_source"] == "新浪"
-    assert ds.spot_sources(out) == {"spot_source": "新浪", "valuation_source": "tushare_daily_basic", "valuation_trade_date": D0}
+    assert ds.spot_sources(out) == {"spot_source": "新浪", "valuation_source": "tushare_daily_basic", "pe_basis": "ttm",
+                                    "valuation_trade_date": D0,
+                                    "valuation_filled": ["pe_ttm", "pb", "total_mv", "float_mv", "turnover", "volume_ratio"]}
     warns = [m for m in _msgs(caplog) if "新浪快照无估值列" in m]
     assert len(warns) == 1 and "Tushare daily_basic" in warns[0]
     assert any("新浪快照无估值列 → Tushare daily_basic (20260923) 补" in m for m in _msgs(caplog, logging.INFO))
@@ -430,31 +434,50 @@ def test_eastmoney_snapshot_untouched_and_tushare_never_called(ts_box, monkeypat
     out = ds._spot_with_fallbacks(em)
     assert out is em                                             # 原对象
     pd.testing.assert_frame_equal(out, before)                   # 一个数都没动
-    assert ds.spot_sources(out) == {"spot_source": "东财直连", "valuation_source": "东财"}
+    assert ds.spot_sources(out) == {"spot_source": "东财直连", "valuation_source": "东财", "pe_basis": "ttm"}
     assert ts_box.calls == [] and seen == []                      # 假 Tushare 与 push2 记录器都是空的
 
 
-def test_build_with_eastmoney_spot_and_cons_map_takes_old_path(sandbox, monkeypatch):
-    """东财直连快照 + 东财成分映射覆盖 >= 3000 只: 榜与旧路径一字不差 (先按旧函数算一份对照), meta 记东财, 零 Tushare 调用。"""
+def _cons_recorder(monkeypatch, n=5000, industry="银行"):
+    """东财成分接口的记录器: 假装成分口径今天真能给 n 只 (生产 09-01 起从没有过) —— 卡 IND-PE 起 quality 一次都不许问它。"""
+    asked = []
+    codes = [f"{i:06d}" for i in range(1, n + 1)]
+    monkeypatch.setattr(ds, "fetch_industry_list", lambda: (asked.append("list"), pd.DataFrame({"industry": [industry]}))[1])
+    monkeypatch.setattr(ds, "fetch_industry_cons",
+                        lambda ind: (asked.append("cons:" + str(ind)), pd.DataFrame({"code": codes, "name": codes}))[1])
+    return asked
+
+
+def test_build_with_eastmoney_spot_takes_f100_batch_and_never_asks_cons(sandbox, monkeypatch, caplog):
+    """(c) 东财直连快照 + 东财批量 f100 可达 + 成分接口能给 5000 只: 榜的分组按 f100 批量 (与直接喂这份映射的 _score_rows 一字
+    不差), meta 记 东财 / pe_basis ttm / industry_basis em_f100, 成分接口零调用, 零 Tushare。"""
     box = sandbox
     box["spot"] = _em_spot(CODES)
-    big = {f"{i:06d}": "化学制药" for i in range(1, 3200)}
-    big.update({c: "化学制药" for c in CODES})
-    monkeypatch.setattr(q, "_industry_map", lambda ds_: big)
-    seen = _push2_recorder(monkeypatch)
-    asked = []
-    monkeypatch.setattr(ds, "fetch_industry_map", lambda: (asked.append(1), REAL_FETCH_INDUSTRY_MAP())[1])
+    batch = {f"{i:06d}": "化学制药" for i in range(1, 5001)}
+    batch.update({c: "化学制药" for c in CODES})
+    monkeypatch.setattr(ds, "_industry_map_em_hosts", lambda: (dict(batch), "push2delay.eastmoney.com"))
+    asked = _cons_recorder(monkeypatch)
     spot_map = {str(r["code"]).zfill(6): r for r in box["spot"].to_dict("records")}
-    expect = q._score_rows(box["reports"], spot_map, big)          # 旧路径: 直接喂东财快照 + 东财成分映射
-    res = q.build_quality()
+    expect = q._score_rows(box["reports"], spot_map, batch)
+    with caplog.at_level(logging.INFO):
+        res = q.build_quality()
     assert res is not None and len(res["picks"]) == q.TOP_N
     m = res["meta"]
-    assert (m["spot_source"], m["valuation_source"], m["industry_source"]) == ("东财直连", "东财", "东财成分")
-    assert m["industry_map_coverage"] == {"source": "东财成分", "n": len(big)} and m["valuation_trade_date"] is None
+    assert (m["spot_source"], m["valuation_source"], m["industry_source"]) == ("东财直连", "东财", "东财")
+    assert m["pe_basis"] == "ttm" and m["industry_basis"] == "em_f100" and m["valuation_trade_date"] is None
+    assert m["industry_map_coverage"]["source"] == "东财" and m["industry_map_coverage"]["n"] == len(batch)
+    assert m["industry_map_coverage"]["basis"] == "em_f100" and "em_cons_n" not in m["industry_map_coverage"]
     got = sorted(expect, key=lambda r: (-r["n_pass"], -r["score"]))[:q.TOP_N]
     assert [(p["code"], p["pe"], p["mcap_b"], p["gates"], p["score"]) for p in res["picks"]] == \
            [(p["code"], p["pe"], p["mcap_b"], p["gates"], p["score"]) for p in got]
-    assert box["ts"].calls == [] and seen == [] and asked == []     # 零 Tushare / 零 push2 / 没问过批量映射
+    assert box["ts"].calls == [] and asked == []                     # 零 Tushare / 成分接口一次没问
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(x.startswith("行业映射: 来源 东财批量 (push2 clist f100 全市场分类, 主机 push2delay.eastmoney.com), 覆盖 %d 只" % len(batch))
+               for x in msgs)
+    assert any("| PE 口径 ttm (行业口径 em_f100)" in x and x.startswith("优质榜数据来源: 快照 东财直连 | 估值 东财 | 行业 东财 覆盖")
+               for x in msgs)
+    hist = json.load(open(os.path.join(str(box["dash"]), "history", f"quality_{TODAY}.json"), encoding="utf-8"))
+    assert hist["pe_basis"] == "ttm" and hist["industry_basis"] == "em_f100" and len(hist["picks"]) == q.TOP_N
 
 
 # ============================================================ (a) 全链路: 新浪快照 + Tushare 补 → 入池 > 0, 单位对
@@ -470,7 +493,7 @@ def test_build_with_sina_spot_publishes_via_tushare(sandbox, caplog):
     cov = m["industry_map_coverage"]
     assert cov["source"] == "tushare_stock_basic" and cov["total"] == 5000 + 31 + 4
     assert cov["mapped"] == 5000 + 31 + 2 and cov["kept"] == 1 and cov["empty"] == 1 and cov["kept_names"] == ["电气设备"]
-    assert cov["em_cons_n"] == 0
+    assert "em_cons_n" not in cov and cov["basis"] == "em_f100" and m["pe_basis"] == "ttm" and m["industry_basis"] == "em_f100"
     ai = next(p for p in res["picks"] if p["code"] == "688578")
     assert ai["mcap_b"] == 459 and ai["pe"] == 14.9 and ai["industry"] == "化学制药"
     assert ai["gates"]["pe"] and ai["gates"]["cap"] and ai["gates"]["q4"] and ai["gates"]["y4"] and ai["gates"]["roe"]
@@ -484,8 +507,9 @@ def test_build_with_sina_spot_publishes_via_tushare(sandbox, caplog):
     assert any("新浪快照无估值列 → Tushare daily_basic (20260923) 补" in x for x in msgs)
     assert any(x.startswith("行业映射: 东财不可达 (所有 push2 主机), Tushare stock_basic 覆盖 5034/5035") for x in msgs)
     assert any("优质榜数据来源: 快照 新浪 | 估值 tushare_daily_basic (20260923) | 行业 tushare_stock_basic 覆盖 5034 只" in x
-               for x in msgs)
-    assert any("行业映射: 东财成分口径只覆盖 0 只 (< 3000), 改用 tushare_stock_basic 覆盖 5034/5035 只" in x for x in msgs)
+               and x.endswith("| PE 口径 ttm (行业口径 em_f100)") for x in msgs)
+    assert any(x.startswith("行业映射: 来源 tushare_stock_basic (东财 push2 不可达), 覆盖 5034/5035 只 (映射到东财口径 5033")
+               for x in _msgs(caplog))                                  # 三态之三: Tushare → WARNING
     # 看板文件里的 meta 同样带来源留痕
     assert q._parse_ql_js(q.QL_JS)["meta"]["valuation_source"] == "tushare_daily_basic"
 
@@ -515,7 +539,7 @@ def test_tushare_down_keeps_snapshot_bare_and_board_refuses(sandbox, caplog):
     assert len(errs) == 1 and "入池 0" in errs[0]
     assert any("优质榜看板沿用 2026-09-21 的榜" in m for m in _msgs(caplog, logging.INFO))
     assert any("优质榜数据来源: 快照 新浪 | 估值 缺失 | 行业 缺失 覆盖 0 只" in m for m in _msgs(caplog, logging.INFO))
-    assert any(m.startswith("行业映射: 东财成分 / 东财批量 / Tushare stock_basic 都不可用") for m in _msgs(caplog))
+    assert any(m.startswith("行业映射: 来源 缺失 (东财 f100 批量 / Tushare stock_basic 都不可用") for m in _msgs(caplog))
 
 
 # ============================================================ 行业映射兜底
@@ -564,20 +588,30 @@ def test_fill_spot_industry_from_batch_map(ts_box):
     assert full.loc[0, "industry"] == "化学制药" and full.loc[0, "pe_ttm"] == 14.9
 
 
-def test_quality_industry_map_ex_orders_em_cons_then_batch_then_partial(ts_box, monkeypatch, caplog):
-    big = {f"{i:06d}": "化学制药" for i in range(1, 3100)}
-    monkeypatch.setattr(q, "_industry_map", lambda ds_: big)
-    monkeypatch.setattr(ds, "fetch_industry_map", lambda: (_ for _ in ()).throw(AssertionError("东财成分够用时不该问批量映射")))
-    assert q._industry_map_ex(ds) == (big, "东财成分", {"source": "东财成分", "n": len(big)})
-    monkeypatch.setattr(ds, "fetch_industry_map", REAL_FETCH_INDUSTRY_MAP)   # 别用 monkeypatch.undo(): 它会把夹具的打桩一起撤掉 → 真联网
-    small = {f"{i:06d}": "化学制药" for i in range(1, 486)}                   # 09-21 形态: 6/90 个行业 485 只
-    monkeypatch.setattr(q, "_industry_map", lambda ds_: small)
+def test_quality_industry_map_ex_never_uses_cons_even_when_cons_is_huge(ts_box, monkeypatch, caplog):
+    """(c) 三态顺序 东财批量 → Tushare → (部分); 成分接口给 5000 只也不问、不选 (卡 IND-PE, 老板拍板 ①)。"""
+    asked = _cons_recorder(monkeypatch, n=5000)
+    batch = {f"{i:06d}": "化学制药" for i in range(1, 3100)}
+    monkeypatch.setattr(ds, "_industry_map_em_hosts", lambda: (dict(batch), "push2.eastmoney.com"))
+    with caplog.at_level(logging.INFO, logger="ashare.quality"):
+        m, src, info = q._industry_map_ex(ds)
+    assert (m, src) == (batch, "东财") and info["n"] == len(batch) and info["basis"] == "em_f100" and "em_cons_n" not in info
+    assert asked == [] and ts_box.calls == []                                 # 成分零调用, Tushare 零调用
+    assert _msgs(caplog) == []
+    assert any(x.startswith("行业映射: 来源 东财批量 (push2 clist f100 全市场分类, 主机 push2.eastmoney.com), 覆盖 3099 只")
+               for x in [r.getMessage() for r in caplog.records])
+    # 东财不可达 → Tushare (WARNING), 成分仍零调用 (先删掉上一步落盘的东财按日缓存 ind_map, 否则读到的是「东财当日缓存」—— 那正是生产要的)
+    monkeypatch.setattr(ds, "_ind_map", None)
+    monkeypatch.setattr(ds, "_industry_map_em_hosts", lambda: ({}, None))
+    os.remove(os.path.join(str(ts_box.cache), ds._cache_key("ind_map", TODAY) + ".pkl"))
+    caplog.clear()
     with caplog.at_level(logging.WARNING, logger="ashare.quality"):
         m, src, info = q._industry_map_ex(ds)
-    assert src == "tushare_stock_basic" and len(m) == 5034 and info["em_cons_n"] == 485 and info["mapped"] == 5033
-    assert any("东财成分口径只覆盖 485 只 (< 3000), 改用 tushare_stock_basic 覆盖 5034/5035 只 (映射到东财口径 5033" in x
+    assert src == "tushare_stock_basic" and len(m) == 5034 and info["mapped"] == 5033 and "em_cons_n" not in info
+    assert any(x.startswith("行业映射: 来源 tushare_stock_basic (东财 push2 不可达), 覆盖 5034/5035 只 (映射到东财口径 5033")
                for x in _msgs(caplog))
-    # 批量那份也不够 3000 → 谁多用谁, 标 (部分)。先删掉按日缓存的 stock_basic 原始表, 否则下一次读的还是上面那份 (那正是生产要的行为)
+    assert asked == []
+    # Tushare 那份也不够 3000 → 仍用, 标 (部分) + 降级 WARNING。先删掉按日缓存的 stock_basic 原始表, 否则下一次读的还是上面那份
     sb_pkl = os.path.join(str(ts_box.cache), ds._cache_key("ts_stock_basic", TODAY) + ".pkl")
     monkeypatch.setattr(ds, "_ind_map", None)
     os.remove(sb_pkl)
@@ -585,13 +619,17 @@ def test_quality_industry_map_ex_orders_em_cons_then_batch_then_partial(ts_box, 
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="ashare.quality"):
         m, src, info = q._industry_map_ex(ds)
-    assert src == "tushare_stock_basic(部分)" and len(m) == 601 and info["em_cons_n"] == 485
-    assert any("都低于 3000 → 用后者, 龙头判定降级" in x for x in _msgs(caplog))
+    assert src == "tushare_stock_basic(部分)" and len(m) == 601 and info["n"] == 601
+    assert any("覆盖 601/601 只" in x and x.endswith("— 低于 3000 只, 龙头判定降级") for x in _msgs(caplog))
+    # 东财批量也可能"部分" (主机只回了一页): 同样标 (部分) 并 WARNING, 不悄悄当全量
     monkeypatch.setattr(ds, "_ind_map", None)
-    os.remove(sb_pkl)
-    ts_box.stock_basic = _stock_basic({"601398": "银行"}, n_pad=100)
-    m, src, info = q._industry_map_ex(ds)
-    assert src == "东财成分(部分)" and m == small
+    monkeypatch.setattr(ds, "_industry_map_em_hosts", lambda: ({f"{i:06d}": "化学制药" for i in range(1, 101)}, "push2.eastmoney.com"))
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="ashare.quality"):
+        m, src, info = q._industry_map_ex(ds)
+    assert src == "东财(部分)" and len(m) == 100 and asked == []
+    assert any(x.startswith("行业映射: 来源 东财批量") and x.endswith("— 低于 3000 只, 龙头判定降级") for x in _msgs(caplog))
+    assert not hasattr(q, "_industry_map")                                   # 成分口径那条函数已删, 不留复活的口子
 
 
 # ============================================================ (f) 09-23 回修: 东财日常态 / 金融后缀 / daily_basic 重试与前一日缓存
@@ -609,41 +647,37 @@ def test_fin_industry_exemption_strips_em_level_suffix():
 
 
 def _em_day(monkeypatch, cons_n=656, batch=None, host="push2delay.eastmoney.com"):
-    """东财日的真实形态: 成分口径只 cons_n 只 (09-15 实测 656 只 / 12 个行业), 东财批量 f100 全市场可达。"""
-    cons = {f"{i:06d}": "化学制药" for i in range(1, cons_n + 1)}
-    monkeypatch.setattr(q, "_industry_map", lambda ds_: cons)
+    """东财日的真实形态: 成分口径只 cons_n 只 (09-15 实测 656 只 / 12 个行业; 记录器, quality 不许问), 东财批量 f100 全市场可达。"""
+    asked = _cons_recorder(monkeypatch, n=cons_n, industry="化学制药")
     if batch is None:
         batch = {f"{i:06d}": ("银行Ⅱ" if i % 50 == 0 else "化学制药") for i in range(1, 5201)}
     monkeypatch.setattr(ds, "_industry_map_em_hosts", lambda: (dict(batch), host))
     monkeypatch.setattr(ds, "fetch_industry_map", REAL_FETCH_INDUSTRY_MAP)
-    return cons, batch
+    return asked, batch
 
 
 def test_industry_map_ex_em_day_norm_is_f100_batch_info_not_warning(ts_box, monkeypatch, caplog):
-    """东财日: 成分 656 只 (< 3000, 09-01 起常态) → ② 东财批量 f100 → 来源 东财, INFO 一行、零 WARNING、零 Tushare 调用。"""
-    cons, batch = _em_day(monkeypatch)
+    """东财日: 东财批量 f100 → 来源 东财, INFO 一行、零 WARNING、零 Tushare 调用、成分零调用; 同日第二个进程 → 「东财当日缓存」。"""
+    asked, batch = _em_day(monkeypatch)
     with caplog.at_level(logging.INFO, logger="ashare.quality"):
         m, src, info = q._industry_map_ex(ds)
     assert src == "东财" and m == batch and info["source"] == "东财" and info["n"] == 5200
-    assert info["em_cons_n"] == 656 and info["host"] == "push2delay.eastmoney.com"
+    assert info["host"] == "push2delay.eastmoney.com" and "em_cons_n" not in info
     assert _msgs(caplog) == []                                              # 不再天天 WARNING
     infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
-    assert any(x.startswith("行业映射: 东财批量 f100 覆盖 5200 只 (push2delay.eastmoney.com; 东财成分口径只 656 只, 09-01 起常态")
+    assert any(x.startswith("行业映射: 来源 东财批量 (push2 clist f100 全市场分类, 主机 push2delay.eastmoney.com), 覆盖 5200 只")
                for x in infos)
-    assert ts_box.calls == []
-    # 同日第二个进程读 ind_map 按日缓存: 仍是 INFO, 来源标「按日缓存」
+    assert ts_box.calls == [] and asked == []
+    # 同日第二个进程读 ind_map 按日缓存: 仍是 INFO, 来源标「东财当日缓存」
     monkeypatch.setattr(ds, "_ind_map", None)
     monkeypatch.setattr(ds, "_industry_map_em_hosts", lambda: (_ for _ in ()).throw(AssertionError("有缓存不该再问 push2")))
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="ashare.quality"):
         m2, src2, info2 = q._industry_map_ex(ds)
     assert src2 == "东财" and m2 == batch and info2.get("cached") is True and _msgs(caplog) == []
-    assert any("(按日缓存; 东财成分口径只 656 只" in x for x in [r.getMessage() for r in caplog.records])
-    # 成分口径真到 3000 (①) 仍优先, 且不问批量映射 —— 生产里没出现过, 但路径留着
-    big = {f"{i:06d}": "化学制药" for i in range(1, 3100)}
-    monkeypatch.setattr(q, "_industry_map", lambda ds_: big)
-    monkeypatch.setattr(ds, "fetch_industry_map", lambda: (_ for _ in ()).throw(AssertionError("成分够用时不该问批量映射")))
-    assert q._industry_map_ex(ds)[1] == "东财成分"
+    assert any(x.startswith("行业映射: 来源 东财当日缓存 (push2 clist f100 全市场分类), 覆盖 5200 只")
+               for x in [r.getMessage() for r in caplog.records])
+    assert asked == []
 
 
 def test_build_on_em_day_bank_with_suffix_is_rd_exempt(sandbox, monkeypatch, caplog):
@@ -656,7 +690,7 @@ def test_build_on_em_day_bank_with_suffix_is_rd_exempt(sandbox, monkeypatch, cap
     batch = {c: "化学制药" for c in CODES}
     batch["688578"] = "银行Ⅱ"
     batch.update({f"{i:06d}": "化学制药" for i in range(1, 5001)})
-    _em_day(monkeypatch, batch=batch)
+    cons_asked, _ = _em_day(monkeypatch, batch=batch)
     asked = []
     monkeypatch.setattr(q, "_rd_intensity", lambda code: (asked.append(code), None)[1])
     with caplog.at_level(logging.INFO):
@@ -664,7 +698,7 @@ def test_build_on_em_day_bank_with_suffix_is_rd_exempt(sandbox, monkeypatch, cap
     assert res is not None and len(res["picks"]) == q.TOP_N
     m = res["meta"]
     assert (m["spot_source"], m["valuation_source"], m["industry_source"]) == ("东财直连", "东财", "东财")
-    assert m["industry_map_coverage"]["em_cons_n"] == 656 and m["industry_map_coverage"]["n"] == len(batch)
+    assert m["industry_map_coverage"]["n"] == len(batch) and cons_asked == []
     bank = next(p for p in res["picks"] if p["code"] == "688578")
     assert bank["industry"] == "银行Ⅱ" and bank["rd_exempt"] == 1 and bank["rd"] is None
     assert bank["gates"]["dom"] and bank["val_model"] == "PB-ROE"           # 分组来自 f100 批量: 独占 '银行Ⅱ' 组 → 龙头

@@ -17,6 +17,7 @@ import logging
 
 from . import db
 from .config import DASHBOARD_DATA_JS, DATA_DIR, CONFIG
+from .datasource import PE_BASIS
 
 log = logging.getLogger("ashare.export")
 
@@ -231,6 +232,11 @@ def build_payload(run_date: str | None = None) -> dict:
             "scan_basis": runlog.get("scan_basis") or "raw_spot",
             "n_hit": len(candidates),   # 与主表展示条数一致
             "selected_industries": selected_inds,
+            # 口径标记 (老板 2026-09-23 拍板, 卡 IND-PE): 候选的 pe_ttm / pe_disp 与行业 PE 中位都是 TTM (阶段B 估值历史
+            # PE(TTM) 优先, 快照兜底也是 东财 f115 / Tushare pe_ttm); 行业归属 = 东财全市场分类 (f100)。
+            # **没有 pe_basis 的历史快照**: 主路 (估值历史) 本来就是 TTM, 只有快照兜底那部分在东财日是动态口径。
+            "pe_basis": PE_BASIS,
+            "industry_basis": "em_f100",
             "disclaimer": DISCLAIMER,
             "opp": opp_result,
         },

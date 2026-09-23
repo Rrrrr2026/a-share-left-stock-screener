@@ -8,8 +8,9 @@
 标记 👑, 未全过的列出差在哪一条)。
 
 数据: 东财业绩报表按报告期批量 (全市场归母净利/营收/加权ROE, 20期≈5年) +
-全A快照 (PE-TTM/总市值) + 行业成分映射; 研发强度用同花顺年度利润表,
-只对入围短名单逐只取 (py_mini_racer 不允许并发)。
+全A快照 (PE-TTM = 东财 f115 / Tushare daily_basic.pe_ttm, 真 TTM; 总市值) + 行业归属 = **东财全市场行业分类**
+(push2 clist f100, ~128 个二级类; 东财不可达时 Tushare stock_basic 经别名表换成东财口径) —— 老板 2026-09-23 拍板 ①②,
+卡 IND-PE; 研发强度用同花顺年度利润表, 只对入围短名单逐只取 (py_mini_racer 不允许并发)。
 
 硬性门槛 (全过 = 👑):
   Q4  近四个单季: 营收与归母净利的单季同比全部 > 0 (官方累计口径相邻期差分)
@@ -83,13 +84,15 @@ EMPTY_LATEST_MAX_AGE_DAYS = YJBB_EMPTY_MAX_AGE_DAYS
 # 沿用旧榜时, 榜比这更旧就用 warning 而不是 info: 正常的上一版榜是 1-3 天前的; 一份几周前的榜多半是 git reset
 # 恢复出来的 HEAD 版 (dashboard/quality_data.js 是跟踪文件), 说明 data/quality_last_good.js 与 docs 副本都不在。
 CARRY_STALE_WARN_DAYS = 7
-# 行业映射 (龙头判定 dom 用的分组) 覆盖低于这么多只就视为不可用 (2026-09-23 卡 QL-SPOT; 回修改注释): 全A ~5200 只。
-# **东财成分口径 (fetch_industry_list × fetch_industry_cons) 在生产里从来没到过这个数**: 服务器 journal 09-01 起每一跑都是
-# `东财行业列表失败 RemoteDisconnected` + `候选池: 全行业成分股 62/214/329/…/1041/485/25/0 只 (行业数 0-13)` —— 09-21 的
-# 485 只不是异常, 是常态 (首版把它写成"东财成分接口大面积失败的形态", 错了)。所以 _industry_map_ex 的 ① 实际上永远走不到,
-# 东财日的常态是 ② datasource.fetch_industry_map() 的东财 f100 批量映射 (全市场一次, 二级口径 ~128 组, 与 run_pipeline
-# 市场地位分组同一份; INFO 不 WARNING), 东财不可达时它自己退到 Tushare stock_basic (名字经别名表换成东财口径; WARNING)。
-# 与 run_pipeline 的 3000 只裁池阈值同一口径。
+# 行业映射 (龙头判定 dom 用的分组) 覆盖低于这么多只就算「部分」: 仍用, 但来源标 (部分) 并 WARNING 龙头判定降级 (全A ~5200 只;
+# 与 run_pipeline 的 3000 只裁池阈值同一口径)。
+# **口径唯一 (老板 2026-09-23 拍板 ①, 卡 IND-PE): 东财全市场行业分类** = datasource.fetch_industry_map() 的 push2 clist f100 批量
+# 映射 (全市场一次, 二级口径 ~128 组, 与 run_pipeline 市场地位/行业 PE 中位分组同一份), 东财不可达时它自己退到 Tushare
+# stock_basic (名字经别名表换成东财口径)。**「东财成分口径」(fetch_industry_list × fetch_industry_cons) 已从这里删掉, 永不再用**:
+# 它只覆盖 3-13 个一级行业 / 62-1041 只 (服务器 journal 09-01 起每一跑 `候选池: 全行业成分股 62/214/329/…/1041/485/25/0 只`,
+# 从没到过 3000), 用它分组等于只给一小撮票判龙头; 卡 QL-SPOT 首版把它排在 ① "成分 >= 3000 才用" —— 那条分支在生产里一次
+# 都没走到, 却让 09-21 之前的榜 (成分部分分组) 与之后的榜 (f100 全市场) 是两套口径。现在三态只剩 东财批量 / 东财当日缓存 /
+# Tushare, 成分接口在本模块里一次都不调 (用例锁住: 成分 5000 只也不选)。
 IND_MAP_MIN_CODES = 3000
 
 
@@ -360,63 +363,42 @@ def _refuse(reason: str, n_screened: int, n_pool, n_picks) -> None:
     return None
 
 
-def _industry_map(ds) -> dict:
-    """行业映射 {code: 行业名}; 接口挂了返回能拿到的部分 (龙头判定降级), 不抛。"""
-    ind_of = {}
-    try:
-        inds = ds.fetch_industry_list()
-        names = list(inds["industry"]) if inds is not None and "industry" in inds.columns \
-            else (list(inds.iloc[:, 0]) if inds is not None else [])
-        for ind in names:
-            cons = ds.fetch_industry_cons(ind)
-            if cons is None:
-                continue
-            for _, r in cons.iterrows():
-                ind_of[str(r["code"]).zfill(6)] = ind
-    except Exception as e:
-        log.warning("行业映射构建失败(龙头判定降级): %s", e)
-    return ind_of
+INDUSTRY_BASIS = "em_f100"      # 行业归属口径标记 (meta.industry_basis): 东财全市场行业分类 (兜底日 Tushare 别名表换成同一套名)
 
 
 def _industry_map_ex(ds) -> tuple:
-    """行业映射 + 来源留痕 -> (ind_of, 来源名, info)。东财优先不变:
-      ① 东财成分口径 (_industry_map: fetch_industry_list × fetch_industry_cons) 覆盖 >= IND_MAP_MIN_CODES → 用它。
-         **生产里 09-01 起从没到过** (每跑 62-1041 只, 见 IND_MAP_MIN_CODES 注释), 留着只是万一成分接口哪天真好了;
-      ② 不够 → ds.fetch_industry_map() (东财 push2 f100 全市场一次, 二级口径 ~128 组 —— 这就是**东财日的常态**, INFO 一行,
-         与 run_pipeline 市场地位分组同一份; 东财不可达时它自己退到 Tushare stock_basic → WARNING) 覆盖够 → 用它;
-      ③ 都不够 → 谁有用谁 (龙头判定降级, warning 点名)。
-    东财日 ② 只多一次 push2delay 批量调用 (按日缓存 ind_map_<日>; run_pipeline 同日已取过就零调用), 零 Tushare 调用。
-    注意 (2026-09-23 回修): 东财日的 dom 分组因此是 f100 二级 (~128 组, 全市场), 与 09-21 之前"成分口径只覆盖 3-13 个一级
-    行业"的部分分组不是同一套 —— 东财恢复那天榜单成员会再变一次, 这是已知口径差异, 不是故障。"""
-    ind_of = _industry_map(ds)
-    n_em = len(ind_of)
-    if n_em >= IND_MAP_MIN_CODES:
-        return ind_of, "东财成分", {"source": "东财成分", "n": n_em}
+    """行业映射 + 来源留痕 -> (ind_of, 来源名, info)。**口径唯一: 东财全市场行业分类** (老板 2026-09-23 拍板 ①):
+    ds.fetch_industry_map() —— 东财 push2 clist f100 全市场一次 (二级口径 ~128 组, 按日缓存 ind_map_<日>, run_pipeline 同日已取过
+    就零调用; 与它的市场地位分组 / 行业 PE 中位同一份), 东财不可达时它自己退到 Tushare stock_basic (名字经 TS_INDUSTRY_ALIAS 换成
+    东财口径)。日志三态 「行业映射: 来源 …」: 东财批量 (本进程刚从 push2 拉的, INFO) | 东财当日缓存 (INFO) | tushare_stock_basic
+    (WARNING, 东财 push2 不可达)。覆盖 < IND_MAP_MIN_CODES → 仍用但来源标 (部分) 并 WARNING 龙头判定降级 (沉默降级是本队记过三次的
+    失败形态); 一只都没有 → 「缺失」WARNING, dom 门全挂 (榜多半入池 0 → 按 QL-EMPTY 拒发)。
+    **不再走「东财成分口径」** (fetch_industry_list × fetch_industry_cons, 见 IND_MAP_MIN_CODES 注释): 成分接口在这里一次都不调,
+    成分哪怕能给 5000 只也不选 —— 用例锁住。"""
     try:
         m = ds.fetch_industry_map() or {}
     except Exception as e:      # noqa: BLE001
         log.warning("行业映射: 批量映射抛错 (%s: %s)", type(e).__name__, e)
         m = {}
     src, info = ds.industry_map_source()
-    if len(m) >= IND_MAP_MIN_CODES and src:
-        cov_txt = ds._coverage_text(info)      # noqa: SLF001
-        if src == "东财":
-            # 东财日常态 (卡 QL-SPOT 回修): 成分口径 09-01 起每天都 < 3000, 不是事故, 不该天天 WARNING
-            log.info("行业映射: 东财批量 f100 覆盖 %d 只 (%s; 东财成分口径只 %d 只, 09-01 起常态; 与 run_pipeline 市场地位分组同一份)",
-                     len(m), "按日缓存" if info.get("cached") else (info.get("host") or "东财"), n_em)
-        else:
-            log.warning("行业映射: 东财成分口径只覆盖 %d 只 (< %d), 改用 %s 覆盖 %d/%d 只%s",
-                        n_em, IND_MAP_MIN_CODES, src, len(m), info.get("total", len(m)), (" (" + cov_txt + ")") if cov_txt else "")
-        return m, src, {**info, "em_cons_n": n_em}
-    # ③ 都不够 → 谁多用谁, 龙头判定降级 (warning 点名两边各多少只; 沉默降级是本队记过三次的失败形态)
-    if src and len(m) > n_em:
-        log.warning("行业映射: 东财成分 %d 只 / %s %d 只都低于 %d → 用后者, 龙头判定降级", n_em, src, len(m), IND_MAP_MIN_CODES)
-        return m, src + "(部分)", {**info, "em_cons_n": n_em}
-    if n_em:
-        log.warning("行业映射: 东财成分口径只有 %d 只, 批量映射也不可用 (%s) → 龙头判定降级", n_em, info.get("error") or src)
-        return ind_of, "东财成分(部分)", {"source": "东财成分(部分)", "n": n_em}
-    log.warning("行业映射: 东财成分 / 东财批量 / Tushare stock_basic 都不可用 (%s) → 龙头判定降级", info.get("error"))
-    return {}, "缺失", {"source": None, "n": 0, "error": info.get("error")}
+    n = len(m)
+    if not m or not src:
+        log.warning("行业映射: 来源 缺失 (东财 f100 批量 / Tushare stock_basic 都不可用: %s) → 龙头判定降级, dom 门全挂",
+                    info.get("error"))
+        return {}, "缺失", {"source": None, "n": 0, "error": info.get("error"), "basis": INDUSTRY_BASIS}
+    cov_txt = ds._coverage_text(info)      # noqa: SLF001
+    if src == "东财":
+        how = "东财当日缓存" if info.get("cached") else "东财批量"
+        msg = "行业映射: 来源 %s (push2 clist f100 全市场分类%s), 覆盖 %d 只; 与 run_pipeline 市场地位/行业 PE 中位分组同一份" % (
+            how, (", 主机 " + str(info["host"])) if info.get("host") else "", n)
+    else:
+        msg = "行业映射: 来源 %s (东财 push2 不可达), 覆盖 %d/%d 只%s" % (
+            src, n, info.get("total", n), (" (" + cov_txt + ")") if cov_txt else "")
+    if n < IND_MAP_MIN_CODES:
+        log.warning("%s — 低于 %d 只, 龙头判定降级", msg, IND_MAP_MIN_CODES)
+        return m, src + "(部分)", {**info, "n": n, "basis": INDUSTRY_BASIS}
+    (log.info if src == "东财" else log.warning)(msg)
+    return m, src, {**info, "n": n, "basis": INDUSTRY_BASIS}
 
 
 def _score_rows(reports: dict, spot_map: dict, ind_of: dict) -> list:
@@ -559,10 +541,11 @@ def _build_quality(top_n: int) -> dict | None:
                 spot_map[str(r.get("code", "")).zfill(6)] = r.to_dict()
         ind_of, ind_src, ind_info = _industry_map_ex(ds)
         cov_txt = ds._coverage_text(ind_info)      # noqa: SLF001  (别叫 cov: 上面那个是报告期覆盖)
-        log.info("优质榜数据来源: 快照 %s | 估值 %s%s | 行业 %s 覆盖 %d 只%s",
+        log.info("优质榜数据来源: 快照 %s | 估值 %s%s | 行业 %s 覆盖 %d 只%s | PE 口径 %s (行业口径 %s)",
                  srcs.get("spot_source"), srcs.get("valuation_source"),
                  (" (%s)" % srcs["valuation_trade_date"]) if srcs.get("valuation_trade_date") else "",
-                 ind_src, len(ind_of), (" (" + cov_txt + ")") if cov_txt else "")
+                 ind_src, len(ind_of), (" (" + cov_txt + ")") if cov_txt else "",
+                 srcs.get("pe_basis") or ds.PE_BASIS, INDUSTRY_BASIS)
         rows = _score_rows(reports, spot_map, ind_of)
         n_pool = len(rows)
     if problem:
@@ -607,11 +590,17 @@ def _build_quality(top_n: int) -> dict | None:
                  "periods_empty": list(cov.get("empty") or []),
                  "periods_failed": list(cov.get("failed") or []),
                  # 数据来源留痕 (2026-09-23 卡 QL-SPOT): 东财 push2 海外不可达时快照/估值/行业各走了哪条兜底。
-                 # 东财正常的日子: 东财直连 / 东财 / 东财成分。industry_map_coverage 在 Tushare 兜底时带
+                 # 东财正常的日子: 东财直连 / 东财 / 东财。industry_map_coverage 在 Tushare 兜底时带
                  # total/mapped/kept/empty/kept_names (映射到东财口径 / 原样沿用 Tushare 名 / 空)。
                  "spot_source": srcs.get("spot_source"),
                  "valuation_source": srcs.get("valuation_source"),
                  "valuation_trade_date": srcs.get("valuation_trade_date"),
+                 # 口径标记 (老板 2026-09-23 拍板, 卡 IND-PE): pe_basis = "ttm" (picks.pe 与门槛 0<pe<31 都是 TTM: 东财 f115 /
+                 # Tushare pe_ttm); **没有 pe_basis 的历史榜按「动态市盈率」解释** (东财 f9, 09-23 之前的东财日)。
+                 # industry_basis = "em_f100": dom 分组 = 东财全市场行业分类 (兜底日 Tushare 别名表换成同一套名);
+                 # 没有它的历史榜是 09-21 前的东财成分口径 (3-13 个一级行业的部分分组) 或 09-23 兜底日的 Tushare 别名 74 组。
+                 "pe_basis": srcs.get("pe_basis") or ds.PE_BASIS,
+                 "industry_basis": INDUSTRY_BASIS,
                  "industry_source": ind_src,
                  "industry_map_coverage": ind_info},
         "picks": picks,
@@ -625,7 +614,8 @@ def _build_quality(top_n: int) -> dict | None:
         slim = [{k: p.get(k) for k in ("code", "name", "industry", "score", "n_pass", "pe", "roe", "gates")}
                 for p in picks]
         with open(os.path.join(hdir, f"quality_{result['meta']['date']}.json"), "w", encoding="utf-8") as f:
-            json.dump({"date": result["meta"]["date"], "picks": slim}, f, ensure_ascii=False)
+            json.dump({"date": result["meta"]["date"], "pe_basis": result["meta"]["pe_basis"],
+                       "industry_basis": INDUSTRY_BASIS, "picks": slim}, f, ensure_ascii=False)
     except Exception as e:
         log.warning("优质榜历史落盘失败: %s", e)
     try:

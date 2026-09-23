@@ -34,6 +34,7 @@ from ashare import module4_crossscore as m4
 from ashare import module6_profile as m6
 from ashare import tradeplan as tp
 from ashare import export_data as ex
+from ashare.quality import industry_base_name      # 景气分查表: 东财 f100 二级名 (银行Ⅱ) → 一级名 (银行)
 
 # Windows 控制台默认 GBK, 输出中文/emoji 会报 UnicodeEncodeError; 统一切到 UTF-8
 for _s in (sys.stdout, sys.stderr):
@@ -61,12 +62,53 @@ def _tqdm():
 # ---------------------------------------------------------------------------
 #  候选股票池
 # ---------------------------------------------------------------------------
+def spot_industry_of(spot_map: dict, code) -> str | None:
+    """个股行业归属 —— **唯一口径: 快照 industry 列** (东财直连 f100 全市场分类; 新浪/akshare 东财快照由 fill_spot_industry
+    用同一份批量映射补, 东财不可达时是 Tushare stock_basic 经别名表换成东财口径)。老板 2026-09-23 拍板 ① (卡 IND-PE):
+    行业归属/市场地位分组/行业 PE 中位/优质榜 dom 都用这一套, 不再用东财成分口径的行业名。缺 / NaN / '-' → None
+    (阶段B 再由 ds.fetch_stock_industry 逐只补, 它的第 0 步也是这份批量映射)。"""
+    v = (spot_map.get(code) or {}).get("industry") if spot_map else None
+    if isinstance(v, str):
+        v = v.strip()
+        return v if v and v not in ("-", "—", "nan", "None") else None
+    return None
+
+
+def industry_groups_from_spot(spot) -> dict:
+    """{行业: [code, ...]} 按快照 industry 列分组 (与 spot_industry_of / dom_map 同一口径), 供行业 PE 中位
+    (m3.compute_industry_pe_median)。以前这里喂的是东财成分口径的 ind_to_codes (3-13 个一级行业), 键与个股归属对不上时
+    行业 PE 对比整条链默默是 '—'。快照无行业列 → {}。"""
+    if spot is None or spot.empty or not {"code", "industry"} <= set(spot.columns):
+        return {}
+    s = spot[["code", "industry"]].dropna()
+    s = s[~s["industry"].astype(str).str.strip().isin(["", "-", "—", "nan", "None"])]
+    return {str(ind): list(g["code"].astype(str).str.zfill(6)) for ind, g in s.groupby("industry")}
+
+
+def prosperity_for(prosperity_map: dict, industry) -> float | None:
+    """景气分查表: 模块1 的景气榜按东财/同花顺**一级**行业名, 个股归属是东财 f100 **二级**名 (银行Ⅱ / 白酒Ⅱ …),
+    先按原名查, 查不到去掉 Ⅱ/Ⅲ 后缀再查 (银行Ⅱ → 银行); 仍查不到 → None (module4 按"景气未知"处理, 与全市场回退同)。"""
+    if not industry or not prosperity_map:
+        return None
+    v = prosperity_map.get(industry)
+    if v is None:
+        base = industry_base_name(industry)
+        if base and base != industry:
+            v = prosperity_map.get(base)
+    return v
+
+
 def build_candidate_universe(spot, spot_map, ind_df, selected_inds=None):
     """候选池构建 (行业成分并池 / 全市场预筛) -> (universe, ind_to_codes)。
 
     2026-09-08 从 run() 里**原样**抽出来 (逻辑一字未改): 裁池那一步要能离线复现和单测,
     而它原来内联在 500 行的 run() 里, 只能靠跑整条流水线才验证得了。
     universe = [(code, name, industry|None), ...]; ind_to_codes = {行业: [成分码]}。
+
+    **行业归属 (2026-09-23 老板拍板 ①, 卡 IND-PE)**: 「全行业成分股」那一步**只用来选票** (扫描面), 元组里的 industry
+    一律来自快照 industry 列 (spot_industry_of: 东财 f100 全市场分类 / 兜底映射), **不再**写成分口径的行业名 ——
+    以前成分股带一级名、并池补进来的票带二级名, 一份候选榜里两套口径混着 (且成分口径 09-01 起只覆盖 62-1041 只)。
+    ind_to_codes 仍是成分 {行业: [成分码]}, 只作留痕/行业数日志, 行业 PE 中位改按 industry_groups_from_spot 分组。
     """
     ind_to_codes: dict = {}
     universe = []   # list of (code, name, industry)
@@ -86,7 +128,7 @@ def build_candidate_universe(spot, spot_map, ind_df, selected_inds=None):
                 amt = sp.get("amount")
                 if amt is not None and amt == amt and 0 < amt < thr * 0.3:
                     continue   # 明显流动性不足预筛
-                rows.append((code, name, None))
+                rows.append((code, name, spot_industry_of(spot_map, code)))
         log.info("候选池: 全市场(预筛后) %d 只", len(rows))
         return rows
 
@@ -120,8 +162,9 @@ def build_candidate_universe(spot, spot_map, ind_df, selected_inds=None):
                 if CONFIG["tech"].get("exclude_b_share", True) and ds.is_b_share(code):
                     continue
                 seen.add(code)
-                universe.append((code, name, ind_name))
-        log.info("候选池: 全行业成分股 %d 只 (行业数 %d)", len(universe), len(ind_to_codes))
+                # 归属不写 ind_name (成分口径): 与并池/全市场那条路同一口径 (快照 industry 列), 见 docstring
+                universe.append((code, name, spot_industry_of(spot_map, code)))
+        log.info("候选池: 全行业成分股 %d 只 (行业数 %d; 只用来选票, 行业归属一律按快照 industry 列)", len(universe), len(ind_to_codes))
         # 行业成分接口大面积失败会让扫描面悄悄缩水: 覆盖过低时并入全市场池补齐。
         # 全A正常 ~5200 只; 2026-08-14 限频事故只拿到 1086 只、恰好躲过旧阈值 1000 ->
         # 阈值提到 3000, 任何明显缩水都并入全市场池
@@ -134,7 +177,7 @@ def build_candidate_universe(spot, spot_map, ind_df, selected_inds=None):
         # 成分股全部获取失败(东财实时端点被重置)时, 回退到全市场扫描, 保证流程不空跑
         if len(universe) == 0:
             log.warning("行业成分股获取失败(东财push2被限, 无可用备用成分接口), 回退到全市场扫描。"
-                        "行业景气榜仍展示; 但个股缺行业归属, '所属行业/景气加成/行业PE对比'将显示 '—'。")
+                        "行业景气榜仍展示; 个股行业归属照旧来自快照 industry 列 (快照也没有行业列时才显示 '—')。")
             universe = _full_market_universe()
     return universe, ind_to_codes
 
@@ -374,11 +417,15 @@ def run(full_market: bool, use_cache: bool):
     n_pool_raw = len(universe)
     universe, scan_basis = trim_universe_by_store(universe, run_date)
 
-    # 行业 PE 中位 (用于基本面对比)
-    industry_pe_median = m3.compute_industry_pe_median(spot, ind_to_codes) if ind_to_codes else {}
+    # 行业 PE 中位 (用于基本面对比): 分组 = 快照 industry 列 (东财全市场分类, 与个股归属/市场地位同一口径, 老板 09-23 拍板 ①),
+    # PE = 快照 pe_ttm (东财 f115 / Tushare daily_basic, 真 TTM, 拍板 ②)。以前按成分口径 ind_to_codes 分组, 键对不上归属。
+    ind_groups = industry_groups_from_spot(spot)
+    industry_pe_median = m3.compute_industry_pe_median(spot, ind_groups) if ind_groups else {}
+    log.info("行业 PE 中位: %d 个行业 (分组 = 快照 industry 列, PE 口径 %s; 成分口径行业数 %d 只作留痕)",
+             len(industry_pe_median), ds.PE_BASIS, len(ind_to_codes))
 
     # 市场地位 (垄断力代理): 东财行业内 总市值排名/份额。
-    # 全量来自快照(行业+总市值都在里面, 零额外请求) — 成分股接口挂掉也不影响
+    # 全量来自快照(行业+总市值都在里面, 零额外请求) — 成分股接口挂掉也不影响; 分组口径与上面同一份 (快照 industry 列)
     dom_map = {}
     if spot is not None and not spot.empty and {"industry", "total_mv"} <= set(spot.columns):
         _s = spot[["code", "industry", "total_mv"]].dropna()
@@ -476,8 +523,9 @@ def run(full_market: bool, use_cache: bool):
         rec, detail = rd
         industry = rec.get("industry")
         if not industry:
-            # 全市场回退时个股无行业归属: 快照的东财行业列免费全覆盖, 没有再逐只补
-            industry = (spot_map.get(rec["code"]) or {}).get("industry")
+            # 候选池已按快照 industry 列归属 (spot_industry_of); 还没有的 (快照无行业列 / 该票不在映射里) 再逐只补,
+            # fetch_stock_industry 的第 0 步是同一份批量映射, 之后才是雪球/巨潮/东财逐只
+            industry = spot_industry_of(spot_map, rec["code"])
             if not industry:
                 try:
                     industry = ds.fetch_stock_industry(rec["code"])
@@ -495,7 +543,7 @@ def run(full_market: bool, use_cache: bool):
             share_txt = f" · {d['share']}%" if d["share"] is not None else ""
             f["dominance_disp"] = f"{crown}#{d['rank']}/{d['n']}{share_txt}"
             f["dom_rank"], f["dom_n"], f["dom_share"] = d["rank"], d["n"], d["share"]
-        fr = m4.cross_score(rec, f, prosperity_map.get(industry) if industry else None)
+        fr = m4.cross_score(rec, f, prosperity_for(prosperity_map, industry))
         return (rec, detail, f, fr)
 
     results = []
