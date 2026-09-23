@@ -65,6 +65,11 @@ EMPTY_LATEST_MAX_AGE_DAYS = YJBB_EMPTY_MAX_AGE_DAYS
 # 沿用旧榜时, 榜比这更旧就用 warning 而不是 info: 正常的上一版榜是 1-3 天前的; 一份几周前的榜多半是 git reset
 # 恢复出来的 HEAD 版 (dashboard/quality_data.js 是跟踪文件), 说明 data/quality_last_good.js 与 docs 副本都不在。
 CARRY_STALE_WARN_DAYS = 7
+# 行业映射 (龙头判定 dom 用的分组) 覆盖低于这么多只就视为不可用 (2026-09-23 卡 QL-SPOT): 全A ~5200 只; 东财成分口径
+# (fetch_industry_list × fetch_industry_cons) 09-21 实测只有 6/90 个行业 485 只 —— 那是"东财成分接口大面积失败"的
+# 形态, 不是一份能拿来排龙头的映射。低于此改用 datasource.fetch_industry_map() (东财 f100 全市场一次; 东财不可达时它
+# 自己退到 Tushare stock_basic, 名字经别名表换成东财口径)。与 run_pipeline 的 3000 只裁池阈值同一口径。
+IND_MAP_MIN_CODES = 3000
 
 
 def _today() -> dt.date:
@@ -352,6 +357,38 @@ def _industry_map(ds) -> dict:
     return ind_of
 
 
+def _industry_map_ex(ds) -> tuple:
+    """行业映射 + 来源留痕 -> (ind_of, 来源名, info)。东财优先不变:
+      ① 东财成分口径 (_industry_map: fetch_industry_list × fetch_industry_cons) 覆盖 >= IND_MAP_MIN_CODES → 用它;
+      ② 不够 → ds.fetch_industry_map() (东财 push2 f100 全市场一次; 东财不可达时它自己退到 Tushare stock_basic) 覆盖够 → 用它;
+      ③ 都不够 → 谁有用谁 (龙头判定降级, 与 09-23 之前一样)。
+    只有 ① 不够时才会碰 ②, 所以东财成分正常的日子一次 push2/Tushare 调用都不发。"""
+    ind_of = _industry_map(ds)
+    n_em = len(ind_of)
+    if n_em >= IND_MAP_MIN_CODES:
+        return ind_of, "东财成分", {"source": "东财成分", "n": n_em}
+    try:
+        m = ds.fetch_industry_map() or {}
+    except Exception as e:      # noqa: BLE001
+        log.warning("行业映射: 批量映射抛错 (%s: %s)", type(e).__name__, e)
+        m = {}
+    src, info = ds.industry_map_source()
+    if len(m) >= IND_MAP_MIN_CODES and src:
+        cov_txt = ds._coverage_text(info)      # noqa: SLF001
+        log.warning("行业映射: 东财成分口径只覆盖 %d 只 (< %d), 改用 %s 覆盖 %d/%d 只%s",
+                    n_em, IND_MAP_MIN_CODES, src, len(m), info.get("total", len(m)), (" (" + cov_txt + ")") if cov_txt else "")
+        return m, src, {**info, "em_cons_n": n_em}
+    # ③ 都不够 → 谁多用谁, 龙头判定降级 (warning 点名两边各多少只; 沉默降级是本队记过三次的失败形态)
+    if src and len(m) > n_em:
+        log.warning("行业映射: 东财成分 %d 只 / %s %d 只都低于 %d → 用后者, 龙头判定降级", n_em, src, len(m), IND_MAP_MIN_CODES)
+        return m, src + "(部分)", {**info, "em_cons_n": n_em}
+    if n_em:
+        log.warning("行业映射: 东财成分口径只有 %d 只, 批量映射也不可用 (%s) → 龙头判定降级", n_em, info.get("error") or src)
+        return ind_of, "东财成分(部分)", {"source": "东财成分(部分)", "n": n_em}
+    log.warning("行业映射: 东财成分 / 东财批量 / Tushare stock_basic 都不可用 (%s) → 龙头判定降级", info.get("error"))
+    return {}, "缺失", {"source": None, "n": 0, "error": info.get("error")}
+
+
 def _score_rows(reports: dict, spot_map: dict, ind_of: dict) -> list:
     """七道门槛 + 评分, 纯函数 (不联网): 过 4 条门槛的票 -> rows (未排序)。逻辑与 2026-09-09 之前的
     build_quality 内联段逐字相同, 拆出来是为了能离线复现"缺哪几期 → 入池几只"。"""
@@ -479,13 +516,23 @@ def _build_quality(top_n: int) -> dict | None:
     reports, cov = ds.fetch_profit_reports_ex(N_PERIODS)
     problem = _coverage_problem(cov, N_PERIODS)
     rows, n_pool = [], None
+    srcs = {"spot_source": "无", "valuation_source": None}
+    ind_src, ind_info = "缺失", {"source": None, "n": 0}
     if reports:
+        # 快照: fetch_spot_snapshot 自己做兜底 (2026-09-23 卡 QL-SPOT: 新浪快照无估值列 → Tushare daily_basic 补;
+        # 无行业列 → 批量行业映射补), 这里只读来源留痕进 meta; 东财直连快照什么都不触发。
         spot = ds.fetch_spot_snapshot()
+        srcs = ds.spot_sources(spot)
         spot_map = {}
         if spot is not None and not spot.empty:
             for _, r in spot.iterrows():
                 spot_map[str(r.get("code", "")).zfill(6)] = r.to_dict()
-        ind_of = _industry_map(ds)
+        ind_of, ind_src, ind_info = _industry_map_ex(ds)
+        cov_txt = ds._coverage_text(ind_info)      # noqa: SLF001  (别叫 cov: 上面那个是报告期覆盖)
+        log.info("优质榜数据来源: 快照 %s | 估值 %s%s | 行业 %s 覆盖 %d 只%s",
+                 srcs.get("spot_source"), srcs.get("valuation_source"),
+                 (" (%s)" % srcs["valuation_trade_date"]) if srcs.get("valuation_trade_date") else "",
+                 ind_src, len(ind_of), (" (" + cov_txt + ")") if cov_txt else "")
         rows = _score_rows(reports, spot_map, ind_of)
         n_pool = len(rows)
     if problem:
@@ -528,7 +575,15 @@ def _build_quality(top_n: int) -> dict | None:
                  "periods_ok": list(cov.get("ok") or []),
                  "periods_fallback": list(cov.get("fallback") or []),
                  "periods_empty": list(cov.get("empty") or []),
-                 "periods_failed": list(cov.get("failed") or [])},
+                 "periods_failed": list(cov.get("failed") or []),
+                 # 数据来源留痕 (2026-09-23 卡 QL-SPOT): 东财 push2 海外不可达时快照/估值/行业各走了哪条兜底。
+                 # 东财正常的日子: 东财直连 / 东财 / 东财成分。industry_map_coverage 在 Tushare 兜底时带
+                 # total/mapped/kept/empty/kept_names (映射到东财口径 / 原样沿用 Tushare 名 / 空)。
+                 "spot_source": srcs.get("spot_source"),
+                 "valuation_source": srcs.get("valuation_source"),
+                 "valuation_trade_date": srcs.get("valuation_trade_date"),
+                 "industry_source": ind_src,
+                 "industry_map_coverage": ind_info},
         "picks": picks,
     }
     json.dump(result, open(QL_JSON, "w", encoding="utf-8"), ensure_ascii=False)

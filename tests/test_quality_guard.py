@@ -35,6 +35,8 @@ test_build_new_quarter_end_to_end_*) 红; 去掉判据 ② (年龄) → test_fet
 (盘上/旧缓存) → test_fetch_no_data_answer_with_*_falls_back 红; build_quality 不套 try/except → test_build_exception_*
 红; _coverage_problem 去掉年龄核 → test_cov_latest_empty_tolerated_only_within_45_days 红。
 运行:  python -m pytest tests/test_quality_guard.py -q
+(2026-09-23 卡 QL-SPOT: 快照缺估值列 / 行业映射的 Tushare 兜底用例在 tests/test_quality_spot_fallback.py; 本文件的 sandbox
+ 只把那两条兜底路封死, 保证这里的用例仍是"纯守卫"且不联网。)
 """
 from __future__ import annotations
 import datetime as dt
@@ -179,6 +181,11 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(ds, "fetch_profit_reports_ex", lambda n: (box["reports"], box["cov"]))
     monkeypatch.setattr(ds, "fetch_spot_snapshot", lambda force=False: box["spot"])
     monkeypatch.setattr(ds, "fetch_industry_list", lambda: None)
+    # 2026-09-23 卡 QL-SPOT: 东财成分映射为空时 quality._industry_map_ex 会去问 ds.fetch_industry_map() (东财 push2 →
+    # Tushare stock_basic); 这里的用例只管榜的守卫, 两条路都封死 (Tushare 出口打桩成"一碰就炸", 保证不联网)。
+    monkeypatch.setattr(ds, "fetch_industry_map", lambda: {})
+    monkeypatch.setattr(ds, "industry_map_source", lambda: (None, {}))
+    monkeypatch.setattr(ds, "_ts_query", lambda api, **kw: (_ for _ in ()).throw(AssertionError("用例里不许打 Tushare: " + api)))
     monkeypatch.setattr(q, "_rd_intensity", lambda code: None)
     monkeypatch.setattr(q, "_deep_profiles", lambda picks: {})
     monkeypatch.setattr(q, "_drawer_profiles", lambda picks, reports=None: {})
@@ -709,7 +716,10 @@ def test_build_new_quarter_end_to_end_publishes_19_of_20(sandbox, yjbb_box, monk
     assert os.path.exists(os.path.join(str(sandbox["dash"]), "history", "quality_2026-10-01.json"))
     assert q._parse_ql_js(q.QL_JS)["meta"]["periods_empty"] == ["20260930"]
     assert any("报告期 到齐 19/20 (回退 0, 空 1)" in r.getMessage() for r in caplog.records)
-    assert not any(r.levelno >= logging.WARNING for r in caplog.records if r.name.startswith("ashare"))
+    # 报表/守卫链路无 warning。行业映射那一行例外: sandbox 把东财成分/东财批量/Tushare 三条路都封死了, 09-23 卡 QL-SPOT 起
+    # "三条路都不可用 → 龙头判定降级" 必须响 (沉默降级是本队记过三次的失败形态), 它与季初形态无关。
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records
+                   if r.name.startswith("ashare") and not r.getMessage().startswith("行业映射"))
 
 
 # ============================================================ 抛错日也沿用旧榜 (2026-09-13 回修 MEDIUM)

@@ -418,7 +418,7 @@ def fetch_spot_snapshot(force: bool = False) -> pd.DataFrame | None:
     if not force:
         c = _cache_load(key)
         if c is not None:
-            return c
+            return _spot_with_fallbacks(c)
     # 顺序: 东财直连(多主机, 最稳) -> akshare东财 -> 新浪。
     # 直连放第一位是因为 akshare 写死的主机在本机被挡, 而其余东财主机可达。
     # 2026-08-14 事故: 限频把分页截断在 1086 行, 部分列表被当全量缓存+扫描 ->
@@ -440,9 +440,18 @@ def fetch_spot_snapshot(force: bool = False) -> pd.DataFrame | None:
     if len(df) < MIN_ROWS:
         log.warning("所有源都只拿到截断快照(%d行): 本轮硬着头皮用, 但不缓存, 下次重取",
                     len(df))
-        return df
+        return _spot_with_fallbacks(df)
+    # 缓存的是**源给的原样** (东财 15 列 / 新浪 8 列), 兜底补的列不进 spot 缓存: 一眼能从缓存看出当天是哪个源,
+    # 且 Tushare 那份自己按交易日缓存, 同日再读只是一次本地合并 (毫秒级), 不重打端点。
     _cache_save(key, df)
-    return df
+    return _spot_with_fallbacks(df)
+
+
+def _spot_with_fallbacks(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """快照出源/读缓存之后的统一出口 (2026-09-23 卡 QL-SPOT): 缺估值列 → Tushare daily_basic 补; 缺行业列 →
+    批量行业映射补 (东财 f100, 东财不可达时 Tushare stock_basic)。东财直连快照两样都齐, 这里什么都不做。"""
+    df, _ = fill_spot_valuation(df)
+    return fill_spot_industry(df)
 
 
 # 东财行情主机池。akshare 写死用 17.push2, 而本机代理恰好挡住这一台 ——
@@ -592,6 +601,12 @@ def _spot_from_sina() -> pd.DataFrame | None:
     except Exception as e:
         log.warning("新浪快照 stock_zh_a_spot 失败: %s", e)
         return None
+    # 2026-09-23 卡 QL-SPOT 核过: 现在的 akshare (1.18.x) stock_zh_a_spot 只有 代码/名称/最新价/涨跌额/涨跌幅/
+    # 买入/卖出/昨收/今开/最高/最低/成交量/成交额 —— **没有市盈率、市净率、总市值, 也没有换手率/量比**
+    # (服务器 09-23 实测 5567 行 8 列)。下面的 换手率/市盈率/市净率 候选名是老版 akshare 才有的, 留着不碍事
+    # (rename_normalize 缺列不报错), 但**别再指望它们出现**: 缺列不是异常, 由 fill_spot_valuation 用 Tushare
+    # daily_basic 补 (只 warning 一次「新浪快照无估值列, 改用 Tushare daily_basic 补」), 行业列由
+    # fill_spot_industry 补。09-22/23 优质榜入池 0 就是因为这里的列一直是空的、而下游没人补。
     df = rename_normalize(raw, {
         "code":     ["代码"],
         "name":     ["名称"],
@@ -613,6 +628,390 @@ def _spot_from_sina() -> pd.DataFrame | None:
         if col not in ("code", "name"):
             df[col] = _to_num(df[col])
     return df
+
+
+
+# ===========================================================================
+#  1b) 东财 push2 海外不可达时的兜底 (2026-09-23 卡 QL-SPOT):
+#      估值列 ← Tushare daily_basic, 行业归属 ← Tushare stock_basic (名字经别名表换成东财口径)
+# ===========================================================================
+# 事故形态 (2026-09-22/23, 09-21 10:01 首现「东财行业列表失败 RemoteDisconnected」): 东财 push2 行情接口对海外 IP
+# 502 / 连接失败 (服务器与老板 PC 两个海外 IP 同样), 快照退到新浪 —— 而新浪 stock_zh_a_spot **没有** 市盈率/市净率/
+# 总市值列 → spot_map 里 pe_ttm/total_mv 全空 → 优质榜 pe/cap/up 三门必挂; 行业映射同时挂 → dom 也挂 → 最多过
+# q4/y4/roe 三条 < 4 → 入池 0 → 按 QL-EMPTY 规则拒发、沿用 09-21 的榜。报告期 20/20 到齐, 不是财报或榜逻辑的问题。
+#
+# 兜底原则: **东财优先不变** —— 东财直连快照自带 f9/f20/f21/f23/f100, 什么都不触发, 结果与旧路径一字不差; 只有快照
+# 缺估值列 (新浪; akshare 东财则只缺行业列) 或行业映射不可用时才动 Tushare, 每种 api 每天一次调用 (原始表按日缓存到
+# data/cache, 与 spot 缓存同法), 经 tushare_client.query 的进程级硬期限 + 限频桶 + 重试。Tushare 也挂 → 什么都不造,
+# 快照原样交出去, 优质榜照 QL-EMPTY 规则拒发沿用旧榜 (不造榜)。
+#
+# **单位**: Tushare daily_basic 的 total_mv / circ_mv 是**万元**, 东财 f20/f21 是**元**, quality.mcap_b = mv/1e8 按元算
+# → 这里乘 TS_MV_UNIT 换成元再交出去 (688578 艾力斯 09-23: 5,058,900 万元 → 5.06e10 元 → 506 亿; 09-21 东财口径 459 亿,
+# 差的是两天涨幅, 同量级)。pe_ttm 取 Tushare pe_ttm (真 TTM; 东财 f9 是动态市盈率, 增长股上 TTM 略高: 艾力斯 18.9 vs 14.9),
+# 亏损股 pe_ttm 为空属正常 (09-23: 5556 行里 3924 非空)。字段名/门槛/评分一律不改。
+SPOT_VALUATION_COLS = ("pe_ttm", "pb", "total_mv", "float_mv")
+SPOT_EXTRA_FILL_COLS = ("turnover", "volume_ratio")      # 新浪也没有换手率/量比; daily_basic 同名同单位 (%, 倍) 顺手补
+TS_MV_UNIT = 1e4                    # 万元 → 元
+TS_DAILY_BASIC_MIN_ROWS = 4000      # 全市场 ~5550 行; 低于此 = 当日还没出 / 只出了一部分 → 退回前一交易日
+TS_VALUATION_BACK_DAYS = 2          # 最新交易日没出时最多再往前退几个交易日
+TS_DAILY_BASIC_FIELDS = "ts_code,trade_date,close,pe,pe_ttm,pb,total_mv,circ_mv,turnover_rate,volume_ratio"
+TS_STOCK_BASIC_FIELDS = "ts_code,symbol,name,industry,market,list_date"
+
+_ts_state = {"valuation_warned": False}       # 「新浪快照无估值列」只 warning 一次 (每次 fetch_spot_snapshot 都会走兜底)
+_ts_daily_basic_short: dict = {}              # trade_date -> 行数: 本进程内已知"当日还没出"的日期, 不重复打端点, 也不落盘
+_ts_lock = threading.Lock()
+
+
+def _ts_query(api: str, **kw) -> pd.DataFrame:
+    """本模块所有 Tushare 调用的唯一出口 (用例打桩这里, 不联网); 生产走 tushare_client.query。"""
+    from . import tushare_client as tc
+    return tc.query(api, **kw)
+
+
+def _ts_available() -> bool:
+    try:
+        from . import tushare_client as tc
+        return bool(tc.available())
+    except Exception:           # noqa: BLE001
+        return False
+
+
+def _ymd8(d) -> str:
+    """'2026-09-23' / date / '20260923' -> '20260923'。"""
+    return str(d)[:10].replace("-", "")[:8]
+
+
+def spot_source_of(df) -> str:
+    """快照来自哪个源 —— 缓存的 pkl 不带来源标记, 按列判: 东财直连 = 估值列 + industry; akshare 东财 = 估值列、无
+    industry; 新浪 = 没有估值列。attrs 里已记的 (兜底补过列之后) 优先。"""
+    if df is None:
+        return "无"
+    src = (getattr(df, "attrs", None) or {}).get("spot_source")
+    if src:
+        return str(src)
+    cols = set(df.columns)
+    if "pe_ttm" in cols or "total_mv" in cols:
+        return "东财直连" if "industry" in cols else "东财(akshare)"
+    return "新浪"
+
+
+def spot_lacks_valuation(df) -> bool:
+    """快照是否缺估值列 (pe_ttm / total_mv 列不存在, 或存在但整列为空)。空表不算缺。"""
+    if df is None or len(df) == 0:
+        return False
+    for c in ("pe_ttm", "total_mv"):
+        if c not in df.columns or not _to_num(df[c]).notna().any():
+            return True
+    return False
+
+
+def spot_sources(df) -> dict:
+    """优质榜 meta 用的来源留痕 -> {spot_source, valuation_source, valuation_trade_date?}。"""
+    src = spot_source_of(df)
+    if df is None or len(df) == 0:
+        return {"spot_source": src, "valuation_source": None}
+    a = getattr(df, "attrs", None) or {}
+    if a.get("valuation_source"):
+        return {"spot_source": src, "valuation_source": str(a["valuation_source"]),
+                "valuation_trade_date": a.get("valuation_trade_date")}
+    return {"spot_source": src, "valuation_source": "缺失" if spot_lacks_valuation(df) else "东财"}
+
+
+def _store_trade_days_before(mx: str, n: int) -> list:
+    """价格库自己的交易日历 (idx_bars) 里严格早于 mx 的最近 n 个交易日, 新→旧。库不可读 -> []。"""
+    try:
+        return [str(r[0]) for r in _store_conn().execute(
+            "SELECT d FROM idx_bars WHERE d < ? ORDER BY d DESC LIMIT ?", (str(mx)[:10], int(n)))]
+    except Exception:           # noqa: BLE001
+        return []
+
+
+def _valuation_trade_dates(n: int = 1 + TS_VALUATION_BACK_DAYS) -> list:
+    """daily_basic 该问哪几天 -> [最新交易日, 前一交易日, ...] (YYYYMMDD, 新→旧)。
+    最新交易日 = 价格库个股末日 (阶段A 用的就是那批价, 与 data_date 同口径); 库不在/没开 → Tushare trade_cal 最后
+    开市日 (1 次调用) → 再退到按工作日近似。"""
+    out: list = []
+    try:
+        if bars_from_store_on():
+            mx = _store_max_date()
+            if mx:
+                out.append(_ymd8(mx))
+                out.extend(_ymd8(d) for d in _store_trade_days_before(mx, n - 1))
+    except Exception as e:      # noqa: BLE001
+        log.debug("估值交易日: 价格库不可读 (%s)", e)
+    if out:
+        return out[:n]
+    try:
+        from . import tushare_client as tc
+        today = dt.date.today()
+        days = [d for d in tc.trade_cal(today - dt.timedelta(days=30), today) if d <= today.isoformat()]
+        if days:
+            return [_ymd8(d) for d in days[-n:]][::-1]
+    except Exception as e:      # noqa: BLE001
+        log.debug("估值交易日: trade_cal 不可用 (%s)", str(e)[:120])
+    d = dt.date.today()
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(_ymd8(d))
+        d -= dt.timedelta(days=1)
+    return out
+
+
+def fetch_daily_basic_tushare(trade_date) -> pd.DataFrame | None:
+    """某交易日全市场 daily_basic **原始表** (ts_code/pe/pe_ttm/pb/total_mv(万元)/circ_mv(万元)/turnover_rate/volume_ratio),
+    按交易日缓存 (缓存键含日期)。行数 < TS_DAILY_BASIC_MIN_ROWS (当日还没出 / 只出了一部分) 的结果**不落盘**、本进程内
+    记住不再打, 留给下一轮重试; 抛错 -> None。"""
+    trade_date = _ymd8(trade_date)
+    key = _cache_key("ts_daily_basic", trade_date)
+    c = _cache_load(key)
+    if c is not None:
+        return c
+    with _ts_lock:
+        if trade_date in _ts_daily_basic_short:
+            return None
+    try:
+        df = _ts_query("daily_basic", trade_date=trade_date, fields=TS_DAILY_BASIC_FIELDS)
+    except Exception as e:      # noqa: BLE001
+        log.warning("Tushare daily_basic %s 失败: %s", trade_date, str(e)[:160])
+        return None
+    n = 0 if df is None else len(df)
+    if n < TS_DAILY_BASIC_MIN_ROWS:
+        with _ts_lock:
+            _ts_daily_basic_short[trade_date] = n
+        log.warning("Tushare daily_basic %s 只有 %d 行 (< %d: 当日还没出或只出了一部分), 不缓存",
+                    trade_date, n, TS_DAILY_BASIC_MIN_ROWS)
+        return df
+    _cache_save(key, df)
+    return df
+
+
+def fetch_valuation_tushare(trade_dates: list | None = None) -> tuple:
+    """-> (估值表 DataFrame[code, pe_ttm, pb, total_mv(元), float_mv(元), turnover, volume_ratio], info)。
+    info = {source: "tushare_daily_basic", trade_date, n, fell_back_from: 最新交易日 (退回前一交易日时) | None};
+    一天都拿不到 -> (None, {source: None, error: ...})。单位换算只在这一处。"""
+    if not _ts_available():
+        return None, {"source": None, "error": "未配置 tushare_token (data/secrets.json)"}
+    dates = [_ymd8(d) for d in (trade_dates or _valuation_trade_dates())]
+    tried = []
+    for i, d in enumerate(dates):
+        df = fetch_daily_basic_tushare(d)
+        n = 0 if df is None else len(df)
+        tried.append(f"{d}:{n}行")
+        if df is None or n < TS_DAILY_BASIC_MIN_ROWS or "ts_code" not in df.columns:
+            continue
+        if i > 0:
+            log.warning("Tushare daily_basic: 最新交易日 %s 的估值还没出 (%s) → 退回前一交易日 %s (%d 行); "
+                        "北京 15:45 后才齐, 明天这一行不该再出现", dates[0], ", ".join(tried[:-1]), d, n)
+
+        def _col(name):
+            return _to_num(df[name]) if name in df.columns else pd.Series(np.nan, index=df.index)
+
+        out = pd.DataFrame({
+            "code": df["ts_code"].astype(str).str[:6].str.zfill(6),
+            "pe_ttm": _col("pe_ttm"), "pb": _col("pb"),
+            "total_mv": _col("total_mv") * TS_MV_UNIT,
+            "float_mv": _col("circ_mv") * TS_MV_UNIT,
+            "turnover": _col("turnover_rate"), "volume_ratio": _col("volume_ratio"),
+        }).drop_duplicates("code").reset_index(drop=True)
+        return out, {"source": "tushare_daily_basic", "trade_date": d, "n": int(len(out)),
+                     "fell_back_from": dates[0] if i > 0 else None}
+    return None, {"source": None, "error": "daily_basic 没有可用交易日 (" + ", ".join(tried) + ")"}
+
+
+def fill_spot_valuation(spot: pd.DataFrame | None) -> tuple:
+    """快照缺估值列 → 用 Tushare daily_basic 补 pe_ttm/pb/total_mv/float_mv (+ 换手率/量比); 东财快照齐全 →
+    **原对象原样返回, 不触发任何调用**。-> (快照, info{spot_source, valuation_source, ...})。
+    只补整列为空的列, 已有的列一个数都不碰; Tushare 也拿不到 → 快照原样、info.valuation_source = 缺失。"""
+    src = spot_source_of(spot)
+    if spot is None or len(spot) == 0:
+        return spot, {"spot_source": src, "valuation_source": None}
+    if not spot_lacks_valuation(spot):
+        return spot, {"spot_source": src, "valuation_source": "东财"}
+    if not _ts_state["valuation_warned"]:
+        _ts_state["valuation_warned"] = True
+        log.warning("%s快照无估值列 (市盈率/市净率/总市值; 老版 akshare 才有), 改用 Tushare daily_basic 补", src)
+    val, info = fetch_valuation_tushare()
+    if val is None:
+        log.warning("估值列兜底失败: Tushare daily_basic 也不可用 (%s) — 快照仍无估值列, 优质榜将按 QL-EMPTY 规则拒发、沿用旧榜",
+                    info.get("error"))
+        return spot, {"spot_source": src, "valuation_source": "缺失", "error": info.get("error")}
+    out = spot.copy()
+    out["code"] = out["code"].astype(str).str.zfill(6)
+    v = val.set_index("code")
+    filled = []
+    for c in SPOT_VALUATION_COLS + SPOT_EXTRA_FILL_COLS:
+        if c not in v.columns:
+            continue
+        if c in out.columns and _to_num(out[c]).notna().any():
+            continue                                      # 已有数的列不覆盖
+        out[c] = out["code"].map(v[c]).to_numpy()
+        filled.append(c)
+    n_hit = int(out["code"].isin(v.index).sum())
+    n_pe = int(_to_num(out["pe_ttm"]).notna().sum()) if "pe_ttm" in out.columns else 0
+    log.info("%s快照无估值列 → Tushare daily_basic (%s) 补 %d/%d 只 (pe_ttm 非空 %d, 亏损股为空属正常; 市值 万元→元 ×%d; 补列 %s)%s",
+             src, info["trade_date"], n_hit, len(out), n_pe, int(TS_MV_UNIT), ",".join(filled),
+             "" if not info.get("fell_back_from") else
+             " — 注意: 当日 %s 还没出, 用的是前一交易日" % info["fell_back_from"])
+    try:
+        out.attrs["spot_source"] = src
+        out.attrs["valuation_source"] = "tushare_daily_basic"
+        out.attrs["valuation_trade_date"] = info["trade_date"]
+    except Exception:           # noqa: BLE001
+        pass
+    return out, {"spot_source": src, "valuation_source": "tushare_daily_basic",
+                 "valuation_trade_date": info["trade_date"], "valuation_n": n_hit,
+                 "fell_back_from": info.get("fell_back_from")}
+
+
+def fill_spot_industry(spot: pd.DataFrame | None) -> pd.DataFrame | None:
+    """快照无 industry 列 (新浪 / akshare 东财) → 用 fetch_industry_map() 补 (东财 f100 全市场一次; 东财不可达时它自己
+    退到 Tushare stock_basic, 名字经别名表换成东财口径); 东财直连快照自带 f100, 原样返回。查不到的票是 NaN (与东财 '-' 同义)。"""
+    if spot is None or len(spot) == 0:
+        return spot
+    if "industry" in spot.columns and spot["industry"].notna().any():
+        return spot
+    try:
+        m = fetch_industry_map() or {}
+    except Exception as e:      # noqa: BLE001
+        log.warning("快照行业列兜底失败: %s", e)
+        m = {}
+    if not m:
+        return spot
+    a = dict(getattr(spot, "attrs", None) or {})
+    out = spot.copy()
+    out["industry"] = out["code"].astype(str).str.zfill(6).map(m)
+    n = int(out["industry"].notna().sum())
+    src, _info = industry_map_source()
+    log.info("%s快照无行业列 → %s 行业映射补 %d/%d 只", spot_source_of(spot), src or "批量", n, len(out))
+    try:
+        out.attrs.update(a)
+        out.attrs["industry_source"] = src
+    except Exception:           # noqa: BLE001
+        pass
+    return out
+
+
+# Tushare stock_basic.industry (Tushare 自己的 ~110 个行业名, 09-23 服务器实测 111 个含空) → 东财口径行业名。
+# 「东财口径」= 流水线里行业名实际出现的两套一级/二级名的并集: fetch_industry_list 给的 90 个一级名 (如 '银行' '化学制药'
+# '通用设备' '饮料制造'; quality._industry_map 一直给的就是它, FIN_INDUSTRIES 的 '银行/保险/证券/多元金融' 要精确命中)
+# 与东财快照 f100 的二级名 (如 '饮料乳品' '水泥' '玻璃玻纤' '摩托车及其他'); 优先一级名, 一级没有对应才用二级名。
+# **只在 Tushare 的类别整体落在一个东财类别里时才映射**; 混装的 (电气设备 = 电池+光伏+电网, 元器件, 医疗保健 = 器械+服务,
+# 互联网, 家用电器, 电器仪表, 农业综合, 广告包装, 文教休闲) **原样沿用 Tushare 名** —— 宁可标签是 Tushare 的, 也不把
+# 347 只「电气设备」硬塞进「电池」。三类计数 (映射到东财口径 / 原样沿用 / 空) 由 fetch_industry_map_tushare 记进 info,
+# 优质榜 meta.industry_map_coverage 留痕。
+# 周期/金融模型键 (quality.CYCLICAL_KEYS / FIN_PB_KEYS, 子串匹配) 在这套目标名里能命中的: 煤炭 钢铁 化学原料 化学制品
+# 化学纤维 石油 航运 养殖 贵金属 小金属 工业金属 水泥 玻璃 银行 保险; 命不中的 (有色 化工 航空 农牧 船舶 能源金属 猪)
+# 在东财口径里本来就没有含这些字的名 (或 Tushare 没有这一类), 与东财日一致, 不是别名表的缺口。
+TS_INDUSTRY_ALIAS = {
+    # 金融 (FIN_INDUSTRIES 精确命中)
+    "银行": "银行", "保险": "保险", "证券": "证券", "多元金融": "多元金融",
+    # 医药
+    "化学制药": "化学制药", "生物制药": "生物制品", "中成药": "中药", "医药商业": "医药商业",
+    # 食品饮料
+    "白酒": "白酒", "啤酒": "饮料制造", "红黄酒": "饮料制造", "软饮料": "饮料制造", "乳制品": "饮料乳品",
+    "食品": "食品加工制造",
+    # 农林牧渔
+    "种植业": "种植业与林业", "林业": "种植业与林业", "渔业": "养殖业", "饲料": "饲料", "农药化肥": "农化制品",
+    # 化工
+    "化工原料": "化学原料", "染料涂料": "化学制品", "日用化工": "美容护理", "化纤": "化学纤维",
+    "塑料": "塑料制品", "橡胶": "橡胶制品",
+    # 钢铁 / 有色
+    "普钢": "钢铁", "特种钢": "钢铁", "钢加工": "钢铁",
+    "铜": "工业金属", "铝": "工业金属", "铅锌": "工业金属", "黄金": "贵金属", "小金属": "小金属",
+    "矿物制品": "金属新材料",
+    # 能源 / 公用
+    "煤炭开采": "煤炭开采加工", "焦炭加工": "煤炭开采加工",
+    "石油开采": "油气开采及服务", "石油加工": "石油加工贸易", "石油贸易": "石油加工贸易",
+    "火力发电": "电力", "水力发电": "电力", "新型电力": "电力", "供气供热": "燃气",
+    "水务": "环境治理", "环境保护": "环境治理",
+    # 建筑 / 建材 / 地产
+    "建筑工程": "建筑装饰", "装修装饰": "建筑装饰", "水泥": "水泥", "玻璃": "玻璃玻纤",
+    "其他建材": "建筑材料", "陶瓷": "建筑材料",
+    "全国地产": "房地产", "区域地产": "房地产", "园区开发": "房地产", "房产服务": "房地产",
+    # 机械 / 军工
+    "专用机械": "专用设备", "机械基件": "通用设备", "机床制造": "通用设备", "工程机械": "工程机械",
+    "轻工机械": "专用设备", "农用机械": "专用设备", "化工机械": "专用设备", "纺织机械": "专用设备",
+    "运输设备": "轨交设备", "船舶": "军工装备", "航空": "军工装备",
+    # 电子 / IT / 通信
+    "半导体": "半导体", "通信设备": "通信设备", "电信运营": "通信服务", "软件服务": "软件开发",
+    "IT设备": "计算机设备",
+    # 汽车
+    "汽车整车": "汽车整车", "汽车配件": "汽车零部件", "汽车服务": "汽车服务及其他", "摩托车": "摩托车及其他",
+    # 消费 / 轻工
+    "家居用品": "家居用品", "造纸": "造纸", "纺织": "纺织制造", "服饰": "服装家纺",
+    # 商贸
+    "百货": "零售", "超市连锁": "零售", "商品城": "零售", "电器连锁": "零售", "其他商业": "零售",
+    "商贸代理": "贸易", "批发业": "贸易",
+    # 交运
+    "仓储物流": "物流", "公路": "公路铁路运输", "路桥": "公路铁路运输", "铁路": "公路铁路运输",
+    "公共交通": "公路铁路运输", "水运": "港口航运", "港口": "港口航运", "空运": "机场航运", "机场": "机场航运",
+    # 传媒 / 服务
+    "影视音像": "文化传媒", "出版业": "文化传媒",
+    "旅游景点": "旅游及酒店", "旅游服务": "旅游及酒店", "酒店餐饮": "旅游及酒店",
+    # 综合
+    "综合类": "综合",
+}
+#: 有意原样沿用 (混装类别, 见上): 留在这里是让用例能锁住「这些名不该被硬映射」, 也让别人一眼知道不是漏了。
+TS_INDUSTRY_KEEP = ("电气设备", "元器件", "医疗保健", "互联网", "家用电器", "电器仪表", "农业综合", "广告包装", "文教休闲")
+
+
+def alias_industry(raw) -> tuple:
+    """Tushare 行业名 -> (东财口径行业名 | 原样 | None, 类别 'mapped' | 'kept' | 'empty')。"""
+    s = "" if raw is None else str(raw).strip()
+    if not s or s.lower() in ("nan", "none", "-"):
+        return None, "empty"
+    t = TS_INDUSTRY_ALIAS.get(s)
+    if t:
+        return t, "mapped"
+    return s, "kept"
+
+
+def fetch_stock_basic_tushare() -> pd.DataFrame | None:
+    """Tushare stock_basic(list_status=L) 原始表 (ts_code/symbol/name/industry/market/list_date), 按日缓存 (键含日期);
+    抛错 / 空 / 无 industry 列 -> None (warning)。"""
+    key = _cache_key("ts_stock_basic", dt.date.today().isoformat())
+    c = _cache_load(key)
+    if c is not None:
+        return c
+    try:
+        df = _ts_query("stock_basic", list_status="L", fields=TS_STOCK_BASIC_FIELDS)
+    except Exception as e:      # noqa: BLE001
+        log.warning("Tushare stock_basic 失败: %s", str(e)[:160])
+        return None
+    if df is None or len(df) == 0 or "industry" not in df.columns:
+        log.warning("Tushare stock_basic 返回空表或无 industry 列 (%s 行)", 0 if df is None else len(df))
+        return None
+    _cache_save(key, df)
+    return df
+
+
+def fetch_industry_map_tushare() -> tuple:
+    """行业归属兜底 -> ({code: 东财口径行业名}, info)。info = {source, total, mapped, kept, empty, n_groups, kept_names};
+    stock_basic 不可用 -> ({}, {source: None, error})。"""
+    df = fetch_stock_basic_tushare()
+    if df is None:
+        return {}, {"source": None, "error": "Tushare stock_basic 不可用"}
+    codes = (df["symbol"] if "symbol" in df.columns else df["ts_code"].astype(str).str[:6])
+    m: dict = {}
+    cnt = {"mapped": 0, "kept": 0, "empty": 0}
+    kept: dict = {}
+    for code, raw in zip(codes.astype(str).str.zfill(6), df["industry"]):
+        name, kind = alias_industry(raw)
+        cnt[kind] += 1
+        if kind == "kept":
+            kept[name] = kept.get(name, 0) + 1
+        if name:
+            m[code] = name
+    info = {"source": "tushare_stock_basic", "total": int(len(df)), "mapped": cnt["mapped"], "kept": cnt["kept"],
+            "empty": cnt["empty"], "n_groups": len(set(m.values())), "kept_names": sorted(kept)}
+    return m, info
+
+
+def _coverage_text(info: dict) -> str:
+    if not info or info.get("source") != "tushare_stock_basic":
+        return ""
+    return ("映射到东财口径 %d, 原样沿用 Tushare 名 %d (%s), 空 %d"
+            % (info.get("mapped", 0), info.get("kept", 0), "/".join(info.get("kept_names") or []) or "-", info.get("empty", 0)))
 
 
 #: B 股代码前缀: 沪B 900xxx / 深B 200xxx。**与北交所的 920xxx 不冲突** ("900" vs "920"),
@@ -2134,6 +2533,55 @@ def fetch_hist_long(code: str, years: int = 10) -> pd.DataFrame | None:
 
 _ind_map = None
 _ind_map_lock = threading.Lock()
+_ind_map_source = None          # "东财" | "tushare_stock_basic" | None —— 本进程这份 _ind_map 是谁给的 (优质榜 meta 留痕)
+_ind_map_info: dict = {}
+
+
+def _industry_map_em_hosts() -> tuple:
+    """东财 push2 clist 全市场 f100 (所属行业) —— 多主机逐个试 -> (map, 用的主机 | None)。拿不到 -> ({}, None)。"""
+    m: dict = {}
+    # 主机故障转移: 本机对各 push2 主机的可达性会变(代理时好时坏), 逐个试。
+    # 2026-07-27 实测 push2.eastmoney.com 可达而 push2delay SSL 报错 —— 反过来的
+    # 情况以前也出现过, 所以这里不写死, 谁通用谁。
+    HOSTS = ("push2.eastmoney.com", "82.push2.eastmoney.com",
+             "push2delay.eastmoney.com", "push2his.eastmoney.com")
+    for host in HOSTS:
+        m = {}
+        try:
+            import requests
+            sess = requests.Session()
+            sess.headers.update({"User-Agent": _BROWSER_UA,
+                                 "Referer": "https://quote.eastmoney.com/"})
+            url = f"https://{host}/api/qt/clist/get"
+            page, total, PZ = 1, None, 100      # 服务端每页上限 100, 必须分页
+            while page <= 80:                   # 上限兜底, 正常 ~59 页
+                r = sess.get(url, params={
+                    "pn": page, "pz": PZ, "po": 0, "np": 1, "fltt": 2, "invt": 2,
+                    "fid": "f12", "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23",
+                    "fields": "f12,f14,f100"},
+                    timeout=CONFIG["fetch"]["timeout_sec"])
+                d = ((r.json() or {}).get("data") or {})
+                rows = d.get("diff") or []
+                if isinstance(rows, dict):      # 某些主机返回 {"0":{...}} 形式
+                    rows = list(rows.values())
+                if total is None:
+                    total = d.get("total") or 0
+                if not rows:
+                    break
+                for it in rows:
+                    code = str(it.get("f12") or "").zfill(6)
+                    ind = str(it.get("f100") or "").strip()
+                    if code and ind and ind not in ("-", "—"):
+                        m[code] = ind
+                if total and page * PZ >= total:
+                    break
+                page += 1
+        except Exception as e:  # noqa: BLE001
+            log.debug("批量行业映射失败(%s): %s", host, e)
+            continue
+        if m:
+            return m, host
+    return {}, None
 
 
 def fetch_industry_map() -> dict:
@@ -2143,8 +2591,13 @@ def fetch_industry_map() -> dict:
     它的 clist 接口带 f100(所属行业) 字段, 5500+ 只一次返回, ~2s, 纯 JSON 线程安全
     —— 远优于逐只查(雪球有WAF; 巨潮 stock_profile_cninfo 用 py_mini_racer, 多线程会
     让进程硬崩)。拿不到则返回空 dict, 上层再逐只降级。
+
+    2026-09-23 卡 QL-SPOT: 所有东财主机都不可达 (push2 对海外 IP 502, 09-21 起) → 退到 Tushare stock_basic
+    (fetch_industry_map_tushare, 名字经别名表换成东财口径), warning 一行点名覆盖 N/M 与三类计数; 来源记在
+    `industry_map_source()` 供优质榜 meta。Tushare 那份**不**写进 ind_map 缓存 (它自己按日缓存原始表), 东财一恢复
+    下一个进程就自动走回东财。
     """
-    global _ind_map
+    global _ind_map, _ind_map_source, _ind_map_info
     if _ind_map is not None:
         return _ind_map
     with _ind_map_lock:
@@ -2153,59 +2606,31 @@ def fetch_industry_map() -> dict:
         key = _cache_key("ind_map", dt.date.today().isoformat())
         c = _cache_load(key)
         if c:
-            _ind_map = c
+            _ind_map, _ind_map_source, _ind_map_info = c, "东财", {"source": "东财", "n": len(c), "cached": True}
             return _ind_map
-        m = {}
-        used_host = None
-        # 主机故障转移: 本机对各 push2 主机的可达性会变(代理时好时坏), 逐个试。
-        # 2026-07-27 实测 push2.eastmoney.com 可达而 push2delay SSL 报错 —— 反过来的
-        # 情况以前也出现过, 所以这里不写死, 谁通用谁。
-        HOSTS = ("push2.eastmoney.com", "82.push2.eastmoney.com",
-                 "push2delay.eastmoney.com", "push2his.eastmoney.com")
-        for host in HOSTS:
-            m = {}
-            try:
-                import requests
-                sess = requests.Session()
-                sess.headers.update({"User-Agent": _BROWSER_UA,
-                                     "Referer": "https://quote.eastmoney.com/"})
-                url = f"https://{host}/api/qt/clist/get"
-                page, total, PZ = 1, None, 100      # 服务端每页上限 100, 必须分页
-                while page <= 80:                   # 上限兜底, 正常 ~59 页
-                    r = sess.get(url, params={
-                        "pn": page, "pz": PZ, "po": 0, "np": 1, "fltt": 2, "invt": 2,
-                        "fid": "f12", "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23",
-                        "fields": "f12,f14,f100"},
-                        timeout=CONFIG["fetch"]["timeout_sec"])
-                    d = ((r.json() or {}).get("data") or {})
-                    rows = d.get("diff") or []
-                    if isinstance(rows, dict):      # 某些主机返回 {"0":{...}} 形式
-                        rows = list(rows.values())
-                    if total is None:
-                        total = d.get("total") or 0
-                    if not rows:
-                        break
-                    for it in rows:
-                        code = str(it.get("f12") or "").zfill(6)
-                        ind = str(it.get("f100") or "").strip()
-                        if code and ind and ind not in ("-", "—"):
-                            m[code] = ind
-                    if total and page * PZ >= total:
-                        break
-                    page += 1
-            except Exception as e:  # noqa: BLE001
-                log.debug("批量行业映射失败(%s): %s", host, e)
-                continue
-            if m:
-                used_host = host
-                break
+        m, used_host = _industry_map_em_hosts()
         if m:
             log.info("批量行业映射: %d 只 (东财 %s)", len(m), used_host)
             _cache_save(key, m)
+            _ind_map_source, _ind_map_info = "东财", {"source": "东财", "n": len(m), "host": used_host}
         else:
-            log.warning("批量行业映射获取失败(所有东财主机不可达), 将逐只降级")
+            tm, info = fetch_industry_map_tushare()
+            if tm:
+                m = tm
+                _ind_map_source, _ind_map_info = "tushare_stock_basic", info
+                log.warning("行业映射: 东财不可达 (所有 push2 主机), Tushare stock_basic 覆盖 %d/%d (%s)",
+                            len(m), info.get("total", 0), _coverage_text(info))
+            else:
+                _ind_map_source, _ind_map_info = None, info
+                log.warning("批量行业映射获取失败(所有东财主机不可达, Tushare stock_basic 也不可用: %s), 将逐只降级",
+                            info.get("error"))
         _ind_map = m
         return _ind_map
+
+
+def industry_map_source() -> tuple:
+    """本进程 fetch_industry_map() 那份映射的来源 -> (来源名 | None, info)。没调过 -> (None, {})。"""
+    return _ind_map_source, dict(_ind_map_info)
 
 
 # 巨潮 stock_profile_cninfo 内部走 py_mini_racer(V8) 解密, **多线程并发会让进程直接
