@@ -554,7 +554,8 @@ def test_industry_map_tushare_alias_counts_and_daily_cache(ts_box):
     m2, _ = ds.fetch_industry_map_tushare()
     assert m2 == m and ts_box.n("stock_basic") == 1                      # 同日读缓存
     assert os.path.exists(os.path.join(str(ts_box.cache), ds._cache_key("ts_stock_basic", TODAY) + ".pkl"))
-    assert ds._cache_key("ts_stock_basic", TODAY) != ds._cache_key("ts_stock_basic", "2026-09-24")
+    # 键含日期: 与「昨天」比 (09-24 回修: 原来写死 "2026-09-24", 到了那天 TODAY 就是它, 用例自炸 —— 干净树 1 failed / 202 passed)
+    assert ds._cache_key("ts_stock_basic", TODAY) != ds._cache_key("ts_stock_basic", (dt.date.today() - dt.timedelta(days=1)).isoformat())
 
 
 def test_fetch_industry_map_falls_back_to_tushare_only_when_em_hosts_dead(ts_box, monkeypatch, caplog):

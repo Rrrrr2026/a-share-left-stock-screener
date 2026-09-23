@@ -34,7 +34,7 @@ from ashare import module4_crossscore as m4
 from ashare import module6_profile as m6
 from ashare import tradeplan as tp
 from ashare import export_data as ex
-from ashare.quality import industry_base_name      # 景气分查表: 东财 f100 二级名 (银行Ⅱ) → 一级名 (银行)
+from ashare.quality import industry_base_name      # 景气分查表 ②: 东财 f100 二级名 (银行Ⅱ) → 去后缀 (银行); ④ 静态表在 ds.F100_TO_L1
 
 # Windows 控制台默认 GBK, 输出中文/emoji 会报 UnicodeEncodeError; 统一切到 UTF-8
 for _s in (sys.stdout, sys.stderr):
@@ -85,17 +85,93 @@ def industry_groups_from_spot(spot) -> dict:
     return {str(ind): list(g["code"].astype(str).str.zfill(6)) for ind, g in s.groupby("industry")}
 
 
-def prosperity_for(prosperity_map: dict, industry) -> float | None:
-    """景气分查表: 模块1 的景气榜按东财/同花顺**一级**行业名, 个股归属是东财 f100 **二级**名 (银行Ⅱ / 白酒Ⅱ …),
-    先按原名查, 查不到去掉 Ⅱ/Ⅲ 后缀再查 (银行Ⅱ → 银行); 仍查不到 → None (module4 按"景气未知"处理, 与全市场回退同)。"""
-    if not industry or not prosperity_map:
-        return None
-    v = prosperity_map.get(industry)
-    if v is None:
+def cons_l1_index(ind_to_codes: dict | None) -> dict:
+    """{code: 一级行业名} —— 候选池成分 {行业: [码]} 的反转, **只给景气分查表用** (prosperity_lookup 第 ③ 步), 不贴标签:
+    成分口径本来就是「这只票属于哪个一级景气行业」的答案 (模块1 景气榜的键就是这些一级名); 归属 / dom / 行业 PE 中位仍一律
+    快照 f100 (老板 2026-09-23 拍板 ①)。一只票落在多个成分里 → 取先出现的 (ind_df 顺序, 确定性), debug 记数。"""
+    out: dict = {}
+    dup = 0
+    for ind_name, codes in (ind_to_codes or {}).items():
+        for c in codes or []:
+            c = str(c).zfill(6)
+            if c in out:
+                dup += 1
+                continue
+            out[c] = ind_name
+    if dup:
+        log.debug("成分反查索引: %d 只票落在多个一级成分里, 取先出现的", dup)
+    return out
+
+
+PROSPERITY_STEPS = ("原名", "去后缀", "成分反查", "二级→一级表")
+
+
+def prosperity_lookup(prosperity_map: dict, industry, code=None, cons_l1_of: dict | None = None) -> tuple:
+    """景气分查表 -> (分 | None, 命中步 | None)。模块1 的景气榜按同花顺/东财**一级**行业名 (fetch_industry_list, 90 个), 个股归属是
+    东财 f100 **二级**名 (银行Ⅱ / 房地产开发 / 普钢 …), 四步:
+      ① 原名 (f100 名恰好就是一级名: 半导体 / 电池 / 汽车零部件 …)
+      ② 去 Ⅱ/Ⅲ 后缀再查 (银行Ⅱ → 银行, 白酒Ⅱ → 白酒)
+      ③ 成分反查 cons_l1_of[code] (这只票今天在哪个一级行业的成分里, build_candidate_universe 的 ind_to_codes 反转; 成分口径当天只
+         覆盖拉到的 3-13 个行业, 但对拉到的票是精确答案, 比静态表优先; **快照没给这只票行业 (industry 空) 也查** —— 09-18 成分 1223 只里
+         有 14 只 f100 空的, 旧口径它们靠成分一级名有景气分, 不能因为改了归属口径就丢)
+      ④ 静态表 ds.F100_TO_L1 (房地产开发 → 房地产, 普钢 → 钢铁, 水泥 → 建筑材料 …)
+    ①② 只两步是 2026-09-23 卡 IND-PE 的写法: 归属改 f100 二级名后 128 个 f100 名只有 67 个能查到, 房地产/建筑材料/钢铁/美容护理 等
+    ~20 个一级行业的票整体查不到景气分, 综合分平白少 4-8 分 (09-24 回修加 ③④)。查到的分是 NaN (榜上有这个行业但没算出分) 就停在那一步
+    返回 NaN (module4 按未知处理), **不**继续借别的行业的分; 四步都查不到 → (None, None), module4 按"景气未知"处理 (综合分按 50 中性,
+    强左侧 tag 视为通过)。"""
+    if not prosperity_map:
+        return None, None
+    industry = industry.strip() if isinstance(industry, str) and industry.strip() else None
+    base = None
+    if industry:
+        v = prosperity_map.get(industry)
+        if v is not None:
+            return v, PROSPERITY_STEPS[0]
         base = industry_base_name(industry)
         if base and base != industry:
             v = prosperity_map.get(base)
-    return v
+            if v is not None:
+                return v, PROSPERITY_STEPS[1]
+    if code is not None and cons_l1_of:
+        l1 = cons_l1_of.get(str(code).zfill(6))
+        if l1 is not None:
+            v = prosperity_map.get(l1)
+            if v is not None:
+                return v, PROSPERITY_STEPS[2]
+    if industry:
+        l1 = ds.F100_TO_L1.get(industry) or (ds.F100_TO_L1.get(base) if base else None)
+        if l1 is not None:
+            v = prosperity_map.get(l1)
+            if v is not None:
+                return v, PROSPERITY_STEPS[3]
+    return None, None
+
+
+def prosperity_for(prosperity_map: dict, industry, code=None, cons_l1_of: dict | None = None) -> float | None:
+    """景气分 (prosperity_lookup 的分那一半; 老签名 (map, industry) 照旧可用, 只是少了 ③ 成分反查)。"""
+    return prosperity_lookup(prosperity_map, industry, code, cons_l1_of)[0]
+
+
+def prosperity_hit_summary(prosperity_map: dict, recs, cons_l1_of: dict | None = None) -> tuple:
+    """阶段B 结束后的景气分命中统计 -> (日志文案, 计数)。命中 = 查到且不是 NaN, 按四步分列: 「成分反查补 K / 二级→一级表补 J」就是
+    ①② 查不到、靠 ③④ 救回来的票数。journal 核法: 东财恢复日候选 ~280 只里命中应 >= 09-18 (旧口径) 的 181/280, 不该更低。"""
+    counts = {s: 0 for s in PROSPERITY_STEPS}
+    n_hit = n_nan = 0
+    recs = list(recs or [])
+    for rec in recs:
+        v, how = prosperity_lookup(prosperity_map, rec.get("industry"), rec.get("code"), cons_l1_of)
+        if how is None:
+            continue
+        if isinstance(v, float) and v != v:
+            n_nan += 1
+            continue
+        counts[how] += 1
+        n_hit += 1
+    unknown = len(recs) - n_hit
+    text = ("景气分查表: 命中 %d/%d 只 (原名 %d / 去后缀 %d / 成分反查补 %d / 二级→一级表补 %d), 未知 %d 只%s"
+            % (n_hit, len(recs), counts["原名"], counts["去后缀"], counts["成分反查"], counts["二级→一级表"], unknown,
+               (" (含榜上无分 NaN %d)" % n_nan) if n_nan else ""))
+    return text, {**counts, "hit": n_hit, "total": len(recs), "unknown": unknown, "nan": n_nan}
 
 
 def build_candidate_universe(spot, spot_map, ind_df, selected_inds=None):
@@ -412,6 +488,8 @@ def run(full_market: bool, use_cache: bool):
         spot_map = {r["code"]: r.to_dict() for _, r in spot.iterrows()}
 
     universe, ind_to_codes = build_candidate_universe(spot, spot_map, ind_df, selected_inds)
+    # 成分反查索引: 只给景气分查表 (prosperity_lookup ③) 用, 不贴标签 (归属仍一律快照 industry 列); 09-24 卡 IND-PE 回修
+    cons_l1_of = cons_l1_index(ind_to_codes)
     # 开扫前按价格库的点时股票池裁池 (退市老代码 / 次新不足 60 根)。n_pool_raw 是裁前的东财口径,
     # 与 scan_basis 一起写进 run_log 和 meta —— 09-08 起 n_scanned 换了口径, 得让快照自己说清楚。
     n_pool_raw = len(universe)
@@ -543,7 +621,7 @@ def run(full_market: bool, use_cache: bool):
             share_txt = f" · {d['share']}%" if d["share"] is not None else ""
             f["dominance_disp"] = f"{crown}#{d['rank']}/{d['n']}{share_txt}"
             f["dom_rank"], f["dom_n"], f["dom_share"] = d["rank"], d["n"], d["share"]
-        fr = m4.cross_score(rec, f, prosperity_for(prosperity_map, industry))
+        fr = m4.cross_score(rec, f, prosperity_for(prosperity_map, industry, rec["code"], cons_l1_of))
         return (rec, detail, f, fr)
 
     results = []
@@ -556,6 +634,8 @@ def run(full_market: bool, use_cache: bool):
             except Exception as e:
                 log.debug("基本面失败: %s", e)
                 continue
+    # 景气分命中统计 (rec["industry"] 已是打分时用的那个; 纯查表, 零请求): 东财恢复日不该低于 09-18 旧口径的 181/280
+    log.info("%s", prosperity_hit_summary(prosperity_map, [x[0] for x in results], cons_l1_of)[0])
 
     # 按综合分排序后落库(同分按代码升序, 结果确定); 详情(K线)只存前 N 只以控制 JS 体积
     results.sort(key=lambda x: (-(x[3]["final_score"] if x[3].get("final_score") is not None else -1),

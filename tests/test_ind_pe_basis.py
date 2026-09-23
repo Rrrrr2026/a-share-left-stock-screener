@@ -15,6 +15,8 @@ PE 切真 TTM + 行业口径统一 的离线自测 (不联网; 2026-09-23 卡 IN
   (c) 行业归属 (run_pipeline): 候选池元组的 industry 一律来自快照 industry 列 (spot_industry_of), 成分口径行业名不再写进去;
       行业 PE 中位按快照 industry 列分组 (industry_groups_from_spot); 景气分查表 二级名 → 去后缀一级名 (prosperity_for)。
       quality 那边「成分 5000 只也不选」的用例在 test_quality_spot_fallback.py。
+  (f) 景气分查表四步 (2026-09-24 卡 IND-PE 回修, 校验员 MEDIUM): 原名 → 去后缀 → 成分反查 (cons_l1_index) → 静态表 ds.F100_TO_L1;
+      表的键值都在东财口径词表内且 128 个 f100 名除 7 个有意不映射外全能查到; NaN 不借分; run() 接线锁源码; 命中统计文案。
   (d) 留痕: spot_sources / fill_spot_valuation 每条路都带 pe_basis="ttm"; 看板 dashboard_data.js 与历史快照 day_<日>.json 的
       meta 带 pe_basis / industry_basis; 优质榜 meta 与 history/quality_<日>.json 的在 test_quality_spot_fallback.py。
   (e) PE_TTM_COLUMN_NAMES 里没有会子串命中「市盈率-动态」的名 (rename_normalize 是子串匹配)。
@@ -24,6 +26,7 @@ PE 切真 TTM + 行业口径统一 的离线自测 (不联网; 2026-09-23 卡 IN
 运行:  python -m pytest tests/test_ind_pe_basis.py -q
 """
 from __future__ import annotations
+import inspect
 import json
 import logging
 import os
@@ -41,8 +44,10 @@ from ashare import datasource as ds                    # noqa: E402
 from ashare import module3_fundamentals as m3          # noqa: E402
 from ashare.config import CONFIG                       # noqa: E402
 import run_pipeline as rp                              # noqa: E402
+from ashare.quality import industry_base_name          # noqa: E402
 from test_quality_spot_fallback import (               # noqa: E402  (同目录用例模块; 夹具 import 进来即可用)
     CODES, D0, ts_box, _daily_basic, _em_spot, _sina_spot, _msgs,   # noqa: F401
+    EM_LEVEL1, EM_F100, TS_NAMES,
 )
 
 
@@ -258,3 +263,71 @@ def test_spot_industry_of_and_groups_and_prosperity_lookup():
     assert rp.prosperity_for(pm, "银行Ⅱ") == 77.0 and rp.prosperity_for(pm, "银行") == 77.0
     assert rp.prosperity_for(pm, "半导体") == 60.0 and rp.prosperity_for(pm, "股份制银行Ⅲ") is None
     assert rp.prosperity_for(pm, None) is None and rp.prosperity_for({}, "银行") is None
+
+
+# ============================================================ (f) 景气分查表四步 (2026-09-24 卡 IND-PE 回修)
+def test_f100_to_l1_table_within_vocab_and_covers_every_f100_name():
+    """表的键都是 f100 二级名 (EM_F100), 值都是 fetch_industry_list 一级名 (EM_LEVEL1); 键不能已经能靠原名/去后缀查到 (表只装
+    救不回来的); 128 个 f100 名除 F100_L1_UNMAPPED 7 个外都能查到 (回修前 67 个); Tushare 兜底日的别名目标除 TS_INDUSTRY_KEEP
+    (混装, 有意原样沿用) 与 摩托车及其他 外都能查到 (回修前 14 个查不到)。"""
+    pm = {n: 60.0 for n in EM_LEVEL1}
+    assert set(ds.F100_TO_L1) <= set(EM_F100) and set(ds.F100_TO_L1.values()) <= set(EM_LEVEL1)
+    assert set(ds.F100_L1_UNMAPPED) <= set(EM_F100) and not (set(ds.F100_TO_L1) & set(ds.F100_L1_UNMAPPED))
+    for k in ds.F100_TO_L1:
+        assert k not in pm and industry_base_name(k) not in pm, k               # 表里没有多余行
+    miss = sorted(n for n in EM_F100 if rp.prosperity_for(pm, n) is None)
+    assert miss == sorted(ds.F100_L1_UNMAPPED) and len(EM_F100) - len(miss) == 121
+    targets = {ds.alias_industry(n)[0] for n in TS_NAMES} - {None}
+    miss_ts = sorted(t for t in targets if rp.prosperity_for(pm, t) is None)
+    assert miss_ts == sorted(set(ds.TS_INDUSTRY_KEEP) | {"摩托车及其他"})
+
+
+def test_prosperity_lookup_four_steps_priority_and_nan():
+    pm = {"房地产": 66.0, "钢铁": 40.0, "银行": 77.0, "建筑材料": 30.0, "半导体": float("nan")}
+    assert rp.prosperity_lookup(pm, "房地产开发") == (66.0, "二级→一级表")          # 校验员点名的两条
+    assert rp.prosperity_lookup(pm, "普钢") == (40.0, "二级→一级表")
+    assert rp.prosperity_lookup(pm, "特钢Ⅱ") == (40.0, "二级→一级表") and rp.prosperity_lookup(pm, "水泥") == (30.0, "二级→一级表")
+    assert rp.prosperity_lookup(pm, "银行") == (77.0, "原名") and rp.prosperity_lookup(pm, "银行Ⅱ") == (77.0, "去后缀")
+    assert rp.prosperity_lookup(pm, " 银行 ") == (77.0, "原名") and rp.prosperity_lookup(pm, " 普钢 ") == (40.0, "二级→一级表")
+    cons = {"600000": "银行", "000002": "房地产"}
+    assert rp.prosperity_lookup(pm, "陌生二级名", "600000", cons) == (77.0, "成分反查")     # ①②④ 都查不到, 成分救回
+    assert rp.prosperity_lookup(pm, "房地产开发", "600000", cons) == (77.0, "成分反查")     # ③ 先于 ④: 今天的成分比静态表准
+    assert rp.prosperity_lookup(pm, "银行Ⅱ", "000002", cons) == (77.0, "去后缀")            # ①② 先于 ③
+    assert rp.prosperity_lookup(pm, "房地产开发", 999, cons) == (66.0, "二级→一级表")       # 不在成分里 → ④
+    assert rp.prosperity_lookup(pm, "陌生二级名", 2, cons) == (66.0, "成分反查")            # zfill: 2 → 000002 → 房地产
+    v, how = rp.prosperity_lookup(pm, "半导体", "600000", cons)                             # 榜上有但 NaN: 停在 ①, 不借银行的分
+    assert how == "原名" and v != v
+    assert rp.prosperity_lookup(pm, "饰品", "999999", cons) == (None, None)                 # 有意不映射 → 未知
+    assert rp.prosperity_lookup(pm, None, "600000", cons) == (77.0, "成分反查")             # 快照没给行业, 成分里有 → 照样查 (09-18 有 14 只)
+    assert rp.prosperity_lookup(pm, " ", "000002", cons) == (66.0, "成分反查") and rp.prosperity_lookup(pm, "", "999999", cons) == (None, None)
+    assert rp.prosperity_lookup(pm, None) == (None, None) and rp.prosperity_lookup({}, "银行") == (None, None)
+    assert rp.prosperity_lookup({}, None, "600000", cons) == (None, None)
+    assert rp.prosperity_for(pm, "房地产开发") == 66.0 and rp.prosperity_for(pm, "陌生二级名", "600000", cons) == 77.0
+    assert rp.prosperity_for(pm, "饰品") is None
+
+
+def test_cons_l1_index_and_hit_summary_text():
+    idx = rp.cons_l1_index({"银行": ["600000", "1"], "钢铁": ["600000", "600019"], "空": []})
+    assert idx == {"600000": "银行", "000001": "银行", "600019": "钢铁"}                     # 先出现的赢; zfill
+    assert rp.cons_l1_index({}) == {} and rp.cons_l1_index(None) == {}
+    pm = {"房地产": 66.0, "钢铁": 40.0, "银行": 77.0, "半导体": float("nan")}
+    recs = [{"code": "600000", "industry": "银行"}, {"code": "601398", "industry": "银行Ⅱ"},
+            {"code": "600019", "industry": "冶钢原料"},                                       # ④ 表: 冶钢原料 → 钢铁
+            {"code": "000002", "industry": "陌生二级名"},                                     # ③ 成分反查
+            {"code": "688981", "industry": "半导体"},                                          # 榜上无分 NaN
+            {"code": "300001", "industry": None}, {"code": "300002", "industry": "饰品"}]
+    text, c = rp.prosperity_hit_summary(pm, recs, {"000002": "房地产"})
+    assert text == "景气分查表: 命中 4/7 只 (原名 1 / 去后缀 1 / 成分反查补 1 / 二级→一级表补 1), 未知 3 只 (含榜上无分 NaN 1)"
+    assert c["hit"] == 4 and c["unknown"] == 3 and c["nan"] == 1 and c["total"] == 7
+    assert rp.prosperity_hit_summary({}, [], None)[0] == \
+        "景气分查表: 命中 0/0 只 (原名 0 / 去后缀 0 / 成分反查补 0 / 二级→一级表补 0), 未知 0 只"
+
+
+def test_run_wires_cons_reverse_index_lookup_and_summary():
+    """run() 不能离线跑 (联网 + 落库), 接线只能锁源码 (上一张卡 needs_boss ④ 记的缺口): 成分反查索引建在候选池之后, 阶段B 每只按
+    (industry, code, cons_l1_of) 查, 阶段B 结束打一行命中统计; 老的两参调用不能留。"""
+    src = inspect.getsource(rp.run)
+    assert "cons_l1_of = cons_l1_index(ind_to_codes)" in src
+    assert 'prosperity_for(prosperity_map, industry, rec["code"], cons_l1_of)' in src
+    assert "prosperity_hit_summary(prosperity_map, [x[0] for x in results], cons_l1_of)" in src
+    assert "prosperity_for(prosperity_map, industry))" not in src
