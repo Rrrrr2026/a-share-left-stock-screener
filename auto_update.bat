@@ -25,6 +25,17 @@ rem Python runs with -X utf8 so its Chinese log lines land in data\update.log as
 rem pipeline's (a redirected stdout would otherwise be GBK on this PC).
 rem Env overrides, for testing only: PSTORE_WAIT_TRIES, PSTORE_WAIT_SLEEP, PSTORE_TARGET_DAY.
 rem "auto_update.bat gate" runs only step 0 and the gate, then exits with the gate result.
+rem ---- pipeline guard (card PC-UPDATE fix B, 2026-09-24) ---------------------------------------
+rem [2/4] watchdog.py exits 1 when run_pipeline failed twice, or was killed for no heartbeat with
+rem no time left to retry (09-10 / 09-14 / 09-18 all happened). Before the fix nothing looked at
+rem that rc: [3/4] copied whatever dashboard\*.js were lying in the working tree (the previous
+rem run's files, i.e. yesterday's or older prices) into docs\ and [4/4] pushed them to the mirror.
+rem Now a non-zero watchdog rc jumps to :pipeline_failed, which writes one line
+rem "==== ABORT ==== pipeline failed (watchdog rc=N); nothing copied, nothing pushed" to
+rem data\update.log and exits 1: no copy, no git. The mirror keeps its previous (good) day.
+rem Env override, testing only: PIPELINE_WATCHDOG = script run in place of watchdog.py (a stub
+rem that exits 1 proves the guard without a 2h pipeline). tests\test_auto_update_bat.py runs this
+rem file for real in a sandbox (fake pricestore/watchdog, local bare git remote) for every path.
 if not defined PSTORE_WAIT_TRIES set "PSTORE_WAIT_TRIES=6"
 if not defined PSTORE_WAIT_SLEEP set "PSTORE_WAIT_SLEEP=600"
 set "TARGET_DAY="
@@ -67,7 +78,11 @@ echo [pricestore] ready for %TARGET_DAY% (rc=0), continuing >> "%LOG%"
 if /I "%~1"=="gate" goto :gate_only
 
 echo [2/4] Fetch data and score (about 10-15 min) ...
-"%PYEXE%" watchdog.py >> "%LOG%" 2>&1
+if not defined PIPELINE_WATCHDOG set "PIPELINE_WATCHDOG=watchdog.py"
+"%PYEXE%" "%PIPELINE_WATCHDOG%" >> "%LOG%" 2>&1
+set "PIPE_RC=%errorlevel%"
+if not "%PIPE_RC%"=="0" goto :pipeline_failed
+echo [pipeline] watchdog rc=0, copying results to docs and publishing >> "%LOG%"
 
 echo [3/4] Copy result to docs ...
 copy /Y "dashboard\index.html" "docs\index.html" >nul
@@ -101,3 +116,10 @@ goto :eof
 echo ==== GATE-ONLY DONE ==== library ready for %TARGET_DAY% >> "%LOG%"
 echo Gate only: price library ready for %TARGET_DAY% (rc=0). Pipeline not run, nothing pushed.
 exit /b 0
+
+:pipeline_failed
+echo ==== ABORT ==== pipeline failed (watchdog rc=%PIPE_RC%); nothing copied, nothing pushed >> "%LOG%"
+echo.
+echo ABORT: pipeline failed (watchdog rc=%PIPE_RC%). Nothing copied to docs, nothing pushed. See data\update.log
+if /I not "%~1"=="auto" pause
+exit /b 1
