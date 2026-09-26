@@ -75,6 +75,18 @@ exit /b 1
 
 :pstore_ok
 echo [pricestore] ready for %TARGET_DAY% (rc=0), continuing >> "%LOG%"
+rem ---- data lake update (card LAKE-1, 2026-09-26): NON-FATAL, runs once the price library is ready ---
+rem stock-core\research\lake.py "update" adds the newest trade day of Tushare daily_basic to
+rem data\lake\lake.db (finance / SW tables refresh about monthly, --force not used here). Skipped when
+rem stock-core is not checked out beside this repo (the sandbox tests have no such path). A non-zero rc
+rem only writes one line here: it never changes the gate result, the pipeline, docs or git. --budget
+rem caps its wall clock (seconds) so it cannot hang this task; the Python side also has the per-call
+rem process deadline. Runs in "gate" mode too, so "auto_update.bat gate" exercises it for real.
+rem No parentheses inside this block: a ")" in echo text would close the "if exist (" block early.
+if exist "..\stock-core\research\lake.py" (
+  "%PYEXE%" -X utf8 "..\stock-core\research\lake.py" update --budget 900 >> "%LOG%" 2>&1
+  if errorlevel 1 echo [lake] update exited with a non-zero rc - non-fatal, see the lines above >> "%LOG%"
+)
 if /I "%~1"=="gate" goto :gate_only
 
 echo [2/4] Fetch data and score (about 10-15 min) ...
