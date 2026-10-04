@@ -15,7 +15,8 @@
   ④ 都补不上 -> 照旧按旧一日算, 但 idx_date / meta.industry_asof 留痕 + 两条 WARNING, 看板标「行业数据截至 X」;
   ⑤ 末日比 data_date 还新 -> 截到 data_date;
   ⑥ 取数层 (ths_daily 解析 / 行业一览的涨跌幅列不许取成领涨股的) 、库 (老库补列) 、导出 meta、看板那一小块的契约。
-日期全部是**过去的真实交易日** (2026-09-25 中秋休市), 不依赖今天是哪天。
+日期全部是**过去的真实日历** (末三个交易日 09-28 / 09-29 / 09-30; 「休市 / 复市」用中秋小长假: 09-24 周四节前最后交易日,
+09-25 周五休市, 09-28 周一复市), 时钟一律注入, 不依赖今天是哪天。
 """
 from __future__ import annotations
 import datetime as dt
@@ -43,10 +44,13 @@ from ashare.config import CONFIG                                 # noqa: E402
 
 BJ = dt.timezone(dt.timedelta(hours=8))
 CEST = dt.timezone(dt.timedelta(hours=2))
-#: 真实日历: 工作日里去掉 2026-09-25 (中秋)。末三个交易日 09-28 / 09-29 / 09-30, 之后国庆休市到 10-07。
+#: 真实日历: 工作日里去掉 2026-09-25 (中秋)。末三个交易日 09-28 / 09-29 / 09-30。
 CAL = [d for d in pd.bdate_range(end="2026-09-30", periods=181).strftime("%Y-%m-%d") if d != "2026-09-25"]
 T, T1, T2 = CAL[-1], CAL[-2], CAL[-3]
 assert (T, T1, T2) == ("2026-09-30", "2026-09-29", "2026-09-28")
+#: 中秋小长假: H0 = 节前最后交易日 (周四), 09-25 周五休市 + 周末, 复市日就是 T2 (周一)。
+H0 = CAL[-4]
+assert H0 == "2026-09-24"
 NAMES = ["半导体", "白酒", "银行", "电池", "化学制药", "通用设备", "港口航运", "饮料制造"]
 CODES = {n: "8811%02d" % i for i, n in enumerate(NAMES)}
 AFTER_CLOSE = dt.datetime(2026, 9, 30, 17, 30, tzinfo=BJ)        # 服务器 11:30 CEST 跑批 = 北京 17:30
@@ -62,9 +66,18 @@ def _hist(seed: int, dates=CAL) -> pd.DataFrame:
 FULL = {n: _hist(11 + i) for i, n in enumerate(NAMES)}           # 日线自带当日 (到 T)
 
 
+def _upto(end: str = T, k: int = 0) -> dict:
+    """行业日线截到 end, 再少最后 k 根 (k=1 = 同花顺年度文件还没落地 end 那根的形态)。"""
+    out = {}
+    for n, h in FULL.items():
+        h = h[h["date"] <= end]
+        out[n] = (h.iloc[:-k] if k else h).reset_index(drop=True)
+    return out
+
+
 def _lagging(k: int = 1) -> dict:
     """同花顺年度文件还没落地当日那根的形态: 每个行业少最后 k 根。"""
-    return {n: h.iloc[:-k].reset_index(drop=True) for n, h in FULL.items()}
+    return _upto(T, k)
 
 
 def _ts_bars(day: str = T, names=NAMES) -> dict:
@@ -138,14 +151,15 @@ def test_equal_is_quiet_and_offline(monkeypatch, caplog):
 
 
 def test_holiday_rerun_does_not_false_alarm(monkeypatch, caplog):
-    """休市日重跑 (10-01..10-07): data_date 停在最后交易日 09-30, 行业日线末日也是 09-30 -> 不告警、不联网。
+    """休市日重跑 (中秋 09-25 周五 / 周末): data_date 停在最后交易日 09-24, 行业日线末日也是 09-24 -> 不告警、不联网。
     守卫比的是 data_date, 不是挂钟上的今天 (拿今天比, 国庆七天会连报七天「落后」)。"""
     net = _Net(monkeypatch)
-    for holiday in (dt.datetime(2026, 10, 1, 17, 30, tzinfo=BJ), dt.datetime(2026, 10, 5, 17, 30, tzinfo=BJ)):
+    for holiday in (dt.datetime(2026, 9, 25, 17, 30, tzinfo=BJ), dt.datetime(2026, 9, 27, 17, 30, tzinfo=BJ)):
         caplog.clear()
-        out, info = m1.align_industry_tails(dict(FULL), CODES, T, "store", cal=CAL, now=holiday, trading_days=_cal_fn)
-        assert info["asof"] == T and info["n_lag"] == 0
+        out, info = m1.align_industry_tails(_upto(H0), CODES, H0, "store", cal=CAL, now=holiday, trading_days=_cal_fn)
+        assert info["asof"] == H0 and info["n_lag"] == 0 and info["raw_last"] == {H0: len(NAMES)}
         assert not _msgs(caplog, logging.WARNING)
+        assert any("行业指数末日 %s = data_date" % H0 in m for m in _msgs(caplog, logging.INFO))
     assert net.ts_calls == [] and net.sum_calls == 0
 
 
@@ -262,27 +276,28 @@ def test_summary_same_session_as_last_bar_is_refused(monkeypatch, caplog):
     assert any("兜底后仍落后" in w and "meta.industry_asof = %s" % T1 in w and "行业数据截至 %s" % T1 in w for w in warns), warns
 
 
-@pytest.mark.parametrize("now, cal_fn, frag", [
-    (dt.datetime(2026, 9, 30, 14, 0, tzinfo=BJ), _cal_fn, "还没收盘"),                       # 盘中: 半天的涨跌幅
-    (dt.datetime(2026, 9, 30, 10, 0, tzinfo=BJ), None, "还没收盘"),
-    (dt.datetime(2026, 10, 8, 10, 0, tzinfo=BJ),                                             # 复市日盘中: 一览已是 10-08 的
-     lambda a, b: [d for d in CAL + ["2026-10-08"] if a <= d <= b], "之后已有交易日 2026-10-08"),
-    (dt.datetime(2026, 10, 1, 10, 0, tzinfo=BJ), None, "按工作日近似"),                      # 日历取不到 + 之后有工作日: 从严
+@pytest.mark.parametrize("expect, now, cal_fn, frag", [
+    (T, dt.datetime(2026, 9, 30, 14, 0, tzinfo=BJ), _cal_fn, "还没收盘"),                    # 盘中: 半天的涨跌幅
+    (T, dt.datetime(2026, 9, 30, 10, 0, tzinfo=BJ), None, "还没收盘"),
+    (H0, dt.datetime(2026, 9, 28, 10, 0, tzinfo=BJ), _cal_fn, "之后已有交易日 2026-09-28"),  # 复市日盘中: 一览已是 09-28 的
+    (H0, dt.datetime(2026, 9, 28, 8, 0, tzinfo=BJ), _cal_fn, "之后已有交易日 2026-09-28"),   # 复市日开盘前: 也从严
+    (H0, dt.datetime(2026, 9, 25, 10, 0, tzinfo=BJ), None, "按工作日近似"),                  # 日历取不到 + 之后有工作日 (其实休市): 从严
 ])
-def test_summary_clock_gate(monkeypatch, caplog, now, cal_fn, frag):
-    net = _Net(monkeypatch, bars={}, summary=_summary())
-    out, info = m1.align_industry_tails(_lagging(), CODES, T, "store", cal=CAL, now=now,
+def test_summary_clock_gate(monkeypatch, caplog, expect, now, cal_fn, frag):
+    net = _Net(monkeypatch, bars={}, summary=_summary(day=expect))
+    out, info = m1.align_industry_tails(_upto(expect, 1), CODES, expect, "store", cal=CAL, now=now,
                                         trading_days=cal_fn if cal_fn is not None else (lambda a, b: None))
-    assert info["n_lag"] == len(NAMES) and info["filled"] == {}, info
-    assert any("不是 data_date %s 的收盘值" % T in w and frag in w for w in _msgs(caplog, logging.WARNING)), _msgs(caplog, logging.WARNING)
+    assert net.sum_calls == 1 and info["n_lag"] == len(NAMES) and info["filled"] == {}, info
+    assert any("不是 data_date %s 的收盘值" % expect in w and frag in w for w in _msgs(caplog, logging.WARNING)), _msgs(caplog, logging.WARNING)
 
 
 def test_summary_ok_on_holiday_evening_with_calendar(monkeypatch):
-    """10-01 (休市) 晚上才发现 09-30 那根没落地: 日历说 09-30 之后没开过市 -> 一览仍是 09-30 的收盘值, 可以补。"""
-    net = _Net(monkeypatch, bars={}, summary=_summary())
-    out, info = m1.align_industry_tails(_lagging(), CODES, T, "store", cal=CAL,
-                                        now=dt.datetime(2026, 10, 1, 17, 30, tzinfo=BJ), trading_days=_cal_fn)
-    assert info["asof"] == T and info["filled"] == {m1.FILL_SUMMARY: len(NAMES)}
+    """09-25 (中秋休市) 才发现 09-24 那根没落地: 日历说 09-24 之后没开过市 -> 一览仍是 09-24 的收盘值, 可以补 (周日同理)。"""
+    for now in (dt.datetime(2026, 9, 25, 17, 30, tzinfo=BJ), dt.datetime(2026, 9, 27, 9, 0, tzinfo=BJ)):
+        net = _Net(monkeypatch, bars={}, summary=_summary(day=H0))
+        out, info = m1.align_industry_tails(_upto(H0, 1), CODES, H0, "store", cal=CAL, now=now, trading_days=_cal_fn)
+        assert info["asof"] == H0 and info["filled"] == {m1.FILL_SUMMARY: len(NAMES)}, info
+        assert all(m1._last_date(out[n]) == H0 for n in NAMES)
 
 
 def test_summary_uses_fetch_time_when_now_not_injected(monkeypatch):
@@ -356,11 +371,11 @@ def test_peek_data_date_same_definition_as_resolve(monkeypatch):
     monkeypatch.setattr(ds, "bars_from_store_on", lambda: True)
     monkeypatch.setattr(ds, "_store_max_date", lambda: T)
     assert dd.peek_data_date(_bench(T1)) == (T, "store")          # 库末日优先 (基准落后也以库为准)
-    assert dd.peek_data_date(_bench(T1))[0] == dd.resolve(T, T1, "2026-10-04")[0]
+    assert dd.peek_data_date(_bench(T1))[0] == dd.resolve(T, T1, T)[0]
     monkeypatch.setattr(ds, "bars_from_store_on", lambda: False)
     assert dd.peek_data_date(_bench(T1)) == (T1, "bench")
     assert dd.peek_data_date(None) == (None, "none")              # 不拿 run_date 冒充
-    assert dd.peek_data_date(pd.DataFrame({"date": [], "close": []}), "2026-10-04") == (None, "none")
+    assert dd.peek_data_date(pd.DataFrame({"date": [], "close": []}), T) == (None, "none")
 
 
 def test_session_settled_pure():
@@ -369,10 +384,10 @@ def test_session_settled_pure():
     assert f(T, dt.datetime(2026, 9, 30, 11, 30, tzinfo=CEST), _cal_fn)[0] is True       # 11:30 CEST = 北京 17:30
     assert f(T, dt.datetime(2026, 9, 30, 14, 59, tzinfo=BJ), _cal_fn)[0] is False
     assert f(T, dt.datetime(2026, 9, 29, 20, 0, tzinfo=BJ), _cal_fn)[0] is False         # 时钟早于 data_date
-    assert f(T, dt.datetime(2026, 10, 4, 12, 0, tzinfo=BJ), _cal_fn)[0] is True          # 长假: 日历说之后没开过市
-    cal8 = lambda a, b: [d for d in CAL + ["2026-10-08"] if a <= d <= b]                  # noqa: E731
-    assert f(T, dt.datetime(2026, 10, 7, 23, 0, tzinfo=BJ), cal8)[0] is True
-    assert f(T, dt.datetime(2026, 10, 8, 8, 0, tzinfo=BJ), cal8)[0] is False             # 复市日: 开盘前也从严
+    assert f(H0, dt.datetime(2026, 9, 25, 12, 0, tzinfo=BJ), _cal_fn)[0] is True         # 休市的周五: 日历说之后没开过市
+    assert f(H0, dt.datetime(2026, 9, 27, 23, 0, tzinfo=BJ), _cal_fn)[0] is True         # 小长假最后一晚
+    assert f(H0, dt.datetime(2026, 9, 28, 8, 0, tzinfo=BJ), _cal_fn)[0] is False         # 复市日: 开盘前也从严
+    assert f(H0, dt.datetime(2026, 9, 28, 16, 0, tzinfo=BJ), _cal_fn)[0] is False        # 复市日收盘后: 一览已是 09-28 的
     ok, why = f(T2, dt.datetime(2026, 9, 29, 16, 0, tzinfo=BJ), _cal_fn)
     assert ok is False and "2026-09-29" in why
     # 日历取不到 / 抛错 / 结果里没有 data_date 自己 -> 工作日近似, 从严
@@ -380,7 +395,7 @@ def test_session_settled_pure():
         raise RuntimeError("trade_cal 500")
     assert f("2026-09-18", dt.datetime(2026, 9, 20, 12, 0, tzinfo=BJ), boom)[0] is True  # 周五之后只有周末
     assert f("2026-09-18", dt.datetime(2026, 9, 21, 9, 0, tzinfo=BJ), None)[0] is False  # 周一
-    assert f(T, dt.datetime(2026, 10, 1, 12, 0, tzinfo=BJ), lambda a, b: [])[0] is False
+    assert f(H0, dt.datetime(2026, 9, 25, 12, 0, tzinfo=BJ), lambda a, b: [])[0] is False  # 休市的周五 + 日历空: 从严判否
     assert f(None, AFTER_CLOSE, _cal_fn)[0] is False
 
 
