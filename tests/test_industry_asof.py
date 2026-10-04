@@ -397,6 +397,8 @@ def _stub_pipeline(monkeypatch, hists, bench_last=T, with_codes=True):
         {"industry": NAMES, "net_inflow": np.linspace(5e8, -5e8, len(NAMES))}))
     monkeypatch.setattr(ds, "bars_from_store_on", lambda: False)               # data_date = 基准末日 (干净导出树本来就没库)
     monkeypatch.setitem(CONFIG["fetch"], "max_workers", 2)
+    monkeypatch.setattr(m1, "DATA_DIR", tempfile.mkdtemp(prefix="indt1_data_"))  # 回滚开关: 不看真 data/ 里有没有停机文件
+    monkeypatch.delenv(m1.TAIL_FILL_ENV, raising=False)
 
 
 SCORE_COLS = ["industry", "prosperity_score", "trend", "momentum", "capital", "idx_close", "ma120", "eligible", "selected"]
@@ -445,7 +447,7 @@ def test_scores_after_summary_fill_track_native(monkeypatch):
     monkeypatch.setattr(m1, "_market_calendar", lambda: _cal_fn)
     real = m1.align_industry_tails
     monkeypatch.setattr(m1, "align_industry_tails",
-                        lambda h, c, e, b, cal=None: real(h, c, e, b, cal=cal, now=AFTER_CLOSE))
+                        lambda h, c, e, b, cal=None, **kw: real(h, c, e, b, cal=cal, now=AFTER_CLOSE, **kw))
     fixed = _by_name(m1.compute_industry_scores())
     assert net.ts_calls == [] and net.sum_calls == 1
     assert set(fixed["idx_date"]) == {T} and set(fixed["idx_fill"]) == {m1.FILL_SUMMARY}
@@ -521,6 +523,68 @@ def test_guard_failure_never_breaks_the_run(monkeypatch, caplog):
     assert df["prosperity_score"].between(0, 100).all()
     assert any("行业指数末日守卫出错" in w for w in _msgs(caplog, logging.WARNING))
     assert df.attrs["industry_asof"]["error"]
+
+
+# ---------------------------------------------------------------- 回滚口子: 只关补根, 守卫关不掉
+
+def test_tail_fill_switch_env_file_default(monkeypatch, tmp_path):
+    monkeypatch.setattr(m1, "DATA_DIR", str(tmp_path))
+    monkeypatch.delenv(m1.TAIL_FILL_ENV, raising=False)
+    assert m1.tail_fill_switch() == (True, "", "")               # 默认开
+    for v in ("0", "false", "OFF", " off "):
+        monkeypatch.setenv(m1.TAIL_FILL_ENV, v)
+        on, by, warn = m1.tail_fill_switch()
+        assert on is False and m1.TAIL_FILL_ENV in by and warn == ""
+    off_file = tmp_path / m1.TAIL_FILL_OFF_FILE
+    off_file.write_text("")
+    for v in ("1", "true", "On"):                                # 环境变量压过停机文件
+        monkeypatch.setenv(m1.TAIL_FILL_ENV, v)
+        assert m1.tail_fill_switch() == (True, "", "")
+    monkeypatch.delenv(m1.TAIL_FILL_ENV)
+    on, by, warn = m1.tail_fill_switch()
+    assert on is False and "停机文件" in by and str(off_file) in by and warn == ""
+    off_file.unlink()
+    monkeypatch.setenv(m1.TAIL_FILL_ENV, "no")                   # 写了个不认识的值: 忽略它按默认 (开), 但必须响
+    on, by, warn = m1.tail_fill_switch()
+    assert on is True and by == "" and "不是可识别的值" in warn and "'no'" in warn
+
+
+def test_fill_off_keeps_guard_but_never_goes_online(monkeypatch, caplog):
+    net = _Net(monkeypatch, bars={T: _ts_bars()}, summary=_summary())
+
+    def never():
+        raise AssertionError("补根关了, 不该去数「差几根」")
+    src = _lagging()
+    out, info = m1.align_industry_tails(src, CODES, T, "store", cal=never, now=AFTER_CLOSE, trading_days=_cal_fn,
+                                        fill=False, fill_off_by="停机文件 /x/industry_tail_fill.off")
+    assert net.ts_calls == [] and net.sum_calls == 0
+    assert info["fill_enabled"] is False and info["asof"] == T1 and info["n_lag"] == len(NAMES) and info["filled"] == {}
+    assert all(out[n] is src[n] for n in NAMES)
+    warns = _msgs(caplog, logging.WARNING)
+    assert len(warns) == 2, warns
+    assert "补根已关闭" in warns[0] and "停机文件 /x/industry_tail_fill.off" in warns[0] and "不兜底" in warns[0]
+    assert "仍落后" in warns[1] and "补根已关闭" in warns[1] and "meta.industry_asof = %s" % T1 in warns[1]
+    # 末日本来就等于 data_date 时, 开关关着也一样安静
+    caplog.clear()
+    out, info = m1.align_industry_tails(dict(FULL), CODES, T, "store", cal=CAL, fill=False, fill_off_by="x")
+    assert info["n_lag"] == 0 and not _msgs(caplog, logging.WARNING)
+
+
+def test_compute_honours_switch(monkeypatch, caplog, tmp_path):
+    monkeypatch.setattr(m1, "DATA_DIR", str(tmp_path))
+    _stub_pipeline(monkeypatch, _lagging())
+    net = _Net(monkeypatch, bars={T: _ts_bars()}, summary=_summary())
+    monkeypatch.setenv(m1.TAIL_FILL_ENV, "0")
+    df = m1.compute_industry_scores()
+    assert net.ts_calls == [] and net.sum_calls == 0
+    assert set(df["idx_date"]) == {T1} and df["idx_fill"].isna().all()
+    assert df.attrs["industry_asof"]["fill_enabled"] is False and df.attrs["industry_asof"]["n_lag"] == len(NAMES)
+    assert any("补根已关闭" in w and "环境变量 %s=0" % m1.TAIL_FILL_ENV in w for w in _msgs(caplog, logging.WARNING))
+    monkeypatch.setenv(m1.TAIL_FILL_ENV, "yes")                  # 不认识的值: 响一声, 按默认 (开) 走
+    caplog.clear()
+    df = m1.compute_industry_scores()
+    assert net.ts_calls == [T] and set(df["idx_date"]) == {T}
+    assert any("回滚开关" in w and "不是可识别的值" in w for w in _msgs(caplog, logging.WARNING))
 
 
 # ---------------------------------------------------------------- 取数层

@@ -27,10 +27,11 @@ from __future__ import annotations
 import collections
 import datetime as dt
 import logging
+import os
 import numpy as np
 import pandas as pd
 
-from .config import CONFIG
+from .config import CONFIG, DATA_DIR
 from . import datadate as _dd
 from . import datasource as ds
 from . import indicators as ind
@@ -51,6 +52,33 @@ SUMMARY_SAME_SHARE = 0.8        # ≥ 这个数 = 明确是同一个交易日 (�
 SUMMARY_PCT_SANE = 21.0         # 行业指数单日涨跌幅绝对值超过它 = 脏数, 不拿来补
 FILL_TS, FILL_SUMMARY = "ts_ths_daily", "ths_summary"
 _BASIS_CN = {"store": "价格库个股末日", "bench": "基准指数末日", "none": "无"}
+
+#: 「补当日那根」(兜底 ①②) 的回滚口子 —— 与 pool_by_store / backtest_store 同一套路 (值班只需要记一种口径):
+#: 优先级 环境变量 > 停机文件 > 默认开。
+#:   ① `sudo systemctl edit stock-a` 加 `Environment=ASHARE_INDUSTRY_TAIL_FILL=0` (只认 0/1/true/false/on/off);
+#:   ② `touch <repo>/data/industry_tail_fill.off` (data/ 不在 git 里, run_a.sh 的 reset 抹不掉; stock 用户自己就能按)。
+#: **关掉的只是补根; 守卫本身关不掉** —— 末日落后照样 WARNING、照样写 idx_date / meta.industry_asof、看板照样标
+#: 「行业数据截至 X」(也就是退回 2026-10-04 之前的算法, 但不再是静默的)。被哪一层关的, 日志里那行 WARNING 会写明。
+TAIL_FILL_ENV = "ASHARE_INDUSTRY_TAIL_FILL"
+TAIL_FILL_OFF_FILE = "industry_tail_fill.off"
+
+
+def tail_fill_switch() -> tuple:
+    """-> (是否补根, 被谁关的, 环境变量写错时的告警文本)。**每轮现算** (不在 import 时定死): 停机文件随按随生效。"""
+    raw = os.environ.get(TAIL_FILL_ENV)
+    v = (raw or "").strip().lower()
+    warn = ""
+    if v in ("0", "false", "off"):
+        return False, "环境变量 %s=%s" % (TAIL_FILL_ENV, v), ""
+    if v in ("1", "true", "on"):
+        return True, "", ""
+    off_file = os.path.join(DATA_DIR, TAIL_FILL_OFF_FILE)
+    if v:                       # 写了东西, 但不是这 6 个值之一 -> 不当数, 但必须响
+        warn = ("环境变量 %s=%r 不是可识别的值 (只认 0/1/true/false/on/off, 大小写不敏感), 本轮**忽略它**按默认处理; "
+                "要关补根请用 %s=0 或 touch %s" % (TAIL_FILL_ENV, raw, TAIL_FILL_ENV, off_file))
+    if os.path.exists(off_file):
+        return False, "停机文件 %s" % off_file, warn
+    return True, "", warn
 
 
 def _ret(close: pd.Series, bars: int) -> float:
@@ -318,7 +346,7 @@ def _fill_from_summary(out: dict, last: dict, lag: list, expect: str, cal, now, 
 
 
 def align_industry_tails(hists: dict, codes: dict | None, expect: str | None, basis: str = "store",
-                         cal=None, now=None, trading_days=None) -> tuple[dict, dict]:
+                         cal=None, now=None, trading_days=None, fill: bool = True, fill_off_by: str = "") -> tuple[dict, dict]:
     """行业指数日线的末日对齐 data_date -> (对齐后的 {行业: 日线}, info)。**不改传进来的表** (接/截都出新表)。
 
     hists  = {行业: 日线 DataFrame(date, close, …) 升序};  codes = {行业: 同花顺板块代码} (ths_daily 用, 可空)
@@ -326,6 +354,7 @@ def align_industry_tails(hists: dict, codes: dict | None, expect: str | None, ba
     cal    = 交易日历 (ISO 日期列表, 或返回它的零参函数 —— 真落后了才求值; 模块1 传 _bench_calendar), 用来数「差几根」;
              None = 不知道 (ths_daily 只问 data_date 那一根并靠 pre_close 核接续; 行业一览涨跌幅不补)
     now / trading_days = 只给兜底 ② 的时钟闸用 (用例注入; 生产 now 取行业一览的取数时刻, trading_days 取 Market 日历)
+    fill / fill_off_by = 补根开关与「被谁关的」(tail_fill_switch); fill=False 时不联网、不补, 但落后照样告警、照样留痕
 
     四种结局, 每种恰好一行汇总日志 (journal 里 grep「行业指数」):
       · 末日 == expect                 INFO   「行业指数末日 X = data_date (N 个行业, 无需兜底)」
@@ -333,11 +362,12 @@ def align_industry_tails(hists: dict, codes: dict | None, expect: str | None, ba
       · 落后, 兜底后仍落后             WARNING ×2 (第二条点名 meta.industry_asof 与看板标注)
       · 末日比 expect 还新 (库旧了)    WARNING, 截到 expect (快照标的是 expect 的行情, 行业数据不许带它之后的)
     info = {expect, basis, n, raw_last {末日: 行业数} (动手之前), truncated, filled {来源: 行业数}, fill_by {行业: 来源},
-            asof (对齐后最旧的末日), n_lag (对齐后仍落后的行业数)}。"""
+            asof (对齐后最旧的末日), n_lag (对齐后仍落后的行业数), fill_enabled}。"""
     n = len(hists)
     last0 = {k: _last_date(h) for k, h in hists.items()}
     info = {"expect": expect, "basis": basis, "n": n, "raw_last": dict(collections.Counter(last0.values())),
-            "truncated": 0, "filled": {}, "fill_by": {}, "asof": (min(last0.values()) if last0 else None), "n_lag": 0}
+            "truncated": 0, "filled": {}, "fill_by": {}, "asof": (min(last0.values()) if last0 else None), "n_lag": 0,
+            "fill_enabled": bool(fill)}
     if n == 0:
         return hists, info
     if not expect:
@@ -362,23 +392,27 @@ def align_industry_tails(hists: dict, codes: dict | None, expect: str | None, ba
         log.info("行业指数末日 %s = data_date (%d 个行业, 无需兜底)", expect, n)
         return out, info
     log.warning("行业指数末日落后 data_date %s: %d/%d 个行业停在 %s (同花顺年度日线文件的当日那根北京 ~21 点后才落地) "
-                "—— 兜底 ① Tushare ths_daily ② 同花顺行业一览当日涨跌幅补根", expect, len(lag), n,
-                _counts_text(last[k] for k in lag))
-    if callable(cal):                             # 日历惰性求值: 只有真落后了才去数「差几根」(可能要问一次 trade_cal)
-        cal = cal()
-    n_ts = _fill_from_ths_daily(out, last, lag, codes or {}, expect, cal, info)
-    lag = [k for k in lag if last[k] < expect]
-    n_sum = 0
-    if lag:
-        n_sum = _fill_from_summary(out, last, lag, expect, cal, now,
-                                   trading_days if trading_days is not None else _market_calendar(), info)
+                "—— %s", expect, len(lag), n, _counts_text(last[k] for k in lag),
+                "兜底 ① Tushare ths_daily ② 同花顺行业一览当日涨跌幅补根" if fill
+                else "**补根已关闭** (%s), 不兜底" % (fill_off_by or "fill=False"))
+    n_ts = n_sum = 0
+    if fill:
+        if callable(cal):                         # 日历惰性求值: 只有真落后了才去数「差几根」(可能要问一次 trade_cal)
+            cal = cal()
+        n_ts = _fill_from_ths_daily(out, last, lag, codes or {}, expect, cal, info)
         lag = [k for k in lag if last[k] < expect]
+        if lag:
+            n_sum = _fill_from_summary(out, last, lag, expect, cal, now,
+                                       trading_days if trading_days is not None else _market_calendar(), info)
+            lag = [k for k in lag if last[k] < expect]
     info["filled"] = {k: v for k, v in ((FILL_TS, n_ts), (FILL_SUMMARY, n_sum)) if v}
     info["asof"], info["n_lag"] = min(last.values()), len(lag)
     if lag:
-        log.warning("行业指数兜底后仍落后 data_date %s: %d/%d 个行业停在 %s (Tushare ths_daily 补 %d 个 / 行业一览涨跌幅补 %d 个) "
+        log.warning("行业指数兜底后仍落后 data_date %s: %d/%d 个行业停在 %s (%s) "
                     "—— 这些行业的景气分按旧一日的指数算; meta.industry_asof = %s, 看板景气榜标题旁显示「行业数据截至 %s」",
-                    expect, len(lag), n, _counts_text(last[k] for k in lag), n_ts, n_sum, info["asof"], info["asof"])
+                    expect, len(lag), n, _counts_text(last[k] for k in lag),
+                    ("Tushare ths_daily 补 %d 个 / 行业一览涨跌幅补 %d 个" % (n_ts, n_sum)) if fill else "补根已关闭",
+                    info["asof"], info["asof"])
     else:
         log.info("行业指数末日 %s = data_date (兜底补齐 %d 个行业: Tushare ths_daily %d 个 / 行业一览涨跌幅 %d 个)",
                  expect, n_ts + n_sum, n_ts, n_sum)
@@ -456,9 +490,13 @@ def compute_industry_scores(progress_cb=None) -> pd.DataFrame:
     # 主线程里做 (线程池已收尾): 兜底 ② 走同花顺 (V8), 兜底 ① 走 Tushare, 都只在「末日 < data_date」时才联网。
     raw_hists = {r["industry"]: r.pop("_hist") for r in rows}
     expect, basis = _dd.peek_data_date(bench)
+    fill_on, fill_off_by, sw_warn = tail_fill_switch()
+    if sw_warn:
+        log.warning("行业指数补根 · 回滚开关: %s", sw_warn)
     try:
         hists, asof = align_industry_tails(raw_hists, _board_codes(ind_list), expect, basis,
-                                           cal=lambda: _bench_calendar(bench, expect))
+                                           cal=lambda: _bench_calendar(bench, expect),
+                                           fill=fill_on, fill_off_by=fill_off_by)
     except Exception as e:                                     # noqa: BLE001  守卫自己出错不许拖垮整轮
         log.warning("行业指数末日守卫出错 (%s: %s), 本轮按原始日线算 (末日见各行业 idx_date)", type(e).__name__, str(e)[:160],
                     exc_info=True)
