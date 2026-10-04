@@ -428,6 +428,32 @@ def log_backtest_price_switch() -> bool:
     return on
 
 
+def run_sources(spot) -> dict:
+    """这一轮**实际用的**数据源留痕 -> 看板 meta.sources (2026-10-04 卡 A-HOLIDAY)。
+
+    页头「数据源」标签原来是写死的 "akshare（东财行业 · 前复权日线）", 09-07 换 Tushare 价格库之后就不是实情了;
+    现在由看板从这里读。键: bars = 日线主源开关 (CONFIG.source.bars; 'tushare' 且 bars_from_store = 阶段A 直读价格库);
+    spot / valuation = 全A快照与估值列各走了哪条 (ds.spot_sources: 东财直连 | 东财(akshare) | 新浪; 东财 | tushare_daily_basic |
+    缺失); industry = 快照行业列谁给的 (东财直连自带 f100 = '东财'; 兜底补列时 = fill_spot_industry 记的来源);
+    industry_basis / pe_basis 与 meta 里同名键同值。**绝不抛** —— 留痕出问题不能拖垮出榜, 取不到的键是 None。
+    """
+    out = {"bars": None, "bars_from_store": None, "spot": None, "valuation": None, "industry": None,
+           "industry_basis": "em_f100", "pe_basis": getattr(ds, "PE_BASIS", None)}
+    try:
+        out["bars"] = str(CONFIG["source"].get("bars") or "") or None
+        out["bars_from_store"] = bool(ds.bars_from_store_on())
+        if spot is not None and len(spot):
+            ss = ds.spot_sources(spot)
+            out["spot"], out["valuation"] = ss.get("spot_source"), ss.get("valuation_source")
+            ind = (getattr(spot, "attrs", None) or {}).get("industry_source")
+            if not ind and "industry" in spot.columns and spot["industry"].notna().any():
+                ind = "东财"                                    # 东财直连快照自带 f100, 没走兜底补列
+            out["industry"] = ind or None
+    except Exception as e:                                     # noqa: BLE001
+        log.debug("数据源留痕失败 (不影响出榜): %s", e)
+    return out
+
+
 def run(full_market: bool, use_cache: bool):
     # 全局socket兜底超时: 任何库(akshare内部等)没设超时的阻塞读, 60秒后抛异常
     # 走重试, 而不是永远挂死。2026-08-13/17/18/19 连续四天 13:30 任务卡死在
@@ -790,10 +816,14 @@ def run(full_market: bool, use_cache: bool):
     # 定义、交叉核对与自检 (data_date < 库末日 / < 最后收盘日 必 error) 都在 ashare/datadate.py。
     from ashare import datadate as _dd
     data_date = _dd.resolve_data_date(_bench, run_date)
+    # 交易日历三件套 (last_closed_day / next_open_day / market_status) + 数据源留痕 -> run_log.extra_json -> 看板 meta
+    # (2026-10-04 卡 A-HOLIDAY): 看板据此分清「休市」与「没跑」, 长假不再误报「定时任务可能失败」。两个函数都不抛,
+    # 取不到的字段是 None (看板回退到跑批新鲜度判断)。
+    run_extra = {"calendar": _dd.calendar_meta(), "sources": run_sources(spot)}
     finished = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.log_run(run_date, started, finished, n_scanned, len(final_records),
                selected_inds, "ok", data_date=data_date,
-               n_pool_raw=n_pool_raw, scan_basis=scan_basis)
+               n_pool_raw=n_pool_raw, scan_basis=scan_basis, extra=run_extra)
     log.info("扫描完成: 扫描 %d (口径 %s, 裁前 %d), 命中 %d",
              n_scanned, scan_basis, n_pool_raw, len(final_records))
 

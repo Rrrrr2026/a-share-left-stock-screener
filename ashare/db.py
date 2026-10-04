@@ -76,7 +76,9 @@ CREATE TABLE IF NOT EXISTS run_log(
     status TEXT, message TEXT, data_date TEXT,
     -- 2026-09-08: n_scanned 改成"按库内在市股裁后"的数, 这两列留住裁前口径, 免得
     -- 前端/快照拿 09-08 前后的扫描数直接比 (老口径含 196 只早已退市的东财老代码)
-    n_pool_raw INTEGER, scan_basis TEXT
+    n_pool_raw INTEGER, scan_basis TEXT,
+    -- 2026-10-04 卡 A-HOLIDAY: 跑批当时的交易日历三件套 + 数据源留痕, 一列 JSON (看板 meta 原样带出)
+    extra_json TEXT
 );
 """
 
@@ -128,7 +130,8 @@ def _migrate(conn):
                        ("dip", "INTEGER"), ("dip_score", "REAL"), ("dip_confirm", "TEXT"),
                        ("coil", "INTEGER"), ("coil_score", "REAL"), ("coil_confirm", "TEXT")],
         "run_log": [("data_date", "TEXT"),
-                    ("n_pool_raw", "INTEGER"), ("scan_basis", "TEXT")],
+                    ("n_pool_raw", "INTEGER"), ("scan_basis", "TEXT"),
+                    ("extra_json", "TEXT")],
     }
     for table, cols in want.items():
         have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -285,19 +288,23 @@ def save_trade_plan(run_date: str, code: str, plan: dict):
 
 def log_run(run_date, started_at, finished_at, n_scanned, n_hit,
             selected_industries, status, message="", data_date=None,
-            n_pool_raw=None, scan_basis=None):
+            n_pool_raw=None, scan_basis=None, extra=None):
     """n_scanned = 阶段A 真的扫了几只; n_pool_raw = 裁前的东财候选池大小;
     scan_basis = 'store_universe'(09-08 起按库内在市股裁)
                | 'store_universe_stale'(按库裁了, 但个股末日落后**库自己的交易日历** >3 个
                  交易日, 或整库 >20 自然日一动不动 —— 尺子旧了; 判据不看挂钟, 见
                  ds.store_ruler_freshness)
-               | 'raw_spot'(老口径 / 裁池关闭 / 降级放行)。"""
+               | 'raw_spot'(老口径 / 裁池关闭 / 降级放行)。
+    extra = 跑批当时才知道、导出时要原样带进 meta 的东西 (dict, 存成一列 JSON):
+            {"calendar": {last_closed_day, next_open_day, market_status}, "sources": {...}}
+            (2026-10-04 卡 A-HOLIDAY; 见 export_data.build_payload)。"""
     _upsert("run_log", [{
         "run_date": run_date, "started_at": started_at, "finished_at": finished_at,
         "n_scanned": n_scanned, "n_hit": n_hit,
         "selected_industries": json.dumps(selected_industries, ensure_ascii=False),
         "status": status, "message": message, "data_date": data_date or run_date,
         "n_pool_raw": n_pool_raw, "scan_basis": scan_basis,
+        "extra_json": json.dumps(extra, ensure_ascii=False) if extra else None,
     }])
 
 

@@ -121,6 +121,89 @@ def last_closed_trading_day(now=None, trading_days=None) -> tuple[str, bool]:
     return cand.isoformat(), False
 
 
+# 交易日历字段往今天之后看多少个自然日找「下一个开市日」。A 股最长连续休市实测 <= 11 个自然日
+# (春节/国庆各带一个周末), 20 留近一倍余量 —— 与 leftside_core.pricestore.CAL_PROBE_DAYS 同一条依据。
+CAL_FWD_DAYS = 20
+
+CALENDAR_KEYS = ("last_closed_day", "next_open_day", "market_status")
+
+
+def calendar_fields(now=None, trading_days=None) -> dict:
+    """看板 meta 的交易日历三件套 (2026-10-04 卡 A-HOLIDAY) -> {last_closed_day, next_open_day, market_status}。
+
+    看板原来只拿 `data_date` 与浏览器当天比自然日 (>4 天亮红条「定时任务可能失败」), 不认交易日历: 国庆
+    休市 10-01..10-07 期间流水线每个工作日照跑、data_date 停在 09-30, 10-05 00:00 起红条会一直误亮到 10-08
+    中午。这三个字段让看板分得清「休市」与「没跑」:
+
+      last_closed_day  已收盘的最后一个交易日 (北京 15:00 后当天算; 与 `last_closed_trading_day` 同一把尺子)
+      next_open_day    last_closed_day 之后的第一个开市日 = 下一个会出新收盘的交易日 (开市日盘中跑 = 当天)
+      market_status    跑批那天 (北京日历): 'open_day' | 'holiday' | 'weekend'
+
+    **只写日历给出的精确值, 取不到一律 None** —— 看板拿 `data_date < last_closed_day` 判红条「数据落后于
+    应到交易日」, 所以绝不能写「按工作日近似」的值: 长假里近似会把假期当开市日, 正好把这张卡要消掉的误报
+    写回去 (同 `guard` 里 exact=False 降级的那条教训)。字段是 None 时看板回退到「跑批新鲜度」判断。
+    唯一不靠日历也确定的是周末: A 股周六日从不开市 (调休补班日交易所也不开), 所以 'weekend' 日历挂了也写。
+
+    'holiday' 要**证明日历覆盖到今天**才写: 今天不在开市日列表里, 可能是真休市, 也可能是镜像日历只填到
+    今天之前 (年末下一年日历没入库)。判据同 `pricestore._calendar_days` 的覆盖自检 —— 今天之后还有开市日,
+    今天的缺席才可信; 没有就写 None。
+
+    `trading_days(start, end)` 一次调用: [最后收盘候选日 - 30 天, 今天 + CAL_FWD_DAYS 天]。纯函数, 不碰 IO。
+    """
+    bj = now.astimezone(BJ_TZ) if now is not None else dt.datetime.now(BJ_TZ)
+    today = bj.date()
+    cand = today if bj.hour >= CLOSE_HOUR else today - dt.timedelta(days=1)
+    out = {"last_closed_day": None, "next_open_day": None,
+           "market_status": "weekend" if today.weekday() >= 5 else None}
+    days = None
+    if trading_days is not None:
+        try:
+            days = trading_days((cand - dt.timedelta(days=30)).isoformat(),
+                                (today + dt.timedelta(days=CAL_FWD_DAYS)).isoformat())
+        except Exception as e:                                 # noqa: BLE001
+            log.warning("交易日历字段: 开市日历取失败 (%s) —— last_closed_day / next_open_day 写 null, "
+                        "看板回退到跑批新鲜度判断", str(e)[:120])
+            days = None
+    if not days:
+        return out
+    days = sorted({_iso(d) for d in days if _iso(d)})
+    past = [d for d in days if d <= cand.isoformat()]
+    if not past:                                               # 日历只给了未来的日子: 不可信, 当没取到
+        return out
+    last_closed = past[-1]
+    future = [d for d in days if d > last_closed]
+    out["last_closed_day"] = last_closed
+    out["next_open_day"] = future[0] if future else None
+    t = today.isoformat()
+    if t in days:
+        out["market_status"] = "open_day"
+    elif today.weekday() < 5 and future and future[0] > t:      # 日历已填过今天 -> 今天缺席 = 真休市
+        out["market_status"] = "holiday"
+    return out
+
+
+def calendar_meta(now=None) -> dict:
+    """run_pipeline 用的薄封装: Market.trading_days -> `calendar_fields` -> 打一行日志。
+
+    **绝不抛**: 这三个字段是看板的锦上添花, 任何异常都退成全 None (看板回退), 不能拖垮出榜。
+    多 1 次 trade_cal (经 tushare_client 的硬期限/重试), 排在 `resolve_data_date` 之后、导出之前。
+    """
+    out = {k: None for k in CALENDAR_KEYS}
+    try:
+        fn = None
+        try:
+            from leftside_core.market import current
+            fn = getattr(current(), "trading_days", None)
+        except Exception:                                      # noqa: BLE001
+            fn = None
+        out.update(calendar_fields(now, fn))
+    except Exception as e:                                     # noqa: BLE001
+        log.warning("交易日历字段: 计算失败 (%s) —— 三个字段写 null, 看板回退", str(e)[:120])
+    log.info("交易日历字段: last_closed_day=%s next_open_day=%s market_status=%s",
+             out.get("last_closed_day"), out.get("next_open_day"), out.get("market_status"))
+    return out
+
+
 def _emit(notes: list[str]) -> None:
     for n in notes:
         lvl, _, msg = n.partition(" ")
