@@ -47,6 +47,32 @@ def _index_by_code(rows):
     return {r["code"]: r for r in rows}
 
 
+def industry_asof_meta(industries, data_date) -> dict:
+    """景气榜的行业指数**实际截至哪一天** -> 并进 meta 的三个键 (2026-10-04 卡 IND-T1)。
+
+    每个行业行带 `idx_date` (该行业指数日线的实际末日, 模块1 写) 与 `idx_fill` (末根由哪条兜底补的)。
+      industry_asof        最旧的那个末日 (YYYY-MM-DD)。== data_date 才算「行业数据是当日的」; **< data_date = 景气榜 (以及
+                           综合分里 20% 的景气分、「观察·景气冷」标签) 是按旧一日的行业指数算的** —— 看板景气榜标题旁据此标
+                           「行业数据截至 X」。None = 这一轮没有记录 (09-30 及以前的快照 / 演示数据), 前端不显示任何东西;
+                           那些老快照在交易日实际上都是 T-1 (同花顺当日那根北京 ~21 点后才落地), 只是当时没人记。
+      industry_asof_n_lag  末日 < data_date 的行业数 (0 = 全部是当日)。
+      industry_fill        {来源: 行业数}, 末根靠兜底补上的行业 (ts_ths_daily = Tushare 同花顺板块日线, 与官方收盘逐位相同;
+                           ths_summary = 同花顺行业一览当日涨跌幅乘出来的, 与官方收盘差 ≤ ~0.5 bp); {} = 日线自带当日。
+    """
+    dates = [str(r.get("idx_date"))[:10] for r in (industries or []) if r.get("idx_date")]
+    if not dates:
+        return {"industry_asof": None}
+    dd = str(data_date or "")[:10]
+    fill: dict = {}
+    for r in industries:
+        f = r.get("idx_fill")
+        if f:
+            fill[str(f)] = fill.get(str(f), 0) + 1
+    return {"industry_asof": min(dates),
+            "industry_asof_n_lag": (sum(1 for d in dates if d < dd) if dd else 0),
+            "industry_fill": fill}
+
+
 def build_payload(run_date: str | None = None) -> dict:
     if run_date is None:
         run_date = db.latest_run_date()
@@ -237,6 +263,9 @@ def build_payload(run_date: str | None = None) -> dict:
             # **没有 pe_basis 的历史快照**: 主路 (估值历史) 本来就是 TTM, 只有快照兜底那部分在东财日是动态口径。
             "pe_basis": PE_BASIS,
             "industry_basis": "em_f100",
+            # 行业指数实际截至哪一天 (卡 IND-T1): industry_asof < data_date = 景气榜按旧一日的行业指数算的; 没有这个键的
+            # 历史快照 = 当时没记 (交易日实际是 T-1), 见 industry_asof_meta。
+            **industry_asof_meta(industries_sorted, runlog.get("data_date") or run_date),
             "disclaimer": DISCLAIMER,
             "opp": opp_result,
         },

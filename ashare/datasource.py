@@ -2251,7 +2251,11 @@ def fetch_industry_cons(industry: str) -> pd.DataFrame | None:
 
 
 def fetch_industry_hist(industry: str) -> pd.DataFrame | None:
-    """行业指数日线。优先东财, 失败退回同花顺行业指数。"""
+    """行业指数日线。优先东财, 失败退回同花顺行业指数。
+
+    ⚠ **这里给的末日不保证是当天** (2026-10-04 卡 IND-T1): 同花顺年度日线文件里当日那根北京 ~21 点后才落地, 跑批在它
+    之前 -> 末日是 T-1。本函数只管取 (缓存的也是原样), 「末日 < data_date 就补当日那根 / 补不上就留痕」在模块1
+    的 align_industry_tails (fetch_industry_bars_tushare / fetch_industry_summary_ths 见下方第 8 节)。"""
     key = _cache_key("ind_hist", industry, CONFIG["fetch"]["lookback_days"],
                      dt.date.today().isoformat())
     c = _cache_load(key)
@@ -2866,22 +2870,118 @@ def _fund_flow_em() -> pd.DataFrame | None:
 
 
 def _fund_flow_ths() -> pd.DataFrame | None:
-    try:
-        with _ths_lock:                      # V8 非线程安全, 见 _ths_lock 说明
-            raw = call_with_retry(_ak().stock_board_industry_summary_ths)
-    except Exception as e:
-        log.debug("同花顺行业摘要失败: %s", e)
+    df = fetch_industry_summary_ths()
+    if df is None or "net_inflow" not in df.columns:
         return None
-    if raw is None or len(raw) == 0:
-        return None
-    df = rename_normalize(raw, {
-        "industry": ["板块", "名称", "板块名称"],
-        "net_inflow": ["净流入", "净额", "主力净流入"],
-    })
-    if "industry" not in df.columns or "net_inflow" not in df.columns:
-        return None
-    df["net_inflow"] = _to_num(df["net_inflow"])
     return df
+
+
+# ---------------------------------------------------------------------------
+#  同花顺行业一览 (实时快照) + Tushare ths_daily —— 行业指数「当日那根」的两个来源 (2026-10-04 卡 IND-T1)
+# ---------------------------------------------------------------------------
+#  病灶: 行业指数日线走 akshare stock_board_industry_index_ths, 它读的是同花顺的**年度日线文件**
+#  (d.10jqka.com.cn/v4/line/bk_<码>/01/<年>.js), 而那份文件里当日那根要到北京 ~21 点之后才落地 (PC 缓存 mtime 实证:
+#  09-23 北京 20:14-20:20 取到的末日还是 09-22; 09-07 北京 22:26、09-16 北京 23:04 取到的是当日)。服务器 11:30 CEST
+#  (北京 17:30)、PC 13:30 CEST (北京 19:30) 跑批都在它之前 -> 每个交易日的景气榜用的都是 **T-1** 的行业指数,
+#  看板却按当天标 (docs/a/history 逐日快照 idx_close: 09-28 那份与 09-25 休市重跑那份 90/90 相同)。
+#  兜底两条 (模块1 的 align_industry_tails 调, 都只在「末日 < data_date」时才打):
+#    ① Tushare ths_daily (同花顺板块指数日线, 带 trade_date): 2026-10-04 实测 15,000 积分档有权限, 一次调用给当日全部
+#       同花顺指数 (09-30 = 1878 行 2.5 s), 90 个一级行业 881xxx.TI 的 close / pre_close 与 akshare 日线**逐位相同**
+#       (90/90 差 0.000000), 代码 = 行业列表的 board_code + '.TI', 名字与 ths_index(type=I) 90/90 相同。当日几点入库没实测
+#       过 (10-04 是休市日), 10-08 复市首跑的 journal 会给出答案。
+#    ② 同花顺行业一览的当日涨跌幅 (资金支柱本来就在拿这张表): 收盘即有, 但**页面不带日期**、涨跌幅只有 2 位小数
+#       (同花顺是截断不是四舍五入) -> 补出来的收盘 = 昨收 × (1 + 涨跌幅%), 与官方收盘差 ≤ 0.52 bp (09-30 90 个行业实测,
+#       均值 0.25 bp); 「这张表是不是 data_date 那天的」由调用方三道闸判 (时钟 / 只差一根 / 与日线末根涨跌幅不同)。
+_ths_summary_memo: dict = {}
+_ths_summary_lock = threading.Lock()
+THS_SUMMARY_MEMO_SEC = 30 * 60      # 进程内复用窗口: 资金支柱与行业指数补根前后只隔几分钟, 共用一次调用
+TS_THS_DAILY_FIELDS = "ts_code,trade_date,open,high,low,close,pre_close,pct_change"
+TS_THS_DAILY_RETRIES = 2
+TS_THS_DAILY_DEADLINE_SEC = 60
+THS_INDEX_SUFFIX = ".TI"
+
+
+def fetch_industry_summary_ths(max_age_sec: float | None = None) -> pd.DataFrame | None:
+    """同花顺行业一览 (q.10jqka.com.cn/thshy, **实时快照**) -> DataFrame[industry, pct_chg, net_inflow];
+    `attrs["fetched_at"]` = 取数时刻 (epoch 秒)。进程内 THS_SUMMARY_MEMO_SEC 之内只取一次 (资金支柱 _fund_flow_ths 与
+    行业指数补根共用); **不落盘**: 页面不带日期, 落盘之后换个时点读回来就说不清是哪个交易日的。失败 / 列不齐 -> None。"""
+    ttl = THS_SUMMARY_MEMO_SEC if max_age_sec is None else float(max_age_sec)
+    with _ths_summary_lock:
+        m = _ths_summary_memo
+        if m.get("df") is not None and time.time() - m.get("at", 0.0) <= ttl:
+            return m["df"]
+        at = time.time()
+        try:
+            with _ths_lock:                      # V8 非线程安全, 见 _ths_lock 说明
+                raw = call_with_retry(_ak().stock_board_industry_summary_ths)
+        except Exception as e:
+            log.debug("同花顺行业摘要失败: %s", e)
+            return None
+        if raw is None or len(raw) == 0:
+            return None
+        df = rename_normalize(raw, {
+            "industry": ["板块", "名称", "板块名称"],
+            "net_inflow": ["净流入", "净额", "主力净流入"],
+        })
+        if "industry" not in df.columns:
+            return None
+        if "net_inflow" in df.columns:
+            df["net_inflow"] = _to_num(df["net_inflow"])
+        # 涨跌幅单独精确匹配: 这张表还有一列「领涨股-涨跌幅」, 子串匹配会不会命中它取决于列序, 不赌
+        pct_col = pick_col(raw, ["涨跌幅", "涨跌幅(%)"])
+        if pct_col is not None:
+            df["pct_chg"] = _to_num(raw[pct_col])
+        df["industry"] = df["industry"].astype(str).str.strip()
+        try:
+            df.attrs["fetched_at"] = at
+        except Exception:                        # noqa: BLE001
+            pass
+        m["df"], m["at"] = df, at
+        return df
+
+
+def fetch_industry_bars_tushare(trade_date) -> dict:
+    """Tushare ths_daily 某交易日的同花顺板块指数日线 -> {6 位板块代码: {date, open, high, low, close, pre_close}}
+    (只留 .TI 且 close 有值的行; 行业列表的 board_code 直接当键查)。没配 token / 抛错 / 当日还没入库 (0 行) -> {}。
+    走 _ts_query (tushare_client.query: 进程级硬期限 + 限频 + 重试); 每个交易日一次调用, 不落盘 (当日是否已入库会变)。
+    这是兜底不是主路, 期限收紧到 2 次 × 60 s (默认 3 × 120 s): 镜像滴流那天最多拖两分钟, 之后还有行业一览那条。"""
+    if not _ts_available():
+        log.debug("Tushare ths_daily: 未配置 tushare_token, 跳过")
+        return {}
+    d8 = _ymd8(trade_date)
+    iso = f"{d8[:4]}-{d8[4:6]}-{d8[6:8]}"
+    try:
+        df = _ts_query("ths_daily", trade_date=d8, fields=TS_THS_DAILY_FIELDS,
+                       retries=TS_THS_DAILY_RETRIES, deadline_sec=TS_THS_DAILY_DEADLINE_SEC)
+    except Exception as e:      # noqa: BLE001
+        log.warning("Tushare ths_daily %s 失败: %s", d8, str(e)[:160])
+        return {}
+    if df is None or len(df) == 0 or "ts_code" not in df.columns or "close" not in df.columns:
+        log.info("Tushare ths_daily %s: 0 行 (当日还没入库?)", d8)
+        return {}
+
+    def _f(v) -> float:
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return float("nan")
+        return x
+
+    out: dict = {}
+    has_date = "trade_date" in df.columns
+    for r in df.to_dict("records"):
+        ts = str(r.get("ts_code") or "")
+        if not ts.upper().endswith(THS_INDEX_SUFFIX):
+            continue
+        if has_date and _ymd8(r.get("trade_date")) != d8:
+            continue                             # 只认问的那一天 (镜像若回了别的日期的行, 不许混进来)
+        close = _f(r.get("close"))
+        if close != close or close <= 0:
+            continue
+        out[ts[:-len(THS_INDEX_SUFFIX)]] = {"date": iso, "open": _f(r.get("open")), "high": _f(r.get("high")),
+                                            "low": _f(r.get("low")), "close": close,
+                                            "pre_close": _f(r.get("pre_close"))}
+    return out
 
 
 # ===========================================================================

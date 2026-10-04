@@ -29,6 +29,10 @@ data_date — 「这批产物的行情日」的唯一定义 (2026-09-14 卡 DATA
 
 纯函数 `resolve` / `guard` / `last_closed_trading_day` 不碰任何 IO, 单测直接考; `resolve_data_date`
 是 run_pipeline 用的薄封装 (读库 + 问日历 + 打日志)。
+
+**2026-10-04 卡 IND-T1 补两个给模块1 (行业景气) 用的**: `peek_data_date` —— 流水线第一步就按同一个定义先看一眼
+data_date (行业指数日线的末日要和它比: 同花顺当日那根北京 ~21 点后才落地, 跑批拿到的是 T-1); `session_settled`
+(纯函数) —— 不带日期的实时快照 (同花顺行业一览) 此刻是不是 data_date 那个交易日的收盘值。
 """
 from __future__ import annotations
 import datetime as dt
@@ -153,3 +157,82 @@ def resolve_data_date(bench, run_date, *, now=None) -> str:
     log.info("data_date = %s (库末日 %s / 基准末日 %s / 最后收盘日 %s%s / run_date %s)",
              data_date, store_max, bench_last, last_closed, "" if exact else "≈", run_date)
     return data_date
+
+
+# ---------------------------------------------------------------------------------------------
+#  2026-10-04 卡 IND-T1: 模块1 (行业景气) 要在**流水线第一步**就知道这批产物的行情日
+# ---------------------------------------------------------------------------------------------
+def peek_data_date(bench, run_date=None) -> tuple[str | None, str]:
+    """先看一眼 data_date -> (data_date | None, basis)。**与 `resolve` 同一个定义**, 只是不打日志、不过 guard、
+    不问日历 —— `resolve_data_date` 要到流水线末尾才调, 而行业指数末日得在模块1 就和它比。
+
+    basis: 'store' = 价格库个股末日 (阶段A 直读库, 生产恒走这条) | 'bench' = 基准指数末日 (没读库的老口径) |
+    'none' = 两头都没有。'none' 时 `resolve` 会退回 run_date, 但 run_date 可能是休市日, **不能**拿它判
+    「行业指数落后」(国庆七天会连报七天假警) -> 这里返回 (None, 'none'), 调用方跳过守卫。
+    """
+    from . import datasource as ds
+    store_max = None
+    try:
+        if ds.bars_from_store_on():
+            store_max = ds._store_max_date()                   # noqa: SLF001
+    except Exception:                                          # noqa: BLE001
+        store_max = None
+    bench_last = None
+    try:
+        if bench is not None and len(bench):
+            bench_last = str(bench["date"].iloc[-1])[:10]
+    except Exception:                                          # noqa: BLE001
+        bench_last = None
+    store_max, bench_last = _iso(store_max), _iso(bench_last)
+    if store_max:
+        return store_max, "store"
+    if bench_last:
+        return bench_last, "bench"
+    return None, "none"
+
+
+def session_settled(data_date, now=None, trading_days=None) -> tuple[bool, str]:
+    """**不带日期的实时快照** (同花顺行业一览那种: 页面只有「最新一个交易日」的涨跌幅) 在 `now` 这一刻给出的,
+    是不是 `data_date` 那个交易日的**收盘**值 -> (是/否, 理由)。纯函数, 北京时钟。
+
+    是 = data_date 已收盘 (当天北京 15:00 之后), 且 data_date 之后到 now 为止**没有任何交易日开过市**:
+      · now 的北京日期 == data_date: 15:00 之后才算 (盘中快照是半天的涨跌幅);
+      · now 的北京日期 >  data_date: (data_date, 今天] 里不能有交易日 —— 有的话快照已经翻到那一天 (哪怕才开盘),
+        拿它当 data_date 的涨跌幅就是把别的日子的行情补进来。今天是交易日但还没开盘 (09:15 前) 其实仍是
+        data_date 的值, 这里一并判否: 宁可少补一次, 不赌页面什么时候翻。
+    开市日由 `trading_days(start, end)` 给 (闭区间, 升序 ISO 日期; 传库内指数日历或 Tushare trade_cal 都行);
+    取不到 / 抛错 / 结果里连 data_date 自己都没有 -> 按工作日近似 **从严**: 之间只要有周一至周五就判否
+    (长假里会少补, 但长假里行业日线本来就是齐的, 用不到这条兜底)。
+    """
+    d0 = _iso(data_date)
+    if not d0:
+        return False, "data_date 为空"
+    bj = now.astimezone(BJ_TZ) if now is not None else dt.datetime.now(BJ_TZ)
+    today = bj.date().isoformat()
+    if today < d0:
+        return False, "此刻北京日期 %s 早于 data_date %s" % (today, d0)
+    if today == d0:
+        if bj.hour >= CLOSE_HOUR:
+            return True, "data_date %s 已收盘 (北京 %s)" % (d0, bj.strftime("%H:%M"))
+        return False, "data_date %s 还没收盘 (北京 %s < %d:00), 快照是盘中值" % (d0, bj.strftime("%H:%M"), CLOSE_HOUR)
+    days = None
+    if trading_days is not None:
+        try:
+            days = [_iso(x) for x in (trading_days(d0, today) or [])]
+            days = sorted(x for x in days if x)
+        except Exception as e:                                 # noqa: BLE001
+            log.debug("session_settled: 开市日历取失败 (%s), 按工作日近似", str(e)[:120])
+            days = None
+    if days and d0 in days:
+        later = [x for x in days if d0 < x <= today]
+        if later:
+            return False, "data_date %s 之后已有交易日 %s (此刻北京 %s), 快照已不是 data_date 的" % (
+                d0, later[0], bj.strftime("%m-%d %H:%M"))
+        return True, "data_date %s 之后到北京 %s 没有交易日 (按开市日历)" % (d0, bj.strftime("%m-%d %H:%M"))
+    cur = dt.date.fromisoformat(d0) + dt.timedelta(days=1)
+    while cur <= bj.date():
+        if cur.weekday() < 5:
+            return False, "开市日历取不到, 按工作日近似: data_date %s 之后有工作日 %s, 不敢认快照还是 data_date 的" % (
+                d0, cur.isoformat())
+        cur += dt.timedelta(days=1)
+    return True, "data_date %s 之后到北京 %s 只有周末 (开市日历取不到, 按工作日近似)" % (d0, bj.strftime("%m-%d %H:%M"))

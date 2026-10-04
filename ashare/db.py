@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS industry_score(
     trend REAL, momentum REAL, breadth REAL, capital REAL, fundamental REAL,
     idx_close REAL, ma120 REAL, above_ma120 INTEGER,
     eligible INTEGER, selected INTEGER,
+    -- 2026-10-04 卡 IND-T1: 该行业指数日线的**实际末日** (景气分是按哪一天的指数算的) 与末根来源
+    -- (NULL = 同花顺/东财日线自带; 'ts_ths_daily' / 'ths_summary' = 兜底补的)。老库由 _migrate 补列, 老行为 NULL。
+    idx_date TEXT, idx_fill TEXT,
     PRIMARY KEY(run_date, industry)
 );
 CREATE TABLE IF NOT EXISTS tech_scan(
@@ -94,6 +97,7 @@ def init_db():
 def _migrate(conn):
     """给老库补新列(不丢历史)。"""
     want = {
+        "industry_score": [("idx_date", "TEXT"), ("idx_fill", "TEXT")],
         "tech_scan": [("support_label", "TEXT"), ("support_price", "REAL"),
                       ("dist_support_pct", "REAL"), ("breakdown_price", "REAL"),
                       ("high_52w", "REAL"), ("low_52w", "REAL"), ("pos_52w_pct", "REAL"),
@@ -172,6 +176,11 @@ def _coerce(v):
 
 
 # ---------------------------------------------------------------------------
+def _text_or_none(v):
+    """非空字符串原样, 其余 (None / NaN / 空串) -> None。DataFrame 里缺的格子可能是 None 也可能是 float NaN。"""
+    return v if isinstance(v, str) and v else None
+
+
 def save_industry_scores(run_date: str, df):
     if df is None or df.empty:
         return
@@ -186,6 +195,7 @@ def save_industry_scores(run_date: str, df):
             "idx_close": r.get("idx_close"), "ma120": r.get("ma120"),
             "above_ma120": bool(r.get("above_ma120")),
             "eligible": bool(r.get("eligible")), "selected": bool(r.get("selected")),
+            "idx_date": _text_or_none(r.get("idx_date")), "idx_fill": _text_or_none(r.get("idx_fill")),
         })
     _upsert("industry_score", rows)
 
