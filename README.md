@@ -13,6 +13,7 @@
 **https://rrrrr2026.github.io/a-share-left-screener/**
 
 > 页面上的数据是**上次发布时的快照**。要更新线上数据:本机先 `python run_pipeline.py` 生成最新结果,再**双击 `发布更新到网上.bat`**(会把 `dashboard/` 拷到 `docs/` 并 `git push`);等 1–2 分钟 Pages 自动重建,刷新网址即可。
+> 本机计划任务「A股左侧监控台每日更新」工作日 13:30 自动跑 `auto_update.bat auto` 并把 docs/ 推到镜像仓; 2026-10-06 起**隐藏运行**: 任务的 Action 是 `wscript.exe run_hidden.vbs` 包装 (无窗口跑 bat, 关不掉也看不见), bat 的屏幕输出进 `logs/task_YYYYMMDD.log` (本地保留 60 天, 不入 git), 退出码原样传回任务的「上次运行结果」; 流水线日志仍在 `data/update.log`。
 
 其它查看方式见 §8(局域网共享 / 本地双击打开)。
 
