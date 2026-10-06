@@ -576,7 +576,7 @@
   <!-- 行业景气榜 -->
   <section id="indCard" class="card p-3 mb-3">
     <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
-      <h2 class="text-lg font-semibold text-white" data-i18n="sec_board">板块景气榜</h2>
+      <div class="flex items-center gap-2 flex-wrap"><h2 class="text-lg font-semibold text-white" data-i18n="sec_board">板块景气榜</h2><span id="indAsof" class="hidden badge tag-warn"></span></div>
       <div class="flex items-center gap-2">
         <span class="text-xs text-slate-400 mr-1" data-i18n="sec_hint">点击板块可筛选主表 · 绿色=入选</span>
         <button class="segbtn on" id="segBar" data-i18n="seg_bar">条形图</button>
@@ -836,6 +836,7 @@
       more_sites:"其他工作台", site_targets:"分析师目标", site_lab:"量化工作台", site_rightside:"右侧工作台", site_strategies:"策略库",
       acct_synced:"已同步", acct_pending:"{n} 条待同步", acct_logout:"退出登录", acct_local:"本机模式 · 未启用云同步",
       sec_board:"行业景气榜", sec_hint:"点击行业可筛选主表 · 绿色=入选", seg_bar:"条形图", seg_tree:"矩形树图",
+      ind_asof:"行业数据截至 ", ind_asof_part:" 个行业数据截至 ",
       wlab_title:"综合分权重实验室", wlab_hint:"拖动滑块即时重算「综合分」并重新排序（不改变原始命中）",
       wlab_reset:"恢复默认 50/30/20", w_tech:"技术面权重", w_fund:"基本面权重", w_prosp:"景气权重",
       tbl_title:"候选股主表", search_ph:"搜索 代码 / 名称", all_inds:"全部行业", all_tags:"全部标签",
@@ -1061,6 +1062,7 @@
       more_sites:"Other desks", site_targets:"Analyst Targets", site_lab:"Quant Lab", site_rightside:"Right-side Desk", site_strategies:"Strategies",
       acct_synced:"Synced", acct_pending:"{n} pending", acct_logout:"Sign out", acct_local:"Local mode · cloud sync off",
       sec_board:"Industry Prosperity", sec_hint:"Click an industry to filter · green = selected", seg_bar:"Bar", seg_tree:"Treemap",
+      ind_asof:"Industry data as of ", ind_asof_part:" industries as of ",
       wlab_title:"Composite-Score Weight Lab", wlab_hint:"Drag sliders to recompute the composite score & re-sort (raw hits unchanged)",
       wlab_reset:"Reset to 50/30/20", w_tech:"Technical weight", w_fund:"Fundamental weight", w_prosp:"Prosperity weight",
       tbl_title:"Candidate Table", search_ph:"Search code / name", all_inds:"All industries", all_tags:"All tags",
@@ -1704,7 +1706,20 @@
     $("#mainTable").scrollIntoView({behavior:"smooth", block:"start"});
   }
   const cssTok = (n)=>getComputedStyle(document.body).getPropertyValue(n).trim() || "#3ddc97";
+  // 行业指数实际截至日 (2026-10-04 卡 IND-T1): 景气榜的趋势/动量吃行业指数日线的最后一根。meta.industry_asof < meta.data_date
+  // = 这份榜是按旧一日的行业指数算的 (同花顺当日那根北京 ~21 点后才落地, 兜底也没补上) -> 标题旁标「行业数据截至 X」;
+  // 相等 / 没有这个键 (09-30 及以前的快照当时没记) -> 不显示。
+  function renderIndAsof(){
+    const el=$("#indAsof"); if(!el) return;
+    const m=DATA.meta||{}, a=m.industry_asof, dd=m.data_date||m.run_date;
+    if(a && dd && String(a)<String(dd)){
+      const n=m.industry_asof_n_lag, tot=(DATA.industries||[]).length;
+      el.textContent = (isNum(n) && n>0 && tot && n<tot) ? `${n}/${tot}${t("ind_asof_part")}${a}` : `${t("ind_asof")}${a}`;
+      el.classList.remove("hidden");
+    } else { el.classList.add("hidden"); el.textContent=""; }
+  }
   function renderIndustryChart(){
+    renderIndAsof();
     const el=$("#industryChart");
     if(!hasECharts){ el.innerHTML=`<div class="text-amber-400 text-sm p-4">${LANG==="en"?"Could not load ECharts (needs internet); table still works.":"未能加载 ECharts（需联网加载图表库），表格功能不受影响。"}</div>`; return; }
     if(indChart){ indChart.dispose(); }
