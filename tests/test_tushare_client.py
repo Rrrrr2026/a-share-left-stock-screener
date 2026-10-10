@@ -337,3 +337,23 @@ if __name__ == "__main__":
     tc.time.sleep = _real_sleep
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     sys.exit(1 if FAIL else 0)
+
+
+def test_trade_cal_filters_is_open_locally_even_when_server_ignores_the_param(monkeypatch):
+    """镜像 tl.kaixin8.top (2026-10-10 起) 对 start==end 的单日查询不套 is_open=1, 把 is_open=0 的行
+    原样返回; trade_cal 必须在本地再过滤, 否则周六被当成开市日 (就绪闸门等 60 分钟拒发)。"""
+    import pandas as pd
+    from ashare import tushare_client as tc
+
+    def fake_query(api, **kw):
+        assert api == "trade_cal" and kw.get("is_open") == "1"
+        return pd.DataFrame({"cal_date": ["20261009", "20261010"], "is_open": [1, 0]})
+
+    monkeypatch.setattr(tc, "query", fake_query)
+    assert tc.trade_cal("2026-10-09", "2026-10-10") == ["2026-10-09"]
+    # 单日查询只回 is_open=0 的那一行 -> 空
+    monkeypatch.setattr(tc, "query", lambda api, **kw: pd.DataFrame({"cal_date": ["20261010"], "is_open": [0]}))
+    assert tc.trade_cal("2026-10-10", "2026-10-10") == []
+    # is_open 列缺失时照旧不过滤 (只能信服务端)
+    monkeypatch.setattr(tc, "query", lambda api, **kw: pd.DataFrame({"cal_date": ["20261012"]}))
+    assert tc.trade_cal("2026-10-12", "2026-10-12") == ["2026-10-12"]
