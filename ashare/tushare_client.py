@@ -340,7 +340,10 @@ def trade_cal(start, end, exchange: str = "SSE", is_open: str = "1",
                start_date=_ymd(start), end_date=_ymd(end), is_open=is_open)
     if not len(df) or "cal_date" not in df.columns:
         return []
-    if is_open is None and "is_open" in df.columns:
+    if "is_open" in df.columns:
+        # 任何参数下都在本地再过滤一遍: 2026-10-10 换到镜像 tl.kaixin8.top 后发现它对 start==end 的
+        # 单日查询不套 is_open=1 (返回 is_open=0 的那一行), 区间查询才套 —— 客户端只数行数就把周六
+        # 10-10 当成开市日, 就绪闸门等了 60 分钟拒发 10-09 产物。服务端过滤只当优化, 不当保证。
         df = df[pd.to_numeric(df["is_open"], errors="coerce") == 1]
     out = sorted({f"{str(d)[:4]}-{str(d)[4:6]}-{str(d)[6:8]}" for d in df["cal_date"]})
     return out
