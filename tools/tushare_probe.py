@@ -3,41 +3,66 @@
 Tushare (协议兼容镜像) 只读探针 —— 两个子命令
 =============================================
     python -X utf8 tools/tushare_probe.py                    # p0: 2026-09 P0 端点清单 (历史用法, 行为不变)
-    python -X utf8 tools/tushare_probe.py compat             # 镜像兼容性探针 (卡 TS-PROBE, **换镜像时必跑**)
-    python -X utf8 tools/tushare_probe.py compat --expect    # 只列「代码期望字段」, 不联网 (0 次调用)
+    python -X utf8 tools/tushare_probe.py compat             # 镜像兼容性探针 (卡 TS-PROBE / TS-PROBE-2, **换 key / 换镜像后必跑**)
+    python -X utf8 tools/tushare_probe.py compat --expect    # 只列「代码期望字段 + 各消费方期限」, 不联网 (0 次调用)
 
 compat 为什么要有 (2026-10-10 教训, CHRONICLE「GM 记 10-10 12:55」): 换到镜像 tl.kaixin8.top 后, 它对
 start==end 的**单日** trade_cal 不套 is_open=1 过滤 (区间查询才套), 客户端数到 1 行就把周六 10-10 当开市日,
 就绪闸门等了 60 分钟拒发 10-09 产物 (a-share f1de80f 起 `tushare_client.trade_cal` 一律本地过滤)。旧镜像没这毛病,
 所以从未暴露 —— 换镜像 = 换了一个「协议兼容」但细节行为未知的实现, 必须先探再切。本子命令把流水线真正依赖的
-那几种调用形态各打一次, 只核**形状** (行数 / 字段集 / is_open 语义 / 延迟 / HTTP 状态), 最后给一张
-PASS/WARN/FAIL 汇总表和一句「可切换 / 不可切换」。
+那几种调用形态各打一次, 只核**形状** (行数 / 字段集 / is_open 语义 / 回包日期 / 延迟 / HTTP 状态), 最后给一张
+PASS/WARN/FAIL 汇总表和**两档结论**。
 
-探什么 (默认 26 次调用, 财务不足一页时各多 1 次续页; 硬上限 --max-calls 30, 超了就不再发, 剩下的判 SKIP = 未跑完):
-  ① trade_cal: 区间 [今天-200 天, 今天+CAL_FWD_DAYS] 带/不带 is_open 各一次 (不带的那次当真值表: 逐自然日一行,
-     周末必须 is_open=0, 要找得到工作日休市日); 单日 周六 / 周日 / 假日 / 开市日 各带/不带 is_open 一次 ——
-     核返回行数与 is_open 值是否符合参数, 并把镜像的**原样回包**喂给客户端 `tushare_client.trade_cal` 回放
-     (打桩 query, 不联网), 证明本地过滤兜得住;
-  ② daily 按 trade_date (全市场一天) 与按 ts_code 区间 (000001.SZ 最近 20 个开市日), 配对的 adj_factor 两次:
-     行数 (过 `market._rows_from_daily` / keep_a_code 后与 stock_basic L 的 A 股只数比, 门槛 = 生产未就绪守卫的
+两档结论 (卡 TS-PROBE-2): 每个检查项带「消费方」—— 生产 (a-share `ashare/*.py`, 流水线) / 数据总览 (stock-core
+`research/data_catalog.py`, 服务器 19:30) / 研究湖 (stock-core `research/lake.py`, PC data/lake)。生产 + 数据总览 =
+**生产档**, 研究湖 = **研究湖档**, 两档各自判「可用 / 不可用 (有 FAIL) / 未跑完 (有 SKIP)」。**退出码只看生产档**:
+0 = 生产档可用 (PASS 或只有 WARN), 1 = 生产档不可用或没跑完, 2 = 判不了 (没 token / 参数错)。研究湖档不可用照样
+打出来, 但不改退出码 —— 只换 token (HANDBOOK 流程 A) 时不能因为研究湖 FAIL 去还原 .bak。
+
+日历真值**不取自被测镜像** (卡 TS-PROBE-2): 用本文件内置的 A 股休市表 `A_CLOSED` (国办放假通知 + 上交所休市通知,
+来源与维护点见表头) + 周末。镜像 trade_cal 把法定假日标成开市、或把开市日标成休市 = FAIL (前者让生产 `trading_days`
+把假日当开市日: `_update_daily_by_date` 那天拉到 0 行就判「当日未就绪」就地停下, 之后天天从这天重试, 价格库永久停更);
+假日一例、开市日 D、按日那几次问的日子 P 都从内置表取, 与镜像无关。表没覆盖的年份 (国办通知还没出) 只核周末并
+WARN, 提醒补表。
+
+探什么 (默认 26 次调用, 财务不足一页时各多 1 次续页; `--max-calls` 只能 1..30 —— 硬上限 30, 超了拒跑 (退出码 2);
+用到上限就不再发, 剩下的判 SKIP = 未跑完):
+  ① trade_cal: 区间 [今天-200 天, 今天+CAL_FWD_DAYS] 带/不带 is_open 各一次 —— 不带的那次逐自然日对照内置休市表
+     (逐日一行、周末必 0、假日必 0、开市日必 1), 带的那次把镜像的**原样回包**喂给客户端 `tushare_client.trade_cal`
+     回放 (打桩 query, 不联网), 回放结果必须等于内置表的开市日; 单日 周六 / 周日 / 假日 (内置表里今天及之前最近的
+     工作日休市日) / 开市日 D (内置表里今天之前最后一个开市日) 各带/不带 is_open 一次 —— 核返回行数与 is_open 值并回放;
+  ② daily / adj_factor 按 trade_date (全市场一天) 与按 ts_code 区间 (000001.SZ 截至 D 的最近 20 个开市日): 按日问的是
+     **已知过去的开市日 P** (内置表里上个月最后一个开市的周二, 且至少在 PAST_DAY_MIN_AGE 天前), 不是最近开市日 ——
+     「无视 trade_date、一律回最新一天」的镜像在最近开市日上与正确镜像分不出来。回包里只要有一行 trade_date ≠ P 就
+     FAIL (生产 `market._rows_from_daily` / `fetch_adj_by_date` 不看 trade_date, 会把别日的行情/因子当成 P 写进价格库);
+     再核行数 (过 `market._rows_from_daily` / keep_a_code 后与 stock_basic L 的 A 股只数比, 门槛 = 生产未就绪守卫的
      ready_ratio)、字段集、因子是否覆盖每根日线;
-  ③ daily_basic / stock_basic (L、D、P 各一次) / index_daily (区间 + 单日) / ths_daily / fina_indicator_vip +
-     income_vip (最近已过法定披露截止的一期, limit = 湖的翻页步长 FIN_PAGE; 不足一页就补一次 offset 续页, 分清
-     「镜像单页上限 < FIN_PAGE → 湖静默少拉」与「该期就这么多」); 研究湖每月重拉的申万三件 index_classify (L1) /
-     index_member_all (一个 L1, is_new=Y, limit = MEMBER_PAGE; 核回包是否真按 l1_code / is_new 过滤) / sw_daily:
-     字段集与行数是否与代码期望一致;
-  ④ 每次调用: HTTP 状态 / code / 行数 / 列数 / 延迟 (工作进程里量的纯 HTTP 时间) / 字节, 延迟对照该端点在生产
-     代码里的最严硬期限 (> 期限 = FAIL, > 一半 = WARN);
-  ⑤ 汇总表 + 「结论: 可切换 / 不可切换」。退出码 0 = 可切换 (PASS 或只有 WARN), 1 = 不可切换 (有 FAIL 或没跑完),
-     2 = 判不了 (没 token / 参数错)。
+  ③ daily_basic 按 P (日期不符同样 FAIL: 生产估值兜底 `fetch_valuation_tushare` 也不看 trade_date) / stock_basic (L、D、
+     P 各一次) / index_daily (区间截至 D + 单日 P; 指数不停牌, 区间缺开市日 = FAIL) / ths_daily 按 P (生产只认所问那天:
+     别日的行 WARN, 当天的 .TI 一行没有 = FAIL) / fina_indicator_vip + income_vip (最近已过法定披露截止的一期,
+     limit = 湖的翻页步长 FIN_PAGE; 不足一页就补一次 offset 续页, 分清「镜像单页上限 < FIN_PAGE → 湖静默少拉」与
+     「该期就这么多」) / 研究湖每月重拉的申万三件 index_classify (L1) / index_member_all (一个 L1, is_new=Y, limit =
+     MEMBER_PAGE; 核回包是否真按 l1_code / is_new 过滤) / sw_daily (申万行业指数, 同样不停牌): 字段集与行数是否与
+     代码期望一致; 按区间查的端点 (指数 / 个股 / 申万日线) 回包里任何一行落在内置表的休市日上 = FAIL (那是假数据);
+  ④ 每次调用: HTTP 状态 / code / 行数 / 列数 / 延迟 (工作进程里量的纯 HTTP 时间) / 字节。延迟按**每档自己最严的
+     消费方期限**判 (> 期限 = FAIL, > 一半 = WARN) —— 例: trade_cal 的生产档期限是数据总览子进程的 10 s, 研究湖档是
+     120 s, 同一次 7.5 s 的调用在生产档 WARN、在研究湖档 PASS;
+  ⑤ 汇总表 + 两档结论 + 一行总结论。
 
-「期望字段」从代码里收集, **不手抄** (`collect_expectations`, 纯 AST, 不 import 被扫的模块):
-  · 扫 a-share `ashare/*.py` 全部 (生产: tushare_client / datasource / market (= pricestore 的取数钩子) / datadate …)
-    与 stock-core `research/lake.py` (研究湖; 找法同 ashare.config: STOCK_CORE_DIR → 同级 ../stock-core)。
+「期望字段」与「期限」从代码里收集, **不手抄** (`collect_expectations`, 纯 AST, 不 import 被扫的模块):
+  · 扫 a-share `ashare/*.py` 全部 (生产: tushare_client / datasource / market (= pricestore 的取数钩子) / datadate …)、
+    stock-core `research/lake.py` (研究湖) 与 `research/data_catalog.py` (数据总览; 找法同 ashare.config:
+    STOCK_CORE_DIR → 同级 ../stock-core)。模块级字符串常量若是一段导入了 tushare_client 的 Python 源码 (子进程脚本,
+    如 data_catalog 的 `_XCAL_CHILD`), 当源码再解析一遍 (行号折回原文件)。
   · 认的调用形态: `query("api", fields=…)` / `_ts_query(…)` / `self.query(…)` / `self._pages(…)` 第一个参数是 api 名,
-    `tsc.trade_cal(…)` / `tsc.index_daily(…)` 是 tushare_client 的薄封装 (字段取封装内部那处)。
+    `tsc.trade_cal(…)` / `tsc.index_daily(…)` 是 tushare_client 的薄封装 (字段取封装内部那处); 客户端模块的别名从
+    import 语句里认 (`from ashare import tushare_client as t` 之后 `t.trade_cal(…)` 也算)。
   · fields 参数能静态求值就算: 字符串字面量、模块常量 (TS_DAILY_BASIC_FIELDS)、`",".join(列表常量)`、
     函数里的局部变量 (含外层函数的, 如湖 pull_daily_basic 里嵌套 fetch 用的 fields)。
+  · 期限: 站点的 `deadline_sec=` (没写 = 客户端 DEADLINE_SEC); 同一作用域里显式改了 `<客户端>.TIMEOUT_SEC = N`
+    (socket 超时) 的再取 min —— 数据总览子进程就是 TIMEOUT_SEC=10 + deadline_sec=10 (子进程里不走进程级期限, 卡它的
+    是这个 socket 超时与父进程 20 s 墙钟)。客户端**默认**的 socket 超时 (TIMEOUT_SEC 60 s) 不另算: 探针自己的请求用的
+    就是同一个 socket 超时, 首字节超过它这次调用在探针里同样失败。每个消费方取自己站点里最严的那个。
   · 列引用: 同一函数里对**这次调用结果那个变量**做的 `need <= set(df.columns)` 守卫集合与 `"x" in df.columns`
     判断 (按变量名 + 行号就近归属, 所以 fetch_bars_bulk_tushare 里 `"adj_factor" in fa.columns` 只算 adj_factor 的,
     不会冤枉 daily)。没给 fields 的调用 (index_daily) 走镜像默认字段集, 期望 = 这些列引用。
@@ -47,10 +72,12 @@ PASS/WARN/FAIL 汇总表和一句「可切换 / 不可切换」。
   以后有人在代码里加一处 Tushare 调用或一个字段, 探针的期望自动跟着变; 代码在用而本探针不探的端点打在「未覆盖」行。
 
 铁律: 只读 (不写任何库; lake.db 以 `mode=ro` 只读 meta / pull_log 两张小表; 结果只在 --json 时落一个文件);
-token 只在请求体里, **永不打印/落盘** (镜像回的 msg 里若出现 token 也会被抹掉, 地址只打主机名); 每次 HTTP 经
-`tushare_client._deadline_call` 走 datasource 的**进程级**墙钟硬期限 (与生产同一个执行器); 默认凭据就是生产
-客户端 `tushare_client.credentials()` 的那一份 (data/secrets.json, 环境变量 TUSHARE_TOKEN / TUSHARE_BASE_URL 可覆盖),
-`--secrets PATH` 可指向另一份 secrets.json (只读其 tushare_token / tushare_base_url 两键)。
+token 只在请求体里, **永不打印/落盘** —— 镜像回包里出现的 token (JSON 回包的 msg, 或网关错误页这种非 JSON 回包) 一律
+**先抹后截**: 整串换成 <token>, 再把 token 任何 ≥ TOKEN_FRAG_MIN 字的片段换成 <token…> (`scrub_token`; 非 JSON 回包在
+工作进程里截 120 字之前就抹), 地址只打主机名; 每次 HTTP 经 `tushare_client._deadline_call` 走 datasource 的**进程级**
+墙钟硬期限 (与生产同一个执行器); 默认凭据就是生产客户端 `tushare_client.credentials()` 的那一份 (data/secrets.json,
+环境变量 TUSHARE_TOKEN / TUSHARE_BASE_URL 可覆盖), `--secrets PATH` 可指向另一份 secrets.json (只读其 tushare_token /
+tushare_base_url 两键)。探针不经 query, 不会触发 TS-FALLBACK 的切备用。
 **不在模块顶层动 stdout / 读 secrets / 联网**: 硬期限的 spawn 子进程会按路径重导入本文件 (见 tushare_ready_probe.py 同款说明)。
 """
 from __future__ import annotations
@@ -74,17 +101,20 @@ if ROOT not in sys.path:
 BJ = dt.timezone(dt.timedelta(hours=8))
 DEFAULT_BASE = "https://api.tushare.pro/"
 
-MAX_CALLS = 30              # 卡 TS-PROBE: 一次探针的调用总数上限 (默认计划 26 次, 续页/重试也算)
+MAX_CALLS = 30              # 卡 TS-PROBE: 一次探针的调用总数**硬上限** (默认计划 26 次, 续页/重试也算); --max-calls 只能 1..30
 GAP_SEC = 1.0               # 两次调用之间的静默秒数 (trade_cal 连打 10 次, 别把镜像的分钟频控打满)
 BUDGET_SEC = 900.0          # 整个探针的墙钟预算; 用完不再发调用 (剩下的判 SKIP)
-DEADLINE_MARGIN_SEC = 30.0  # 硬期限 = 该端点生产最严期限 + 这点余量 (超了生产期限仍判 FAIL, 只是能量出实际耗时)
-SLOW_FRAC = 0.5             # 延迟超过生产期限的这个比例 -> WARN
-LOOKBACK_DAYS = 200         # 区间日历往回看的自然日: A 股两次放假最多隔 ~4 个月, 200 天里必有工作日休市日
+DEADLINE_MARGIN_SEC = 30.0  # 探针每次调用的硬期限 = 该端点各消费方里**最宽**的期限 + 这点余量 (量得出实际耗时, 再按各档期限判)
+SLOW_FRAC = 0.5             # 延迟超过期限的这个比例 -> WARN
+LOOKBACK_DAYS = 200         # 区间日历往回看的自然日 (盖住最近两三个长假; 真值是内置休市表, 不靠镜像)
 RANGE_OPEN_DAYS = 20        # 按 ts_code 区间取最近多少个开市日
 RANGE_CODE = "000001.SZ"    # 按 ts_code 区间的样本股 (平安银行, 极少停牌)
 SW_L1_FALLBACK = "801010.SI"  # 申万分类没拿到时, 成员/日线那两次用的 L1 (农林牧渔)
 ROUND_CAPS = (1000, 2000, 3000, 4000, 5000, 6000, 8000, 9000, 10000)   # 行数恰为整数 -> 疑似单页上限截断
 RATE_BACKOFF_SEC = 12.0     # 超频后重试前等多久 (= tushare_client.BACKOFF_RATE_SEC)
+PAST_DAY_MIN_AGE = 7        # 按日问的 P 至少在这么多自然日之前 (与最近开市日拉开, 测得出「无视 trade_date」的镜像)
+TOKEN_FRAG_MIN = 8          # token 的片段 >= 这么长也抹 (网关/镜像只回显了一截时)
+RAW_HEAD_SCAN = 65536       # 非 JSON 回包: 先在前这么多字里抹 token, 再截前 120 字
 
 LEVELS = ("PASS", "WARN", "FAIL", "SKIP")
 _RANK = {lv: i for i, lv in enumerate(LEVELS)}
@@ -94,13 +124,153 @@ def _worst(*levels: str) -> str:
     return max((lv for lv in levels if lv), key=lambda lv: _RANK[lv], default="PASS")
 
 
+# ================================================================= A 股休市表 (日历真值, 与被测镜像无关)
+# 每年一行 (节日, 休市首日, 休市末日), 照抄交易所「部分节假日休市安排的通知」的区间 (= 国办放假通知的放假区间)。
+# 区间里的周末本来就休市; 调休「上班」的周六/周日交易所照样休市 (公告原文「…为周末休市」), 所以只要这些区间 + 周末。
+#   2025: 国办发明电〔2024〕12号 (2024-11-12, https://www.gov.cn/zhengce/content/202411/content_6986382.htm)
+#         上证公告〔2024〕38号 (2024-12-23)
+#   2026: 国办发明电〔2025〕7号 (2025-11-04, https://www.gov.cn/zhengce/content/202511/content_7047090.htm)
+#         上证公告〔2025〕45号 (2025-12-22)
+#   2027: 国办通知截至 2026-10-12 还没发布 (惯例每年 10 月底-11 月发次年安排, 交易所 12 月发休市通知) —— None = 未覆盖:
+#         探针对 2027 的工作日判不了是不是假日, 只核周末, 并 WARN 提醒补表; 选日子时跳过这些判不了的日子。
+# 维护点: ① 国办通知 / 交易所休市通知出来后照上面的格式补一行 (两者不一致以交易所为准, 并在这里写明); 交易所临时休市
+#   (罕见) 也补进当年这一行。② 补完跑用例 tests/test_tushare_probe_compat.py 的 test_holiday_table_* (各年工作日休市
+#   天数 + 用例文件里另抄一份的逐日清单, 两份互核)。③ 2025-01-01..2026-10-12 已与本机价格库 data/pricestore.db 的
+#   idx_bars 日期与 bars 去重日逐日对过: 427 个开市日, 0 差异 (卡 TS-PROBE-2, 只读)。
+A_CLOSED = {
+    2025: (("元旦", "2025-01-01", "2025-01-01"), ("春节", "2025-01-28", "2025-02-04"),
+           ("清明", "2025-04-04", "2025-04-06"), ("劳动节", "2025-05-01", "2025-05-05"),
+           ("端午", "2025-05-31", "2025-06-02"), ("国庆·中秋", "2025-10-01", "2025-10-08")),
+    2026: (("元旦", "2026-01-01", "2026-01-03"), ("春节", "2026-02-15", "2026-02-23"),
+           ("清明", "2026-04-04", "2026-04-06"), ("劳动节", "2026-05-01", "2026-05-05"),
+           ("端午", "2026-06-19", "2026-06-21"), ("中秋", "2026-09-25", "2026-09-27"),
+           ("国庆", "2026-10-01", "2026-10-07")),
+    2027: None,
+}
+
+
+def _as_date(d) -> dt.date:
+    return d if isinstance(d, dt.date) else dt.date.fromisoformat(str(d)[:10])
+
+
+def _closed_set(year: int):
+    """内置表某年的休市日 (区间内全部自然日, 含周末) -> set[ISO]; 表没覆盖这一年 -> None。"""
+    rows = A_CLOSED.get(year)
+    if rows is None:
+        return None
+    out = set()
+    for _name, a, b in rows:
+        d, e = _as_date(a), _as_date(b)
+        while d <= e:
+            out.add(d.isoformat())
+            d += dt.timedelta(days=1)
+    return out
+
+
+def a_open(d):
+    """内置休市表 + 周末: 开市 True / 休市 False / 表没覆盖那一年的工作日 None (判不了)。"""
+    d = _as_date(d)
+    if d.weekday() >= 5:
+        return False
+    closed = _closed_set(d.year)
+    if closed is None:
+        return None
+    return d.isoformat() not in closed
+
+
+def holiday_truth(d0, d1) -> tuple:
+    """[d0, d1] 逐自然日 -> ({ISO: 1 开市 / 0 休市} 判得了的, [判不了的工作日 ISO], {判不了的年份})。"""
+    d, e = _as_date(d0), _as_date(d1)
+    truth, unknown, years = {}, [], set()
+    while d <= e:
+        v = a_open(d)
+        if v is None:
+            unknown.append(d.isoformat())
+            years.add(d.year)
+        else:
+            truth[d.isoformat()] = 1 if v else 0
+        d += dt.timedelta(days=1)
+    return truth, unknown, years
+
+
+def table_open_days(d0, d1) -> list:
+    """内置表里 [d0, d1] 的开市日 (判不了的不算) -> [ISO] 升序。"""
+    truth, _, _ = holiday_truth(d0, d1)
+    return sorted(d for d, v in truth.items() if v == 1)
+
+
+def last_open_before(today, max_back: int = 90):
+    """内置表里 today 之前 (不含) 最后一个开市日 -> ISO; 判不了的日子跳过; 一路找不到 -> None。"""
+    d = _as_date(today)
+    for _ in range(max_back):
+        d -= dt.timedelta(days=1)
+        if a_open(d) is True:
+            return d.isoformat()
+    return None
+
+
+def last_holiday_on_or_before(today, max_back: int = 400):
+    """内置表里 today 及之前最近的**工作日**休市日 (法定节假日) -> ISO / None。"""
+    d = _as_date(today)
+    for _ in range(max_back):
+        if d.weekday() < 5 and a_open(d) is False:
+            return d.isoformat()
+        d -= dt.timedelta(days=1)
+    return None
+
+
+def past_by_date_day(today):
+    """按日那几次问的日子 P: 内置表里**上个月最后一个开市的周二**, 且至少在 PAST_DAY_MIN_AGE 天前 (月初那几天上月末的
+    周二离今天太近, 往前挪一周)。上个月表没覆盖 / 一个都不合格 -> 今天往前至少 2×PAST_DAY_MIN_AGE 天的最后一个开市日;
+    还没有 -> None (调用方退回镜像日历并 WARN)。"""
+    t = _as_date(today)
+    first = t.replace(day=1)
+    prev_month = (first - dt.timedelta(days=1)).month
+    d = first - dt.timedelta(days=1)                     # 上个月最后一天
+    while d.month == prev_month:
+        if d.weekday() == 1 and (t - d).days >= PAST_DAY_MIN_AGE and a_open(d) is True:
+            return d.isoformat()
+        d -= dt.timedelta(days=1)
+    return last_open_before(t - dt.timedelta(days=2 * PAST_DAY_MIN_AGE - 1), max_back=120)
+
+
+def _prev_weekday(today) -> dt.date:
+    d = _as_date(today) - dt.timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= dt.timedelta(days=1)
+    return d
+
+
+# ================================================================= token 抹除 (先抹后截)
+def scrub_token(text, token: str, min_frag: int = TOKEN_FRAG_MIN) -> str:
+    """把文本里的 token 整串换成 <token>, 再把它任何 ≥ min_frag 字的片段换成 <token…> (先长后短)。
+    **必须在截断之前调用** —— 先截后抹的话 token 跨在截断边界上整串匹配不上, 前缀会原样漏出去。"""
+    s = str(text or "")
+    tok = str(token or "")
+    if not tok or not s:
+        return s
+    s = s.replace(tok, "<token>")
+    n = len(tok)
+    for size in range(n - 1, min_frag - 1, -1):
+        for i in range(0, n - size + 1):
+            frag = tok[i:i + size]
+            if frag in s:
+                s = s.replace(frag, "<token…>")
+    return s
+
+
 # ================================================================= 期望字段: 从代码里收集 (AST, 不手抄)
 _API_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _QUERY_FUNCS = ("query", "_ts_query", "_pages")          # 第一个位置参数 = api 名
-_WRAPPERS = ("trade_cal", "index_daily")                 # tushare_client 的薄封装 (外部以 tsc./tc. 调)
+_WRAPPERS = ("trade_cal", "index_daily")                 # tushare_client 的薄封装 (外部以 tsc./tc./别名. 调)
 _CLIENT_NAMES = ("tsc", "tc", "tushare_client")
 _FIN_TABLES_NAME = "FIN_TABLES"                          # research/lake.py: {api: (表名, 主键, 文本列, 日期列)}
-CONSUMER_PROD, CONSUMER_LAKE = "生产", "研究湖"
+CONSUMER_PROD, CONSUMER_CATALOG, CONSUMER_LAKE = "生产", "数据总览", "研究湖"
+TIER_PROD, TIER_LAKE = "生产", "研究湖"
+TIER_OF = {CONSUMER_PROD: TIER_PROD, CONSUMER_CATALOG: TIER_PROD, CONSUMER_LAKE: TIER_LAKE}
+TIER_DESC = {TIER_PROD: "生产 = a-share 流水线 + 数据总览; 决定退出码",
+             TIER_LAKE: "研究湖 = PC data/lake; 不改退出码"}
+CORE_SCANS = (("research/lake.py", CONSUMER_LAKE), ("research/data_catalog.py", CONSUMER_CATALOG))
 
 
 def _lit(node, lookup):
@@ -178,6 +348,37 @@ def _df_var(node, colvars: dict):
     return None
 
 
+def _client_aliases(tree) -> tuple:
+    """这份源码里 tushare_client 模块的名字: 惯用名 + import 语句里的别名
+    (`from ashare import tushare_client as t` / `from . import tushare_client as tsc` / `import ashare.tushare_client as x`)。"""
+    names = set(_CLIENT_NAMES)
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom):
+            for a in n.names:
+                if a.name == "tushare_client":
+                    names.add(a.asname or a.name)
+        elif isinstance(n, ast.Import):
+            for a in n.names:
+                if a.asname and (a.name == "tushare_client" or a.name.endswith(".tushare_client")):
+                    names.add(a.asname)
+    return tuple(sorted(names))
+
+
+def _sock_override(nodes, clients, lookup):
+    """本作用域里 `<客户端>.TIMEOUT_SEC = N` (socket 超时被显式改掉, 如数据总览子进程的 10 s) -> N / None。"""
+    vals = []
+    for n in nodes:
+        if not isinstance(n, (ast.Assign, ast.AnnAssign)):
+            continue
+        for t, v in _assign_pairs(n):
+            if (isinstance(t, ast.Attribute) and t.attr == "TIMEOUT_SEC" and isinstance(t.value, ast.Name)
+                    and t.value.id in clients):
+                x = _lit(v, lookup)
+                if isinstance(x, (int, float)) and x > 0:
+                    vals.append(x)
+    return min(vals) if vals else None
+
+
 def _call_site(call, lookup, qual: str, ctx: dict):
     """一个 Call 节点是不是 Tushare 调用 -> 站点 dict / None。"""
     f = call.func
@@ -188,9 +389,10 @@ def _call_site(call, lookup, qual: str, ctx: dict):
         owner = f.value.id if isinstance(f.value, ast.Name) else ""
     else:
         return None
+    clients = ctx["clients"]
     api, via_wrapper, dynamic = None, False, False
     if name in _QUERY_FUNCS and call.args:
-        if owner not in (None, "self", "ds", "datasource") + _CLIENT_NAMES:
+        if owner not in (None, "self", "ds", "datasource") + tuple(clients):
             return None                          # df.query(expr) 之类, 不是 Tushare
         v = _lit(call.args[0], lookup)
         if isinstance(v, str):
@@ -199,7 +401,7 @@ def _call_site(call, lookup, qual: str, ctx: dict):
             api = v
         else:
             dynamic = True                       # 湖的 self._pages(api, …): api 运行时才知道, 只记录不计入
-    elif name in _WRAPPERS and owner in _CLIENT_NAMES:
+    elif name in _WRAPPERS and owner in clients:
         api, via_wrapper = name, True
     else:
         return None
@@ -215,13 +417,13 @@ def _call_site(call, lookup, qual: str, ctx: dict):
             fields = "dynamic"
     deadline = _lit(kw["deadline_sec"], lookup) if "deadline_sec" in kw else None
     return {"api": api, "via_wrapper": via_wrapper, "dynamic": dynamic, "fields": fields,
-            "deadline": deadline if isinstance(deadline, (int, float)) else None,
+            "deadline": deadline if isinstance(deadline, (int, float)) else None, "sock_cap": None,
             "params": sorted(k for k in kw if k not in ("fields", "retries", "deadline_sec")),
-            "file": ctx["rel"], "line": call.lineno, "qual": qual or "<module>",
+            "file": ctx["rel"], "line": call.lineno + ctx.get("line_off", 0), "qual": qual or "<module>",
             "consumer": ctx["consumer"], "var": None, "refs": [], "_node": call}
 
 
-def _visit(body, chain: list, qual: str, ctx: dict, out: list, is_class: bool = False) -> dict:
+def _visit(body, chain: list, qual: str, ctx: dict, out: list, is_class: bool = False, sock_cap=None) -> dict:
     nodes, nested = _scope_nodes(body)
     local: dict = {}
 
@@ -242,11 +444,15 @@ def _visit(body, chain: list, qual: str, ctx: dict, out: list, is_class: bool = 
                     dv = _df_var(v, colvars)
                     if dv:
                         colvars[t.id] = dv
+    cap = _sock_override(nodes, ctx["clients"], lookup)  # 本作用域改了 socket 超时 -> 本作用域及嵌套的站点都受它卡
+    if cap is not None:
+        sock_cap = cap if sock_cap is None else min(sock_cap, cap)
     sites = []
     for n in nodes:
         if isinstance(n, ast.Call):
             s = _call_site(n, lookup, qual, ctx)
             if s is not None:
+                s["sock_cap"] = sock_cap
                 sites.append(s)
     by_node = {id(s["_node"]): s for s in sites}
     for n in nodes:                              # 调用结果落到哪个变量 (df = …, df, n = …)
@@ -270,15 +476,35 @@ def _visit(body, chain: list, qual: str, ctx: dict, out: list, is_class: bool = 
             cols, var = [n.left.value], _df_var(right, colvars)
         if not cols or not var:
             continue
-        cands = [s for s in sites if s["var"] == var and s["line"] <= n.lineno]
+        cands = [s for s in sites if s["var"] == var and s["line"] - ctx.get("line_off", 0) <= n.lineno]
         if cands:
             max(cands, key=lambda s: s["line"])["refs"].extend(cols)
     out.extend(sites)
     sub_chain = chain if is_class else [local] + chain
     for d in nested:
         name = f"{qual}.{d.name}" if qual else d.name
-        _visit(d.body, sub_chain, name, ctx, out, is_class=isinstance(d, ast.ClassDef))
+        _visit(d.body, sub_chain, name, ctx, out, is_class=isinstance(d, ast.ClassDef), sock_cap=sock_cap)
     return local
+
+
+def _embedded_sources(tree) -> list:
+    """模块级字符串常量里的 Python 源码 (子进程脚本, 如 data_catalog 的 `_XCAL_CHILD`): 提到 tushare_client 且能解析的
+    -> [(常量名, AST, 行号偏移)]。偏移让站点的行号落回原文件 (脚本第 k 行 = 字符串起始行 + k - 1)。"""
+    out = []
+    for stmt in tree.body:
+        if not isinstance(stmt, (ast.Assign, ast.AnnAssign)) or stmt.value is None:
+            continue
+        v = stmt.value
+        if not (isinstance(v, ast.Constant) and isinstance(v.value, str) and "tushare_client" in v.value):
+            continue
+        try:
+            sub = ast.parse(v.value)
+        except SyntaxError:
+            continue
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+        name = next((t.id for t in targets if isinstance(t, ast.Name)), "?")
+        out.append((name, sub, v.lineno - 1))
+    return out
 
 
 def _fin_tables(tree) -> dict:
@@ -304,10 +530,15 @@ def _fin_tables(tree) -> dict:
 
 
 def scan_source(src: str, rel: str, consumer: str) -> dict:
-    """一份源码 -> {"sites": [Tushare 调用站点], "consts": 模块级常量, "fin_tables": {…}}。纯函数, 不 import。"""
+    """一份源码 -> {"sites": [Tushare 调用站点], "consts": 模块级常量, "fin_tables": {…}}。纯函数, 不 import。
+    模块级字符串常量里的子进程脚本 (见 _embedded_sources) 一并扫, 站点的 qual 记成「常量名 (子进程脚本)」。"""
     tree = ast.parse(src)
     sites: list = []
-    consts = _visit(tree.body, [], "", {"rel": rel, "consumer": consumer}, sites)
+    consts = _visit(tree.body, [], "", {"rel": rel, "consumer": consumer, "clients": _client_aliases(tree),
+                                        "line_off": 0}, sites)
+    for name, sub, off in _embedded_sources(tree):
+        _visit(sub.body, [], f"{name} (子进程脚本)",
+               {"rel": rel, "consumer": consumer, "clients": _client_aliases(sub), "line_off": off}, sites)
     for s in sites:
         s.pop("_node", None)
     return {"sites": sites, "consts": consts, "fin_tables": _fin_tables(tree)}
@@ -359,8 +590,10 @@ def collect_expectations(a_root: str = ROOT, core: str | None = None, lake_meta:
     """扫代码 -> {"apis": {api: 期望}, "dynamic": [动态站点], "consts": {文件: 常量}, "fin_page": int|None, "notes": []}。
 
     期望 = {"mode": explicit|default, "fields": 显式请求的字段 (各站点并集), "refs": 列引用, "expect": 要核的列,
-           "default_sites": 走默认字段集的站点数, "deadline": 各站点最严硬期限 (没写的按客户端 DEADLINE_SEC),
-           "consumers": [...], "sites": ["文件:行 函数 (字段说明)"], "meta_source": 财务字段表来源}。"""
+           "default_sites": 走默认字段集的站点数, "deadline_by": {消费方: 该消费方站点里最严的期限},
+           "deadline": 各消费方里最严的, "wait": 各消费方里最宽的 (探针自己等多久), "consumers": [...],
+           "sites": ["文件:行 函数 (字段说明)"], "meta_source": 财务字段表来源}。
+    站点期限 = min(deadline_sec 没写就是客户端 DEADLINE_SEC, 同作用域显式改的 TIMEOUT_SEC)。"""
     notes, sites, consts = [], [], {}
     for p in sorted(glob.glob(os.path.join(a_root, "ashare", "*.py"))):
         rel = "ashare/" + os.path.basename(p)
@@ -371,15 +604,23 @@ def collect_expectations(a_root: str = ROOT, core: str | None = None, lake_meta:
     fin, fin_page = {}, None
     core = find_core_dir(core)
     if core:
-        with open(os.path.join(core, "research", "lake.py"), encoding="utf-8") as f:
-            res = scan_source(f.read(), "stock-core/research/lake.py", CONSUMER_LAKE)
-        sites += res["sites"]
-        consts["stock-core/research/lake.py"] = res["consts"]
-        fin = res["fin_tables"]
-        fp = res["consts"].get("FIN_PAGE")
-        fin_page = fp if isinstance(fp, int) else None
+        for rel_core, cons in CORE_SCANS:
+            p = os.path.join(core, *rel_core.split("/"))
+            rel = "stock-core/" + rel_core
+            if not os.path.isfile(p):
+                notes.append(f"stock-core 里没有 {rel_core}: {cons}的期望未纳入")
+                continue
+            with open(p, encoding="utf-8") as f:
+                res = scan_source(f.read(), rel, cons)
+            sites += res["sites"]
+            consts[rel] = res["consts"]
+            if rel_core == "research/lake.py":
+                fin = res["fin_tables"]
+                fp = res["consts"].get("FIN_PAGE")
+                fin_page = fp if isinstance(fp, int) else None
     else:
-        notes.append("找不到 stock-core/research/lake.py (STOCK_CORE_DIR / 同级 ../stock-core): 研究湖的期望未纳入")
+        notes.append("找不到 stock-core/research/lake.py (STOCK_CORE_DIR / 同级 ../stock-core): "
+                     "研究湖与数据总览的期望未纳入")
     lake_meta = lake_meta or {"fields": {}, "rows": {}, "error": "未读 lake.db"}
     client_dl = consts.get("ashare/tushare_client.py", {}).get("DEADLINE_SEC")
     client_dl = client_dl if isinstance(client_dl, (int, float)) else 120
@@ -388,8 +629,12 @@ def collect_expectations(a_root: str = ROOT, core: str | None = None, lake_meta:
 
     def entry(api):
         return apis.setdefault(api, {"api": api, "fields": [], "refs": [], "default_sites": 0, "explicit_sites": 0,
-                                     "dyn_fields_sites": 0, "deadlines": [], "consumers": [], "sites": [],
+                                     "dyn_fields_sites": 0, "deadline_by": {}, "consumers": [], "sites": [],
                                      "meta_source": None})
+
+    def note_deadline(e, consumer, secs):
+        cur = e["deadline_by"].get(consumer)
+        e["deadline_by"][consumer] = secs if cur is None else min(cur, secs)
 
     dynamic = []
     for s in sites:
@@ -400,24 +645,29 @@ def collect_expectations(a_root: str = ROOT, core: str | None = None, lake_meta:
         e = entry(s["api"])
         e["consumers"].append(s["consumer"])
         e["refs"] += s["refs"]
-        if s["deadline"]:
-            e["deadlines"].append(s["deadline"])
+        eff = s["deadline"] or client_dl
+        if s.get("sock_cap"):
+            eff = min(eff, s["sock_cap"])
+        note_deadline(e, s["consumer"], eff)
+        lim = (f"; 期限 {eff:g}s" + (f" (TIMEOUT_SEC={s['sock_cap']:g})" if s.get("sock_cap") else "")
+               if eff != client_dl else "")
         if s["via_wrapper"]:
-            e["sites"].append(where + " (经 tushare_client 封装)")
+            e["sites"].append(where + f" (经 tushare_client 封装{lim})")
             continue
         if s["fields"] == "dynamic":
             e["dyn_fields_sites"] += 1
-            e["sites"].append(where + " (fields 运行时才知道)")
+            e["sites"].append(where + f" (fields 运行时才知道{lim})")
         elif s["fields"] is None:
             e["default_sites"] += 1
-            e["sites"].append(where + " (默认字段集)")
+            e["sites"].append(where + f" (默认字段集{lim})")
         else:
             e["explicit_sites"] += 1
             e["fields"] += s["fields"]
-            e["sites"].append(where + f" ({len(s['fields'])} 列)")
+            e["sites"].append(where + f" ({len(s['fields'])} 列{lim})")
     for api, ft in fin.items():
         e = entry(api)
         e["consumers"].append(CONSUMER_LAKE)
+        note_deadline(e, CONSUMER_LAKE, client_dl)            # 湖经 tushare_client.query 的默认期限翻页
         e["refs"] += ft["refs"]
         mf = lake_meta["fields"].get(ft["table"])
         if mf:
@@ -439,19 +689,22 @@ def collect_expectations(a_root: str = ROOT, core: str | None = None, lake_meta:
         else:
             e["mode"] = "default"
             e["expect"] = list(e["refs"])
-        e["deadline"] = min(e["deadlines"] + [client_dl])
+        by = e["deadline_by"] or {CONSUMER_PROD: client_dl}
+        e["deadline"], e["wait"] = min(by.values()), max(by.values())
     return {"apis": apis, "dynamic": dynamic, "consts": consts, "fin_page": fin_page, "notes": notes,
             "core": core, "lake_meta_error": lake_meta.get("error", ""), "client_deadline": client_dl}
 
 
 def print_expectations(exp: dict, out=print) -> None:
-    out("代码期望字段 (AST 静态收集, 不手抄; 生产 = a-share ashare/*.py, 研究湖 = stock-core research/lake.py)")
+    out("代码期望字段与期限 (AST 静态收集, 不手抄; 生产 = a-share ashare/*.py, 研究湖 = stock-core research/lake.py, "
+        "数据总览 = stock-core research/data_catalog.py)")
     for note in exp["notes"]:
         out(f"  注: {note}")
     for api in sorted(exp["apis"]):
         e = exp["apis"][api]
         mode = (f"显式 {len(e['fields'])} 列" if e["mode"] == "explicit" else "默认字段集")
-        out(f"\n  {api}  [{'+'.join(e['consumers'])}]  {mode}  · 要核 {len(e['expect'])} 列 · 生产最严期限 {e['deadline']:g}s")
+        dls = " · ".join(f"{c} {s:g}s" for c, s in e["deadline_by"].items())
+        out(f"\n  {api}  [{'+'.join(e['consumers'])}]  {mode}  · 要核 {len(e['expect'])} 列 · 期限 {dls}")
         if e["fields"]:
             out(f"    fields: {','.join(e['fields'])}")
         if e["refs"]:
@@ -467,7 +720,9 @@ def print_expectations(exp: dict, out=print) -> None:
 # ================================================================= 联网: 一次 POST (在硬期限工作进程里跑)
 def _raw_post(base: str, payload: dict, timeout: float) -> dict:
     """一次 POST -> {"http", "secs", "bytes", "json", "head"}。**必须是模块级函数** (要 pickle 进工作进程)。
-    secs 在工作进程里量 = 纯 HTTP 往返 + 下载, 不含进程池调度; head 只在回包不是 JSON 时给前 120 字 (网关错误页)。"""
+    secs 在工作进程里量 = 纯 HTTP 往返 + 下载, 不含进程池调度。head 只在回包不是 JSON 时给 (网关错误页): **先**在前
+    RAW_HEAD_SCAN 字里把 token 抹掉 (整串 + ≥ TOKEN_FRAG_MIN 字的片段, scrub_token), **再**截前 120 字 —— 反过来的话
+    token 跨在第 120 字上时整串匹配不上, 前缀原样漏出去 (卡 TS-PROBE 校验员实测: 34 字的 token 最多漏 33 字)。"""
     import requests
     t0 = time.perf_counter()
     r = requests.post(base, json=payload, timeout=timeout,
@@ -478,8 +733,10 @@ def _raw_post(base: str, payload: dict, timeout: float) -> dict:
         j = r.json()
     except Exception:                                          # noqa: BLE001
         j = None
-    return {"http": r.status_code, "secs": secs, "bytes": len(body), "json": j,
-            "head": "" if j is not None else r.text[:120]}
+    head = ""
+    if j is None:
+        head = scrub_token(r.text[:RAW_HEAD_SCAN], str((payload or {}).get("token") or ""))[:120]
+    return {"http": r.status_code, "secs": secs, "bytes": len(body), "json": j, "head": head}
 
 
 def deadline_post(base: str, payload: dict, deadline: float) -> dict:
@@ -507,24 +764,23 @@ def _classify_msg(code, msg: str) -> str:
 
 
 class Prober:
-    """按计划逐次调用并记录形状。调用数 > max_calls 或墙钟预算用完就不再发 (记录 kind=SKIP)。
-    传输失败 / 超频各重试一次 (也算调用数); 硬期限超时不重试 (那就是结论)。"""
+    """按计划逐次调用并记录形状。调用数到 max_calls (封顶 MAX_CALLS, 给多大都一样) 或墙钟预算用完就不再发
+    (记录 kind=SKIP)。传输失败 / 超频各重试一次 (也算调用数); 硬期限超时不重试 (那就是结论)。"""
 
     def __init__(self, token: str, base: str, post=None, max_calls: int = MAX_CALLS, gap: float = GAP_SEC,
                  budget: float = BUDGET_SEC, sleep=time.sleep, clock=time.time):
         self.token, self.base = token, base
         self.post = post or deadline_post
-        self.max_calls, self.gap, self.budget = int(max_calls), float(gap), float(budget)
+        self.max_calls = max(0, min(int(max_calls), MAX_CALLS))     # 硬上限 (卡 TS-PROBE-2: 文档写的「硬上限」要真封顶)
+        self.gap, self.budget = float(gap), float(budget)
         self.sleep, self.clock = sleep, clock
         self.t0 = clock()
         self.n = 0
         self.records: list = []
 
     def clean(self, text) -> str:
-        """镜像回的文案: 抹 token、去换行、截 120 字。"""
-        s = str(text or "")
-        if self.token:
-            s = s.replace(self.token, "<token>")
+        """镜像回的文案: **先**抹 token (整串 + ≥ TOKEN_FRAG_MIN 字片段), 再去换行、截 120 字。"""
+        s = scrub_token(str(text or ""), self.token)
         return " ".join(s.split())[:120]
 
     def call(self, rid: str, label: str, api: str, params: dict, fields: str = "", deadline: float = 120.0) -> dict:
@@ -657,15 +913,17 @@ def field_check(rec: dict, expect: list):
     return "PASS", f"字段 {len(expect)}/{len(expect)} 齐 (返回 {len(got)} 列)"
 
 
-def latency_check(rec: dict, deadline: float):
+def latency_check(rec: dict, deadline: float, who: str = ""):
+    """一次调用的延迟对照一个期限 (who = 定这个期限的消费方, 只进文案)。"""
     secs = rec.get("secs")
     if secs is None:
         return None
+    lab = f"{who}期限" if who else "生产期限"
     if secs > deadline:
-        return "FAIL", f"延迟 {secs:.1f}s > 生产硬期限 {deadline:g}s (生产这次会超时)"
+        return "FAIL", f"延迟 {secs:.1f}s > {lab} {deadline:g}s (这次会超时)"
     if secs > deadline * SLOW_FRAC:
-        return "WARN", f"延迟 {secs:.1f}s > 生产期限 {deadline:g}s 的 {SLOW_FRAC:.0%}"
-    return "PASS", f"延迟 {secs:.1f}s / 期限 {deadline:g}s"
+        return "WARN", f"延迟 {secs:.1f}s > {lab} {deadline:g}s 的 {SLOW_FRAC:.0%}"
+    return "PASS", f"延迟 {secs:.1f}s / {lab} {deadline:g}s"
 
 
 def round_cap_note(n: int, ref: int | None):
@@ -680,6 +938,25 @@ def combine(parts: list):
     if not parts:
         return "PASS", ""
     return _worst(*(p[0] for p in parts)), "; ".join(p[1] for p in parts if p[1])
+
+
+def date_check(rec: dict, day: str, prod_filters: bool = False):
+    """按日回包的 trade_date 是不是都等于所问那天。生产不按日期过滤的端点 (daily / adj_factor / daily_basic) 有一行
+    不符就 FAIL —— 别日的数据会被当成这天写进库; 生产按日期过滤的 (ths_daily / index_daily 单日) 判 WARN。
+    回包没有 trade_date 列由字段检查管 (这几个端点生产都请求了 trade_date)。"""
+    ds = _dicts(rec)
+    if not ds or "trade_date" not in ds[0]:
+        return None
+    want = _ymd(day)
+    off = collections.Counter(_ymd(r.get("trade_date")) for r in ds if _ymd(r.get("trade_date")) != want)
+    if not off:
+        return "PASS", f"回包日期全是 {day}"
+    n_off = sum(off.values())
+    eg = dict(off.most_common(2))
+    if prod_filters:
+        return "WARN", f"{n_off}/{len(ds)} 行不是所问的 {day} (如 {eg}; 生产只认所问那天, 这些行被丢掉)"
+    return "FAIL", (f"{n_off}/{len(ds)} 行的 trade_date ≠ 所问的 {day} (如 {eg}): 镜像无视 trade_date? "
+                    "生产不按日期过滤, 会把别日的数据当成这天写进库")
 
 
 def cal_table(rec: dict) -> dict:
@@ -723,19 +1000,26 @@ def replay_trade_cal(rec: dict, start: str, end: str, is_open: str | None = "1")
     return list(days), ""
 
 
-def check_cal_range(r_all: dict, r_open: dict, start: str, end: str, today: str, exp_fields: list,
-                    deadline: float) -> list:
-    """① 区间两次 -> [(检查项, 级别, 证据)]。"""
+def check_cal_range(r_all: dict, r_open: dict, start: str, end: str, today: str, exp_fields: list) -> list:
+    """① 区间两次 -> 恰好两行 [(检查项, 级别, 证据)] (不带 is_open 那次在前)。
+    真值 = 内置 A 股休市表 + 周末 (A_CLOSED, 与被测镜像无关); 表没覆盖的年份只核周末并 WARN。"""
     rows = []
+    d0, d1 = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
+    truth, unknown, years = holiday_truth(d0, d1)
+    t_open = sorted(d for d, v in truth.items() if v == 1)
+    cover = None
+    if unknown:
+        cover = ("WARN", f"内置休市表未覆盖 {'/'.join(str(y) for y in sorted(years))} (国办通知还没录入 A_CLOSED): "
+                         f"这 {len(unknown)} 个工作日 ({unknown[0]}..{unknown[-1]}) 只核周末, 判不了是不是假日 —— 该补表了")
+    item = "trade_cal 区间 (不带 is_open) 对照内置休市表"
     bad = call_level(r_all)
     if bad:
-        rows.append(("trade_cal 区间 (不带 is_open) = 真值表", bad[0], bad[1]))
+        rows.append((item, bad[0], bad[1]))
     else:
         cal = cal_table(r_all)
-        d0, d1 = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
         want = {(d0 + dt.timedelta(days=i)).isoformat() for i in range((d1 - d0).days + 1)}
         dates = [_iso(r.get("cal_date")) for r in _dicts(r_all)]
-        parts = [field_check(r_all, exp_fields), retry_note(r_all), latency_check(r_all, deadline)]
+        parts = [field_check(r_all, exp_fields), retry_note(r_all), cover]
         dup, extra = len(dates) - len(set(dates)), sorted(set(dates) - want)
         miss = sorted(want - set(dates))
         if dup or extra:
@@ -751,59 +1035,71 @@ def check_cal_range(r_all: dict, r_open: dict, start: str, end: str, today: str,
         wk_open = sorted(d for d, v in cal.items() if v == 1 and dt.date.fromisoformat(d).weekday() >= 5)
         if wk_open:
             parts.append(("FAIL", f"周末标成开市 {len(wk_open)} 天 (如 {wk_open[0]})"))
+        hol_open = sorted(d for d, v in cal.items()
+                          if v == 1 and truth.get(d) == 0 and dt.date.fromisoformat(d).weekday() < 5)
+        if hol_open:
+            parts.append(("FAIL", f"把法定假日标成开市 {len(hol_open)} 天 (如 {', '.join(hol_open[:3])}): 生产 trading_days "
+                                  "会把假日当开市日, 价格库那天拉到 0 行判「未就绪」就地停更"))
+        open_closed = sorted(d for d, v in cal.items() if v == 0 and truth.get(d) == 1)
+        if open_closed:
+            parts.append(("FAIL", f"把开市日标成休市 {len(open_closed)} 天 (如 {', '.join(open_closed[:3])}): "
+                                  "生产会漏掉这些交易日"))
         n_open = sum(1 for v in cal.values() if v == 1)
         n_wkd_closed = sum(1 for d, v in cal.items() if v == 0 and dt.date.fromisoformat(d).weekday() < 5)
+        judged = [d for d in truth if d in cal]
+        agree = sum(1 for d in judged if cal[d] == truth[d])
         fut = sorted(d for d, v in cal.items() if v == 1 and d > today)
         if not fut:
             parts.append(("WARN", f"今天之后到 {end} 没有开市日: 看板 next_open_day 会写 null, 闸门覆盖自检判不了"))
         lv, txt = combine(parts)
-        rows.append(("trade_cal 区间 (不带 is_open) = 真值表", lv,
+        rows.append((item, lv,
                      f"{start}..{end} {len(dates)} 行 = {len(want)} 个自然日{'' if not miss else ' (有缺)'}; "
-                     f"开市 {n_open} / 休市 {len(cal) - n_open} (其中工作日休市 {n_wkd_closed}); "
+                     f"镜像开市 {n_open} / 休市 {len(cal) - n_open} (其中工作日休市 {n_wkd_closed}); "
+                     f"与内置休市表逐日一致 {agree}/{len(judged)} 天 (表里开市 {len(t_open)}); "
                      f"今天后首个开市日 {fut[0] if fut else '无'}; {txt}"))
+    item = "trade_cal 区间 is_open=1 → 客户端回放"
     bad = call_level(r_open)
     if bad:
-        rows.append(("trade_cal 区间 is_open=1", bad[0], bad[1]))
+        rows.append((item, bad[0], bad[1]))
         return rows
-    parts = [field_check(r_open, exp_fields), retry_note(r_open), latency_check(r_open, deadline)]
+    parts = [field_check(r_open, exp_fields), retry_note(r_open)]
     got = cal_table(r_open)
     closed_back = sorted(d for d, v in got.items() if v == 0)
-    if call_level(r_all) is None:
-        truth = {d for d, v in cal_table(r_all).items() if v == 1}
-        lost = sorted(truth - set(got))
+    if closed_back:
+        parts.append(("WARN", f"服务端区间查询也不套过滤: 多给 {len(closed_back)} 行 is_open=0 (客户端本地过滤兜住)"))
+    days, why = replay_trade_cal(r_open, start, end, "1")
+    if days is None:
+        parts.append(("WARN", why))
+    else:
+        lost = sorted(set(t_open) - set(days))
+        wrong = sorted(d for d in days if truth.get(d) == 0)
         if lost:
-            parts.append(("FAIL", f"漏了 {len(lost)} 个开市日 (如 {lost[0]})"))
-        if closed_back:
-            parts.append(("WARN", f"服务端区间查询也不套过滤: 多给 {len(closed_back)} 行 is_open=0 (客户端本地过滤兜住)"))
-        days, why = replay_trade_cal(r_open, start, end, "1")
-        if days is None:
-            parts.append(("WARN", why))
-        elif days != sorted(truth):
-            parts.append(("FAIL", f"客户端回放 trade_cal 得 {len(days)} 个开市日 ≠ 真值 {len(truth)}"))
-        else:
-            parts.append(("PASS", f"客户端回放 = 真值 {len(truth)} 个开市日"))
-    elif closed_back:
-        parts.append(("WARN", f"带 is_open=1 仍回 {len(closed_back)} 行 is_open=0"))
+            parts.append(("FAIL", f"客户端回放漏了 {len(lost)} 个开市日 (内置休市表; 如 {lost[0]})"))
+        if wrong:
+            parts.append(("FAIL", f"客户端回放把 {len(wrong)} 个休市日当开市 (内置休市表; 如 {wrong[0]})"))
+        if not lost and not wrong:
+            n_unk = len([d for d in days if d not in truth])
+            parts.append(("PASS", f"客户端回放 = 内置休市表 {len(t_open)} 个开市日"
+                                  + (f" (另 {n_unk} 天在表没覆盖的年份, 不判)" if n_unk else "")))
     lv, txt = combine(parts)
-    rows.append(("trade_cal 区间 is_open=1", lv, f"{len(got)} 行; {txt}"))
+    rows.append((item, lv, f"{len(got)} 行; {txt}"))
     return rows
 
 
-def check_cal_day(kind: str, day: str, r_with: dict, r_without: dict, expect_open: bool, truth: dict,
-                  exp_fields: list, deadline: float):
-    """单日两次 (带 / 不带 is_open) + 客户端回放 -> (检查项, 级别, 证据)。"""
+def check_cal_day(kind: str, day: str, r_with: dict, r_without: dict, expect_open: bool, exp_fields: list):
+    """单日两次 (带 / 不带 is_open) + 客户端回放 -> (检查项, 级别, 证据)。日子本身取自内置休市表。"""
     item = f"trade_cal 单日 {kind} {day}"
     parts, ev = [], []
-    t = truth.get(day)
-    if t is not None and t != (1 if expect_open else 0):
-        parts.append(("FAIL", f"区间真值表说 {day} is_open={t}, 与「{kind}」矛盾"))
+    t = a_open(day)
+    if t is not None and t != expect_open:
+        parts.append(("FAIL", f"内置休市表说 {day} {'开市' if t else '休市'}, 与「{kind}」矛盾 (选日子的代码错了)"))
     for tag, rec in (("带 is_open=1", r_with), ("不带", r_without)):
         bad = call_level(rec)
         if bad:
             parts.append((bad[0], f"{tag}: {bad[1]}"))
             continue
-        for p in (field_check(rec, exp_fields), retry_note(rec), latency_check(rec, deadline)):
-            if p and p[0] != "PASS":                 # 两次调用的字段/延迟只在有问题时才写进证据, 免得刷屏
+        for p in (field_check(rec, exp_fields), retry_note(rec)):
+            if p and p[0] != "PASS":                 # 两次调用的字段问题只在有问题时才写进证据, 免得刷屏
                 parts.append((p[0], f"{tag}: {p[1]}"))
         tab = cal_table(rec)
         other = sorted(d for d in tab if d != day)
@@ -836,7 +1132,7 @@ def check_cal_day(kind: str, day: str, r_with: dict, r_without: dict, expect_ope
         else:
             ev.append(f"客户端回放 {days} ✓")
     lv, txt = combine(parts)
-    return item, lv, "; ".join(ev) + (f"; {txt}" if txt else "")
+    return item, lv, "; ".join(x for x in ev + [txt] if x)
 
 
 def a_code_count(rec: dict, keep) -> tuple:
@@ -846,8 +1142,8 @@ def a_code_count(rec: dict, keep) -> tuple:
     return len(codes), set(codes)
 
 
-def check_stock_basic(recs: dict, expect: list, keep, deadline: float) -> tuple:
-    """recs = {"L": rec, "D": rec, "P": rec} -> ([检查行], listed_a | None, L 的 A 股代码集)。"""
+def check_stock_basic(recs: dict, expect: list, keep) -> tuple:
+    """recs = {"L": rec, "D": rec, "P": rec} -> ([(检查项, 级别, 证据, [用到的调用])], listed_a | None, L 的 A 股代码集)。"""
     rows, listed_a, l_codes = [], None, set()
     sets = {}
     for st in ("L", "D", "P"):
@@ -855,9 +1151,9 @@ def check_stock_basic(recs: dict, expect: list, keep, deadline: float) -> tuple:
         item = f"stock_basic list_status={st}"
         bad = call_level(rec) if rec else ("SKIP", "未调用")
         if bad:
-            rows.append((item, bad[0], bad[1]))
+            rows.append((item, bad[0], bad[1], [rec]))
             continue
-        parts = [field_check(rec, expect), retry_note(rec), latency_check(rec, deadline)]
+        parts = [field_check(rec, expect), retry_note(rec)]
         ds = _dicts(rec)
         stat = collections.Counter(str(r.get("list_status")) for r in ds if "list_status" in r)
         wrong = {k: v for k, v in stat.items() if k != st}
@@ -879,28 +1175,23 @@ def check_stock_basic(recs: dict, expect: list, keep, deadline: float) -> tuple:
                 if "delist_date" in (rec.get("fields") or []) and nd < 0.9 * rec["rows"]:
                     parts.append(("WARN", f"退市日为空的 {rec['rows'] - nd} 行"))
         lv, txt = combine(parts)
-        rows.append((item, lv, ev + (f"; {txt}" if txt else "")))
+        rows.append((item, lv, ev + (f"; {txt}" if txt else ""), [rec]))
     if sets.get("L") and sets.get("D") is not None:
         both = sets["L"] & sets["D"]
         if both and both == sets["L"]:
-            rows.append(("stock_basic L/D 是否分得开", "FAIL", "L 与 D 返回同一批代码"))
+            rows.append(("stock_basic L/D 是否分得开", "FAIL", "L 与 D 返回同一批代码", []))
         elif both:
-            rows.append(("stock_basic L/D 是否分得开", "WARN", f"{len(both)} 只同时在 L 与 D"))
+            rows.append(("stock_basic L/D 是否分得开", "WARN", f"{len(both)} 只同时在 L 与 D", []))
     return rows, listed_a, l_codes
 
 
-def check_by_date(item: str, rec: dict, day: str, expect: list, deadline: float, listed_a, ratio: float,
-                  parsed_n, extra=None):
-    """全市场按 trade_date 的端点 (daily / adj_factor): 行数 vs 在市 A 股 × ready_ratio。"""
+def check_by_date(item: str, rec: dict, day: str, expect: list, listed_a, ratio: float, parsed_n, extra=None):
+    """全市场按 trade_date 的端点 (daily / adj_factor): 回包日期必须全是所问那天 (生产不过滤, 不符 = FAIL),
+    行数 vs 在市 A 股 × ready_ratio。"""
     bad = call_level(rec)
     if bad:
         return item, bad[0], bad[1]
-    parts = [field_check(rec, expect), retry_note(rec), latency_check(rec, deadline),
-             round_cap_note(rec["rows"], None)]
-    dates = collections.Counter(_ymd(r.get("trade_date")) for r in _dicts(rec) if "trade_date" in r)
-    off = {k: v for k, v in dates.items() if k != _ymd(day)}
-    if off:
-        parts.append(("WARN", f"混进别的日期 {dict(list(off.items())[:2])}"))
+    parts = [field_check(rec, expect), retry_note(rec), round_cap_note(rec["rows"], None), date_check(rec, day)]
     ev = f"{rec['rows']} 行, 生产解析后 A 股 {parsed_n}"
     if listed_a:
         r = parsed_n / listed_a
@@ -915,30 +1206,37 @@ def check_by_date(item: str, rec: dict, day: str, expect: list, deadline: float,
     return item, lv, ev + (f"; {txt}" if txt else "")
 
 
-def check_range(item: str, rec: dict, open_days: list, expect: list, deadline: float, ref_dates=None):
-    """按 ts_code 区间 / index_daily 区间: 一个开市日一行。"""
+def check_range(item: str, rec: dict, open_days: list, expect: list, start: str, end: str, index: bool = False,
+                ref_dates=None):
+    """按 ts_code 区间 / 指数区间: 内置休市表的每个开市日一行。指数 (index=True, 不停牌) 缺开市日 = FAIL, 个股缺 = WARN
+    (停牌也会这样); 任何行落在内置表的休市日上 = FAIL (假数据); 区间外的行 = WARN (镜像不认 start/end)。"""
     bad = call_level(rec)
     if bad:
         return item, bad[0], bad[1]
-    parts = [field_check(rec, expect), retry_note(rec), latency_check(rec, deadline)]
+    parts = [field_check(rec, expect), retry_note(rec)]
     got = sorted({_iso(r.get("trade_date")) for r in _dicts(rec) if _iso(r.get("trade_date"))})
     want = sorted(open_days)
-    ev = f"{rec['rows']} 行 / 区间开市日 {len(want)}"
+    ev = f"{rec['rows']} 行 / 区间开市日 {len(want)} (内置休市表)"
     if not got:
         parts.append(("FAIL", "0 行"))
     else:
-        miss, extra = sorted(set(want) - set(got)), sorted(set(got) - set(want))
-        if extra:
-            parts.append(("WARN", f"区间外/非开市日 {len(extra)} 行 (如 {extra[0]})"))
+        closed = [d for d in got if a_open(d) is False]
+        outside = [d for d in got if not (start <= d <= end)]
+        miss = sorted(set(want) - set(got))
+        if closed:
+            parts.append(("FAIL", f"{len(closed)} 天的行落在休市日上 (内置休市表; 如 {closed[0]}): 假数据"))
+        if outside:
+            parts.append(("WARN", f"区间外 {len(outside)} 天 (如 {outside[0]}): 镜像不认 start/end"))
         if miss:
-            parts.append(("WARN", f"缺 {len(miss)} 个开市日 (如 {miss[0]}; 停牌也会这样)"))
+            parts.append(("FAIL", f"缺 {len(miss)} 个开市日 (如 {miss[0]}; 指数不停牌)") if index else
+                         ("WARN", f"缺 {len(miss)} 个开市日 (如 {miss[0]}; 停牌也会这样)"))
     if ref_dates is not None and got and set(got) != set(ref_dates):
         parts.append(("WARN", f"与配对端点日期不一致 ({len(set(got) ^ set(ref_dates))} 天)"))
     lv, txt = combine(parts)
     return item, lv, ev + (f"; {txt}" if txt else "")
 
 
-def check_fin(item: str, rec: dict, expect: list, deadline: float, page: int, ref_rows, rec2=None):
+def check_fin(item: str, rec: dict, expect: list, page: int, ref_rows, rec2=None):
     """财务一期 (limit = 湖翻页步长 FIN_PAGE): 字段表全回 + 单页是否被镜像上限截断。
 
     湖的翻页 (`Lake._pages`) 是「不足一页即停」: 镜像单页上限若低于 FIN_PAGE, 第一页就不足一页, 湖会**静默少拉**。
@@ -946,7 +1244,7 @@ def check_fin(item: str, rec: dict, expect: list, deadline: float, page: int, re
     bad = call_level(rec)
     if bad:
         return item, bad[0], bad[1]
-    parts = [field_check(rec, expect), retry_note(rec), latency_check(rec, deadline)]
+    parts = [field_check(rec, expect), retry_note(rec)]
     n = rec["rows"]
     ev = f"{n} 行 (limit {page})" + (f"; 湖里该期上次拉取 {ref_rows} 行" if ref_rows else "")
     if n == 0:
@@ -970,13 +1268,15 @@ def check_fin(item: str, rec: dict, expect: list, deadline: float, page: int, re
     return item, lv, ev + (f"; {txt}" if txt else "")
 
 
-def check_filtered(item: str, rec: dict, expect: list, deadline: float, filters: dict, page):
+def check_filtered(item: str, rec: dict, expect: list, filters: dict, page):
     """按参数过滤的维表 (申万分类 / 成员): 有行 + 回包里的过滤列是否等于所问 + 分页是否满页/超页。
-    镜像不认过滤参数时湖的数据靠主键去重多半仍对, 只是调用量翻倍 —— 判 WARN; 调不通 / 0 行判 FAIL。"""
+    镜像不认过滤参数时湖的数据靠主键去重多半仍对, 代价是调用量与下载量: 按 lake.db 现有成员数 (31 个 L1, is_new
+    Y 5,913 / N 2,006 行) 算, 每个 L1 都拉全市场后湖的成员调用约 62 → 155 次 (×2.5), 下载行数 ×31 —— 判 WARN;
+    调不通 / 0 行判 FAIL。"""
     bad = call_level(rec)
     if bad:
         return item, bad[0], bad[1]
-    parts = [field_check(rec, expect), retry_note(rec), latency_check(rec, deadline)]
+    parts = [field_check(rec, expect), retry_note(rec)]
     ds = _dicts(rec)
     n = rec["rows"]
     ev = f"{n} 行"
@@ -994,6 +1294,69 @@ def check_filtered(item: str, rec: dict, expect: list, deadline: float, filters:
             ev += f" (满页 {page}, 湖会接着翻)"
     lv, txt = combine(parts)
     return item, lv, ev + (f"; {txt}" if txt else "")
+
+
+def tier_deadlines(e: dict) -> dict:
+    """{档: (期限秒, 定这个期限的消费方)} —— 每档取本档消费方里最严的期限。"""
+    out = {}
+    for cons, secs in (e.get("deadline_by") or {}).items():
+        t = TIER_OF.get(cons, TIER_PROD)
+        if t not in out or secs < out[t][0]:
+            out[t] = (float(secs), cons)
+    return out
+
+
+def judge_row(row: dict, e: dict) -> dict:
+    """一行检查 = 形状级别 (row["lv"]) + 用到的那几次调用的延迟, 延迟**按每档自己的期限**判 ->
+    {item, consumer, level (各档最差, 用于显示), tiers: {档: 级别}, evidence}。"""
+    tiers = tier_deadlines(e) or {TIER_PROD: (float(e.get("deadline") or 120), CONSUMER_PROD)}
+    timed = [r for r in row["recs"] if r and r.get("secs") is not None]
+    tier_lv, notes = {}, []
+    for t, (secs, who) in tiers.items():
+        parts = [latency_check(r, secs, who) for r in timed]
+        tier_lv[t] = _worst(row["lv"], *(p[0] for p in parts if p))
+        for p in parts:
+            if p and p[0] != "PASS":
+                note = f"{t}档 {p[0]}: {p[1]}"
+                if note not in notes:
+                    notes.append(note)
+    if timed and not notes:
+        mx = max(r["secs"] for r in timed)
+        secs, who = min(tiers.values())
+        notes.append(f"延迟 {mx:.1f}s / 最严期限 {secs:g}s ({who})")
+    ev = "; ".join(x for x in (row["ev"], "; ".join(notes)) if x)
+    return {"item": row["item"], "consumer": "+".join(e.get("consumers") or []) or "-",
+            "level": _worst(*tier_lv.values()), "tiers": tier_lv, "evidence": ev}
+
+
+def tier_verdicts(checks: list) -> dict:
+    """两档各自的结论: 有 FAIL = 不可用; 否则有 SKIP = 未跑完; 否则可用 (只有 WARN 也算可用); 没有检查项 = 未纳入。"""
+    out = {}
+    for t in (TIER_PROD, TIER_LAKE):
+        rs = [c for c in checks if t in c["tiers"]]
+        if not rs:
+            out[t] = {"verdict": "未纳入", "n": 0, "fail": [], "skip": [], "warn": [],
+                      "text": "本次没有这一档的检查项 (找不到 stock-core research/lake.py?)"}
+            continue
+        cnt = collections.Counter(c["tiers"][t] for c in rs)
+        fails = [c["item"] for c in rs if c["tiers"][t] == "FAIL"]
+        skips = [c["item"] for c in rs if c["tiers"][t] == "SKIP"]
+        warns = [c["item"] for c in rs if c["tiers"][t] == "WARN"]
+        tally = (f"{len(rs)} 项 PASS {cnt['PASS']} / WARN {cnt['WARN']} / FAIL {cnt['FAIL']}"
+                 + (f" / SKIP {cnt['SKIP']}" if cnt["SKIP"] else ""))
+        if fails:
+            verdict, text = "不可用", tally + ": " + "; ".join(fails[:4]) + (" …" if len(fails) > 4 else "")
+        elif skips:
+            verdict, text = "未跑完", tally + " (调用上限/预算用完没跑到: " + "; ".join(skips[:3]) + \
+                (" …" if len(skips) > 3 else "") + ")"
+        else:
+            verdict = "可用"
+            text = tally + ("; 全部 PASS" if not warns else
+                            "; WARN 换后盯: " + "; ".join(warns[:4]) + (" …" if len(warns) > 4 else ""))
+        if t == TIER_LAKE and verdict != "可用":
+            text += " —— 研究湖档不改退出码、不阻塞生产 (只换 token 时也别因此还原 .bak), 交 GM"
+        out[t] = {"verdict": verdict, "n": len(rs), "fail": fails, "skip": skips, "warn": warns, "text": text}
+    return out
 
 
 # ================================================================= 日期
@@ -1073,6 +1436,13 @@ def _fields_arg(e: dict | None) -> str:
 
 
 def run_compat(args, post=None, now: dt.datetime | None = None, out=print, sleep=time.sleep) -> int:
+    try:
+        max_calls = int(args.max_calls)
+    except (TypeError, ValueError):
+        max_calls = 0
+    if not 1 <= max_calls <= MAX_CALLS:
+        out(f"--max-calls 只能是 1..{MAX_CALLS} (硬上限 {MAX_CALLS} 次), 收到 {args.max_calls!r} —— 拒跑, 一次也没调")
+        return 2
     for name in ("today", "date", "holiday", "period"):
         v = getattr(args, name, "")
         try:
@@ -1091,8 +1461,28 @@ def run_compat(args, post=None, now: dt.datetime | None = None, out=print, sleep
     A = exp["apis"]
 
     def E(api):
+        cdl = exp["client_deadline"]
         return A.get(api) or {"api": api, "mode": "default", "fields": [], "refs": [], "expect": [],
-                              "deadline": exp["client_deadline"], "consumers": [], "sites": []}
+                              "deadline": cdl, "wait": cdl, "deadline_by": {CONSUMER_PROD: cdl},
+                              "consumers": [CONSUMER_PROD], "sites": []}
+
+    nowbj = (now or dt.datetime.now(BJ)).astimezone(BJ)
+    today = dt.date.fromisoformat(_iso(args.today)) if args.today else nowbj.date()
+    t_iso = today.isoformat()
+    # 日子一律从内置休市表取 (与被测镜像无关); 手给的先对表核一遍, 不对就是参数错
+    D = last_open_before(today)
+    pday = _iso(args.date) if args.date else past_by_date_day(today)
+    hol = _iso(args.holiday) if args.holiday else last_holiday_on_or_before(today)
+    if args.date and (pday >= t_iso or a_open(pday) is False):
+        out(f"--date {args.date}: 要一个今天 ({t_iso}) 之前的开市日 —— 内置休市表说它"
+            f"{'休市' if a_open(pday) is False else '不在今天之前'}")
+        return 2
+    if args.holiday:
+        hd = dt.date.fromisoformat(hol)
+        if hd.weekday() >= 5 or a_open(hd) is True or hol > t_iso:
+            out(f"--holiday {args.holiday}: 要一个今天及之前的工作日休市日 —— 内置休市表说它"
+                f"{'是周末' if hd.weekday() >= 5 else ('开市' if a_open(hd) is True else '在今天之后')}")
+            return 2
 
     try:
         token, base = _read_credentials(args.secrets)
@@ -1106,28 +1496,25 @@ def run_compat(args, post=None, now: dt.datetime | None = None, out=print, sleep
     from ashare import market as mk
     from ashare import tushare_client as tsc
 
-    nowbj = (now or dt.datetime.now(BJ)).astimezone(BJ)
-    today = dt.date.fromisoformat(_iso(args.today)) if args.today else nowbj.date()
-    t_iso = today.isoformat()
     start = today - dt.timedelta(days=LOOKBACK_DAYS)
     end = today + dt.timedelta(days=th["cal_fwd"])
     sat, sun = latest_weekday(today, 5), latest_weekday(today, 6)
-    pr = Prober(token, base, post=post, max_calls=args.max_calls, gap=args.gap, budget=args.budget, sleep=sleep)
+    pr = Prober(token, base, post=post, max_calls=max_calls, gap=args.gap, budget=args.budget, sleep=sleep)
 
     out("Tushare 镜像兼容性探针 (只读) · tools/tushare_probe.py compat")
     out(f"镜像主机 {_host(base)} · 北京时间 {nowbj:%Y-%m-%d %H:%M} · 今天(北京) {t_iso} 周{'一二三四五六日'[today.weekday()]}"
-        f" · 调用上限 {args.max_calls} · 间隔 {args.gap:g}s · 墙钟预算 {args.budget:g}s")
-    srcs = ["a-share ashare/*.py"] + (["stock-core research/lake.py"] if exp["core"] else [])
+        f" · 调用上限 {max_calls} · 间隔 {args.gap:g}s · 墙钟预算 {args.budget:g}s")
+    srcs = ["a-share ashare/*.py"] + ([f"stock-core {r}" for r, _ in CORE_SCANS] if exp["core"] else [])
     for api in ("fina_indicator_vip", "income_vip"):
         ms = (A.get(api) or {}).get("meta_source")
         if ms:
             srcs.append(f"{api}: {ms}")
-    out("期望字段来源: " + " + ".join(srcs) + " (完整清单: compat --expect)")
+    out("期望字段与期限来源: " + " + ".join(srcs) + " (完整清单: compat --expect)")
     for note in exp["notes"] + th["src"]:
         out(f"  · {note}")
 
-    def dl(api):
-        return float(E(api)["deadline"]) + DEADLINE_MARGIN_SEC
+    def dl(api):            # 探针这次调用自己的硬期限: 各消费方里最宽的期限 + 余量 (量出实际耗时, 再按各档期限判)
+        return float(E(api)["wait"]) + DEADLINE_MARGIN_SEC
 
     # ① trade_cal ----------------------------------------------------------------------------------------
     cal_f = _fields_arg(E("trade_cal"))
@@ -1137,24 +1524,20 @@ def run_compat(args, post=None, now: dt.datetime | None = None, out=print, sleep
     r_open = pr.call("T02", f"区间 {start:%m-%d}..{end:%m-%d} is_open=1", "trade_cal",
                      {"exchange": "SSE", "start_date": _ymd(start), "end_date": _ymd(end), "is_open": "1"},
                      cal_f, cal_dl)
-    truth = cal_table(r_all) if r_all["kind"] == "OK" else {}
-    open_days = sorted(d for d, v in truth.items() if v == 1)
-    if args.date:
-        D = _iso(args.date)
-    else:
-        past = [d for d in open_days if d < t_iso]
-        if past:
-            D = past[-1]
-        else:                                                  # 没有真值表: 退到上一个工作日 (只为能接着探)
-            d = today - dt.timedelta(days=1)
-            while d.weekday() >= 5:
-                d -= dt.timedelta(days=1)
-            D = d.isoformat()
-    if args.holiday:
-        hol = _iso(args.holiday)
-    else:
-        hs = sorted(d for d, v in truth.items() if v == 0 and d <= t_iso and dt.date.fromisoformat(d).weekday() < 5)
-        hol = hs[-1] if hs else None
+    m_open = sorted(d for d, v in cal_table(r_all).items() if v == 1) if r_all["kind"] == "OK" else []
+    fallback = []                     # 内置表给不出 D / P (那几年没覆盖) -> 退回镜像日历 (不独立, 记一行 WARN)
+    if D is None:
+        past = [d for d in m_open if d < t_iso]
+        D = past[-1] if past else _prev_weekday(today).isoformat()
+        fallback.append(f"开市日 D={D}")
+    if pday is None:
+        lim = (today - dt.timedelta(days=PAST_DAY_MIN_AGE)).isoformat()
+        cands = [d for d in m_open if d <= lim]
+        pday = cands[-1] if cands else D
+        fallback.append(f"按日 P={pday}")
+    out(f"日子 (内置休市表, 与镜像无关{'; 部分退回镜像: ' + ', '.join(fallback) if fallback else ''}): "
+        f"开市日 D = {D} · 按日问的已知过去开市日 P = {pday} ({'--date' if args.date else '上月最后一个开市的周二'})"
+        f" · 假日一例 {hol or '无'}")
     days = [("周六", sat.isoformat(), False), ("周日", sun.isoformat(), False)]
     if hol:
         days.append(("假日", hol, False))
@@ -1172,25 +1555,28 @@ def run_compat(args, post=None, now: dt.datetime | None = None, out=print, sleep
     sb_recs = {st: pr.call(f"S0{i + 1}", f"list_status={st}", "stock_basic", {"list_status": st},
                            _fields_arg(sb), dl("stock_basic"))
                for i, st in enumerate(("L", "D", "P"))}
-    # ② daily / adj_factor 按 trade_date ---------------------------------------------------------------------
-    r_daily = pr.call("B01", f"全市场 {D}", "daily", {"trade_date": _ymd(D)}, _fields_arg(E("daily")), dl("daily"))
-    r_adj = pr.call("B02", f"全市场 {D}", "adj_factor", {"trade_date": _ymd(D)}, _fields_arg(E("adj_factor")),
+    # ② daily / adj_factor 按 trade_date: 问已知过去的开市日 P ------------------------------------------------
+    r_daily = pr.call("B01", f"全市场 {pday}", "daily", {"trade_date": _ymd(pday)}, _fields_arg(E("daily")),
+                      dl("daily"))
+    r_adj = pr.call("B02", f"全市场 {pday}", "adj_factor", {"trade_date": _ymd(pday)}, _fields_arg(E("adj_factor")),
                     dl("adj_factor"))
     # ③ daily_basic / index_daily / ths_daily --------------------------------------------------------------
-    r_db = pr.call("V01", f"全市场 {D}", "daily_basic", {"trade_date": _ymd(D)}, _fields_arg(E("daily_basic")),
+    r_db = pr.call("V01", f"全市场 {pday}", "daily_basic", {"trade_date": _ymd(pday)}, _fields_arg(E("daily_basic")),
                    dl("daily_basic"))
-    in_win = [d for d in open_days if d <= D]
+    in_win = table_open_days(start, D)
+    if fallback:
+        in_win = sorted(set(in_win) | {d for d in m_open if d <= D})
     r_start = in_win[-RANGE_OPEN_DAYS] if len(in_win) >= RANGE_OPEN_DAYS else \
         (dt.date.fromisoformat(D) - dt.timedelta(days=28)).isoformat()
-    rng_days = [d for d in open_days if r_start <= d <= D]
+    rng_days = [d for d in in_win if r_start <= d <= D]
     bench = tsc.to_ts_code(th["bench"])
     r_idx = pr.call("I01", f"{bench} {r_start}..{D}", "index_daily",
                     {"ts_code": bench, "start_date": _ymd(r_start), "end_date": _ymd(D)},
                     _fields_arg(E("index_daily")), dl("index_daily"))
-    r_idx1 = pr.call("I02", f"{bench} 单日 {D}", "index_daily",
-                     {"ts_code": bench, "start_date": _ymd(D), "end_date": _ymd(D)},
+    r_idx1 = pr.call("I02", f"{bench} 单日 {pday}", "index_daily",
+                     {"ts_code": bench, "start_date": _ymd(pday), "end_date": _ymd(pday)},
                      _fields_arg(E("index_daily")), dl("index_daily"))
-    r_ths = pr.call("H01", f"全市场 {D}", "ths_daily", {"trade_date": _ymd(D)}, _fields_arg(E("ths_daily")),
+    r_ths = pr.call("H01", f"全市场 {pday}", "ths_daily", {"trade_date": _ymd(pday)}, _fields_arg(E("ths_daily")),
                     dl("ths_daily"))
     # ② 按 ts_code 区间 -------------------------------------------------------------------------------------
     r_dr = pr.call("B03", f"{RANGE_CODE} {r_start}..{D}", "daily",
@@ -1234,7 +1620,7 @@ def run_compat(args, post=None, now: dt.datetime | None = None, out=print, sleep
                         _fields_arg(E("sw_daily")), dl("sw_daily"))
 
     # ④ 逐次调用 ---------------------------------------------------------------------------------------------
-    out(f"\n④ 逐次调用 ({pr.n} 次 / 上限 {args.max_calls}; 延迟 = 工作进程里量的 HTTP 往返+下载)")
+    out(f"\n④ 逐次调用 ({pr.n} 次 / 上限 {max_calls}; 延迟 = 工作进程里量的 HTTP 往返+下载)")
     out(f"  {'#':<4}{'端点':<20}{'参数':<34}{'结果':<9}{'HTTP':>5}{'code':>6}{'行':>7}{'列':>5}{'秒':>8}{'KB':>8}")
     for r in pr.records:
         res = r["kind"] + ("*" if r["first_fail"] else "")
@@ -1246,38 +1632,39 @@ def run_compat(args, post=None, now: dt.datetime | None = None, out=print, sleep
     if any(r["first_fail"] for r in pr.records):
         out("  * = 首发失败, 重试成功 (也算调用数)")
 
-    # ⑤ 判读 -------------------------------------------------------------------------------------------------
-    checks = []                                     # (检查项, 消费方, 级别, 证据)
+    # ⑤ 判读: 先判形状, 再由 judge_row 按每档自己的期限判延迟 ---------------------------------------------------------
+    rows = []
 
-    def add(item, lv, ev, api):
-        checks.append((item, "+".join(E(api)["consumers"]) or "-", lv, ev))
+    def add(item, lv, ev, api, *recs):
+        rows.append({"item": item, "api": api, "lv": lv, "ev": ev, "recs": [r for r in recs if r]})
 
-    for item, lv, ev in check_cal_range(r_all, r_open, start.isoformat(), end.isoformat(), t_iso,
-                                        E("trade_cal")["expect"], float(E("trade_cal")["deadline"])):
-        add(item, lv, ev, "trade_cal")
+    if fallback:
+        add("日历真值来源", "WARN", f"内置休市表不覆盖这几天, {' / '.join(fallback)} 取自被测镜像 (不独立) —— 补 A_CLOSED",
+            "trade_cal")
+    for (item, lv, ev), rec in zip(check_cal_range(r_all, r_open, start.isoformat(), end.isoformat(), t_iso,
+                                                   E("trade_cal")["expect"]), (r_all, r_open)):
+        add(item, lv, ev, "trade_cal", rec)
     if not hol:
-        add("trade_cal 单日 假日", "WARN", f"窗口 {start}..{t_iso} 里找不到工作日休市日 (区间真值表没拿到?), 假日一例没测",
+        add("trade_cal 单日 假日", "WARN", "内置休市表里找不到今天及之前的工作日休市日 (表没覆盖?), 假日一例没测",
             "trade_cal")
     for kind, day, rw, ro, is_open_day in day_recs:
-        item, lv, ev = check_cal_day(kind, day, rw, ro, is_open_day, truth, E("trade_cal")["expect"],
-                                     float(E("trade_cal")["deadline"]))
-        add(item, lv, ev, "trade_cal")
-    sb_rows, listed_a, _ = check_stock_basic(sb_recs, E("stock_basic")["expect"], mk.keep_a_code,
-                                             float(E("stock_basic")["deadline"]))
-    for item, lv, ev in sb_rows:
-        add(item, lv, ev, "stock_basic")
+        item, lv, ev = check_cal_day(kind, day, rw, ro, is_open_day, E("trade_cal")["expect"])
+        add(item, lv, ev, "trade_cal", rw, ro)
+    sb_rows, listed_a, _ = check_stock_basic(sb_recs, E("stock_basic")["expect"], mk.keep_a_code)
+    for item, lv, ev, recs in sb_rows:
+        add(item, lv, ev, "stock_basic", *recs)
     # daily 全市场: 生产解析 = market._rows_from_daily (价格合法性过滤 + A 股代码)
     parsed_daily, daily_codes = 0, set()
     if r_daily["kind"] == "OK":
         try:
             import pandas as pd
-            rows = mk._rows_from_daily(pd.DataFrame(r_daily["items"], columns=r_daily["fields"] or None))
-            parsed_daily, daily_codes = len(rows), set(rows)
+            rows_ = mk._rows_from_daily(pd.DataFrame(r_daily["items"], columns=r_daily["fields"] or None))
+            parsed_daily, daily_codes = len(rows_), set(rows_)
         except Exception as e:                                 # noqa: BLE001
             parsed_daily = a_code_count(r_daily, mk.keep_a_code)[0]
             out(f"  · daily 生产解析回放失败 ({type(e).__name__}), 退回只数 A 股代码")
-    add(*check_by_date(f"daily 按 trade_date {D}", r_daily, D, E("daily")["expect"],
-                       float(E("daily")["deadline"]), listed_a, th["ready_ratio"], parsed_daily), "daily")
+    add(*check_by_date(f"daily 按 trade_date {pday}", r_daily, pday, E("daily")["expect"], listed_a,
+                       th["ready_ratio"], parsed_daily), "daily", r_daily)
     adj_codes = set()
     for r in _dicts(r_adj):
         c = mk.keep_a_code(r.get("ts_code"))
@@ -1291,112 +1678,109 @@ def run_compat(args, post=None, now: dt.datetime | None = None, out=print, sleep
         lack = daily_codes - adj_codes
         cover = (("WARN" if len(lack) > 0.01 * len(daily_codes) else "PASS"),
                  f"日线 {len(daily_codes)} 只里缺因子 {len(lack)} 只")
-    add(*check_by_date(f"adj_factor 按 trade_date {D}", r_adj, D, E("adj_factor")["expect"],
-                       float(E("adj_factor")["deadline"]), listed_a, th["ready_ratio"], len(adj_codes), cover),
-        "adj_factor")
-    # daily_basic
+    add(*check_by_date(f"adj_factor 按 trade_date {pday}", r_adj, pday, E("adj_factor")["expect"], listed_a,
+                       th["ready_ratio"], len(adj_codes), cover), "adj_factor", r_adj)
+    # daily_basic (生产估值兜底不看 trade_date: 日期不符 = FAIL)
+    item = f"daily_basic 按 trade_date {pday}"
     bad = call_level(r_db)
     if bad:
-        add(f"daily_basic 按 trade_date {D}", bad[0], bad[1], "daily_basic")
+        add(item, bad[0], bad[1], "daily_basic", r_db)
     else:
-        parts = [field_check(r_db, E("daily_basic")["expect"]), retry_note(r_db),
-                 latency_check(r_db, float(E("daily_basic")["deadline"])), round_cap_note(r_db["rows"], None)]
+        parts = [field_check(r_db, E("daily_basic")["expect"]), retry_note(r_db), round_cap_note(r_db["rows"], None),
+                 date_check(r_db, pday)]
         if r_db["rows"] < th["db_min_rows"]:
             parts.append(("FAIL", f"< 生产门槛 {th['db_min_rows']} 行: 估值兜底会判当日没出、退回前一交易日"))
         lv, txt = combine(parts)
-        add(f"daily_basic 按 trade_date {D}", lv, f"{r_db['rows']} 行 (门槛 {th['db_min_rows']}); {txt}",
-            "daily_basic")
-    # index_daily
+        add(item, lv, f"{r_db['rows']} 行 (门槛 {th['db_min_rows']}); {txt}", "daily_basic", r_db)
+    # index_daily: 区间 (指数不停牌, 缺开市日 = FAIL) + 单日 P (生产按日期筛)
     add(*check_range(f"index_daily {bench} 区间 {r_start}..{D}", r_idx, rng_days, E("index_daily")["expect"],
-                     float(E("index_daily")["deadline"])), "index_daily")
+                     r_start, D, index=True), "index_daily", r_idx)
+    item = f"index_daily {bench} 单日 {pday}"
     bad = call_level(r_idx1)
     if bad:
-        add(f"index_daily {bench} 单日 {D}", bad[0], bad[1], "index_daily")
+        add(item, bad[0], bad[1], "index_daily", r_idx1)
     else:
         got = {_iso(r.get("trade_date")) for r in _dicts(r_idx1)}
-        parts = [field_check(r_idx1, E("index_daily")["expect"]), retry_note(r_idx1),
-                 latency_check(r_idx1, float(E("index_daily")["deadline"]))]
-        if D not in got:
-            parts.append(("FAIL", f"单日查询没有 {D} 那根 —— 生产 fetch_index_by_date 当天指数不入库"))
+        parts = [field_check(r_idx1, E("index_daily")["expect"]), retry_note(r_idx1)]
+        if pday not in got:
+            parts.append(("FAIL", f"单日查询没有 {pday} 那根 (回了 {sorted(got)[:2]}) —— 生产 fetch_index_by_date "
+                                  "当天指数不入库"))
         elif len(got) > 1:
             parts.append(("WARN", f"单日查询回了 {len(got)} 个日期 (生产按日期筛, 不影响)"))
         lv, txt = combine(parts)
-        add(f"index_daily {bench} 单日 {D}", lv, f"{r_idx1['rows']} 行; {txt}", "index_daily")
-    # ths_daily
+        add(item, lv, f"{r_idx1['rows']} 行; {txt}", "index_daily", r_idx1)
+    # ths_daily (生产只认所问那天: 别日的行 WARN, 当天的 .TI 一行没有 FAIL)
+    item = f"ths_daily 按 trade_date {pday}"
     bad = call_level(r_ths)
     if bad:
-        add(f"ths_daily 按 trade_date {D}", bad[0], bad[1], "ths_daily")
+        add(item, bad[0], bad[1], "ths_daily", r_ths)
     else:
+        sfx = th["ti_suffix"].upper()
         ds_ = _dicts(r_ths)
-        n_ti = sum(1 for r in ds_ if str(r.get("ts_code") or "").upper().endswith(th["ti_suffix"].upper()))
-        off = sum(1 for r in ds_ if "trade_date" in r and _ymd(r.get("trade_date")) != _ymd(D))
-        parts = [field_check(r_ths, E("ths_daily")["expect"]), retry_note(r_ths),
-                 latency_check(r_ths, float(E("ths_daily")["deadline"]))]
-        if n_ti == 0:
-            parts.append(("FAIL", f"没有 {th['ti_suffix']} 指数行 —— 行业指数当日那根补不上"))
-        if off:
-            parts.append(("WARN", f"{off} 行不是 {D} (生产只认问的那天)"))
+        n_ti = sum(1 for r in ds_ if str(r.get("ts_code") or "").upper().endswith(sfx))
+        on_ti = sum(1 for r in ds_ if str(r.get("ts_code") or "").upper().endswith(sfx)
+                    and ("trade_date" not in r or _ymd(r.get("trade_date")) == _ymd(pday)))
+        parts = [field_check(r_ths, E("ths_daily")["expect"]), retry_note(r_ths), date_check(r_ths, pday, True)]
+        if on_ti == 0:
+            parts.append(("FAIL", f"{pday} 当天的 {th['ti_suffix']} 指数行一行没有 —— 行业指数那天的 bar 补不上"))
         lv, txt = combine(parts)
-        add(f"ths_daily 按 trade_date {D}", lv, f"{r_ths['rows']} 行 ({th['ti_suffix']} {n_ti}); {txt}", "ths_daily")
-    # 按 ts_code 区间
-    add(*check_range(f"daily {RANGE_CODE} 区间 {r_start}..{D}", r_dr, rng_days, E("daily")["expect"],
-                     float(E("daily")["deadline"])), "daily")
+        add(item, lv, f"{r_ths['rows']} 行 ({th['ti_suffix']} {n_ti}, 其中 {pday} 当天 {on_ti}); {txt}", "ths_daily",
+            r_ths)
+    # 按 ts_code 区间 (个股停牌会缺天: WARN)
+    add(*check_range(f"daily {RANGE_CODE} 区间 {r_start}..{D}", r_dr, rng_days, E("daily")["expect"], r_start, D),
+        "daily", r_dr)
     dr_dates = sorted({_iso(r.get("trade_date")) for r in _dicts(r_dr)}) if r_dr["kind"] == "OK" else None
     add(*check_range(f"adj_factor {RANGE_CODE} 区间 {r_start}..{D}", r_ar, rng_days, E("adj_factor")["expect"],
-                     float(E("adj_factor")["deadline"]), ref_dates=dr_dates), "adj_factor")
+                     r_start, D, ref_dates=dr_dates), "adj_factor", r_ar)
     # 财务
     for api, rec, rec2 in fin_recs:
-        e = E(api)
         tbl = {"fina_indicator_vip": "fina_indicator", "income_vip": "income"}.get(api, api)
         ref = lake_meta["rows"].get((tbl, _iso(period)))
-        add(*check_fin(f"{api} period={period}", rec, e["expect"], float(e["deadline"]), page, ref, rec2), api)
+        add(*check_fin(f"{api} period={period}", rec, E(api)["expect"], page, ref, rec2), api, rec, rec2)
     # 申万三件
     if r_cls is not None:
         add(*check_filtered(f"index_classify level=L1 src={sw_src}", r_cls, E("index_classify")["expect"],
-                            float(E("index_classify")["deadline"]), {"level": "L1", "src": sw_src}, None),
-            "index_classify")
+                            {"level": "L1", "src": sw_src}, None), "index_classify", r_cls)
     if r_mem is not None:
         add(*check_filtered(f"index_member_all l1_code={l1} is_new=Y", r_mem, E("index_member_all")["expect"],
-                            float(E("index_member_all")["deadline"]), {"l1_code": l1, "is_new": "Y"}, m_page),
-            "index_member_all")
+                            {"l1_code": l1, "is_new": "Y"}, m_page), "index_member_all", r_mem)
     if r_swd is not None:
         add(*check_range(f"sw_daily {l1} 区间 {r_start}..{D}", r_swd, rng_days, E("sw_daily")["expect"],
-                         float(E("sw_daily")["deadline"])), "sw_daily")
+                         r_start, D, index=True), "sw_daily", r_swd)
 
+    checks = [judge_row(r, E(r["api"])) for r in rows]
     probed = {"trade_cal", "stock_basic", "daily", "adj_factor", "daily_basic", "index_daily", "ths_daily",
               "fina_indicator_vip", "income_vip", "index_classify", "index_member_all", "sw_daily"}
     uncovered = sorted(a for a in A if a not in probed)
 
-    out("\n⑤ 汇总 (每行: 序号. 结论  检查项  [消费方: 生产 = a-share 流水线 / 研究湖 = PC data/lake]  证据)")
-    for i, (item, cons, lv, ev) in enumerate(checks, 1):
-        out(f"  {i:>2}. {lv:<4}  {item}  [{cons}]  {ev}")
+    out("\n⑤ 汇总 (每行: 序号. 结论  检查项  [消费方; 两档结论不同时分写]  证据; 消费方: 生产 = a-share 流水线 / "
+        "数据总览 = stock-core data_catalog 服务器 19:30 / 研究湖 = PC data/lake)")
+    for i, c in enumerate(checks, 1):
+        split = ""
+        if len(set(c["tiers"].values())) > 1:
+            split = " · " + " / ".join(f"{t}档 {lv}" for t, lv in c["tiers"].items())
+        out(f"  {i:>2}. {c['level']:<4}  {c['item']}  [{c['consumer']}{split}]  {c['evidence']}")
     if uncovered:
         out(f"  未覆盖 (代码在用, 本探针不探): {', '.join(uncovered)}")
-    cnt = collections.Counter(lv for _, _, lv, _ in checks)
-    fails = [c for c in checks if c[2] in ("FAIL", "SKIP")]
-    warns = [c for c in checks if c[2] == "WARN"]
-    tally = f"PASS {cnt['PASS']} / WARN {cnt['WARN']} / FAIL {cnt['FAIL']}" + (f" / SKIP {cnt['SKIP']}" if cnt["SKIP"] else "")
-    if fails:
-        verdict = "不可切换"
-        by_cons = collections.Counter(cons for c in fails for cons in c[1].split("+"))
-        why = ("未跑完 (调用上限/预算)" if all(c[2] == "SKIP" for c in fails) else "有 FAIL") + \
-            " (按消费方: " + " / ".join(f"{k} {v}" for k, v in by_cons.items()) + "): " + \
-            "; ".join(c[0] for c in fails[:4]) + (" …" if len(fails) > 4 else "")
-        rc = 1
-    else:
-        verdict = "可切换"
-        why = ("全部 PASS" if not warns else "WARN 项生产已兜住或只影响边角, 换后盯: " + "; ".join(c[0] for c in warns[:4]))
-        rc = 0
-    out(f"\n结论: {verdict} —— {tally} · 调用 {pr.n} 次 · 用时 {pr.clock() - pr.t0:.0f}s · {why}")
+    verdicts = tier_verdicts(checks)
+    vp, vl = verdicts[TIER_PROD]["verdict"], verdicts[TIER_LAKE]["verdict"]
+    rc = 0 if vp == "可用" else 1
+    out("")
+    for t in (TIER_PROD, TIER_LAKE):
+        out(f"结论 · {t}档 ({TIER_DESC[t]}): {verdicts[t]['verdict']} —— {verdicts[t]['text']}")
+    out(f"结论: 生产档{vp} · 研究湖档{vl} —— 退出码 {rc} (只看生产档) · 调用 {pr.n} 次 · "
+        f"用时 {pr.clock() - pr.t0:.0f}s")
 
     if args.json:
         rep = {"probed_at": nowbj.isoformat(timespec="seconds"), "host": _host(base), "today_bj": t_iso,
                "dates": {"range": [start.isoformat(), end.isoformat()], "sat": sat.isoformat(),
-                         "sun": sun.isoformat(), "holiday": hol, "open_day": D, "ts_range": [r_start, D],
-                         "period": period},
+                         "sun": sun.isoformat(), "holiday": hol, "open_day": D, "by_date": pday,
+                         "ts_range": [r_start, D], "period": period,
+                         "truth": "内置 A 股休市表 A_CLOSED + 周末" + (f"; 退回镜像: {fallback}" if fallback else "")},
                "calls": [{k: v for k, v in r.items() if k != "items"} for r in pr.records],
-               "checks": [{"item": c[0], "consumer": c[1], "level": c[2], "evidence": c[3]} for c in checks],
-               "uncovered": uncovered, "verdict": verdict, "rc": rc, "n_calls": pr.n}
+               "checks": checks, "uncovered": uncovered,
+               "verdict": {t: verdicts[t]["verdict"] for t in (TIER_PROD, TIER_LAKE)},
+               "tiers": verdicts, "rc": rc, "n_calls": pr.n}
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(rep, f, ensure_ascii=False, indent=1)
         out(f"明细 → {args.json}")
@@ -1496,15 +1880,17 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Tushare (兼容镜像) 只读探针: p0 (历史端点清单) / compat (换镜像必跑)")
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("p0", help="2026-09 P0 端点清单 (不带子命令时的默认行为)")
-    c = sub.add_parser("compat", help="镜像兼容性探针: 只读, 只打印形状, 结论 可切换/不可切换")
-    c.add_argument("--expect", action="store_true", help="只列代码期望字段, 不联网")
+    c = sub.add_parser("compat", help="镜像兼容性探针: 只读, 只打印形状; 两档结论 (生产档定退出码 / 研究湖档只报)")
+    c.add_argument("--expect", action="store_true", help="只列代码期望字段与各消费方期限, 不联网")
     c.add_argument("--secrets", default="", help="另一份 secrets.json (只读 tushare_token / tushare_base_url); 默认 = 生产客户端凭据")
-    c.add_argument("--max-calls", type=int, default=MAX_CALLS, help=f"调用总数上限 (默认 {MAX_CALLS}, 计划 26)")
+    c.add_argument("--max-calls", type=int, default=MAX_CALLS,
+                   help=f"调用总数上限, 只能 1..{MAX_CALLS} (硬上限, 超了拒跑; 默认 {MAX_CALLS}, 计划 26)")
     c.add_argument("--gap", type=float, default=GAP_SEC, help=f"调用间隔秒 (默认 {GAP_SEC:g})")
     c.add_argument("--budget", type=float, default=BUDGET_SEC, help=f"墙钟预算秒 (默认 {BUDGET_SEC:g})")
     c.add_argument("--today", default="", help="把哪天当「今天」(北京日历, YYYYMMDD; 默认现在)")
-    c.add_argument("--date", default="", help="全市场按日那几次用哪个交易日 (默认: 今天之前最后一个开市日)")
-    c.add_argument("--holiday", default="", help="假日一例用哪天 (默认: 真值表里今天及之前最近的工作日休市日)")
+    c.add_argument("--date", default="", help="全市场按日那几次问哪个交易日 P (默认: 内置休市表里上个月最后一个开市的周二; "
+                   "必须是今天之前的开市日)")
+    c.add_argument("--holiday", default="", help="假日一例用哪天 (默认: 内置休市表里今天及之前最近的工作日休市日)")
     c.add_argument("--period", default="", help="财务一期 (默认: 最近已过法定披露截止的报告期)")
     c.add_argument("--core", default="", help="stock-core 目录 (找 research/lake.py; 默认 STOCK_CORE_DIR → 同级 ../stock-core)")
     c.add_argument("--lake-db", default="", help="lake.db 路径 (只读; 默认 data/lake/lake.db)")
