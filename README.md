@@ -92,7 +92,7 @@ python run_pipeline.py --demo          # 等价于 make_demo_data.py
 # Windows PowerShell
 $env:TUSHARE_TOKEN="你的token"
 ```
-基址与备用基址（2026-10-12）：`data/secrets.json` 的 `tushare_base_url`（镜像站要写完整 POST 地址）与可选的 `tushare_base_url_backup`（环境变量 `TUSHARE_BASE_URL` / `TUSHARE_BASE_URL_BACKUP` 可覆盖）；主站连续 3 次传输层失败（HTTP 非 200 / 非 JSON / 硬期限超时 / 连接错）或返回 token 失效类错误码（2002 / 40101）时，本进程余下调用自动切到备用站（日志 grep `tushare 基址切换`，只打 host，token 永不进日志）；无权限等业务错误不触发切换；没配备用键时行为不变。
+基址与备用基址（2026-10-12）：`data/secrets.json` 的 `tushare_base_url`（镜像站要写完整 POST 地址）与可选的 `tushare_base_url_backup`（环境变量 `TUSHARE_BASE_URL` / `TUSHARE_BASE_URL_BACKUP` 可覆盖）；主站连续 3 次传输层失败（HTTP 非 200 且非 429 / 非 JSON / 连接错）、连续 6 次硬期限超时（单独计，共享进程池的连带超时不至于误切）或返回 token 失效类错误码（2002 / 40101）时，本进程余下调用自动切到备用站（日志 grep `tushare 基址切换`，只打 host，token 永不进日志）；切到备用后每 20 次调用或 10 分钟试探主站一次、备用连续 3 次失败也立即试探，主站应答即回切（grep `tushare 基址回切`）；无权限等业务错误与 HTTP 429 限流不触发切换；没配备用键时行为不变（分类顺序与异常类型同以前，用例钉住）。加键前后用 `python -X utf8 -m ashare.tushare_client --probe-backup` 真验收（4 次调用：主站 trade_cal + daily 走生产路径，备用同两项直调；退出码 0 可用 / 1 不可用 / 2 判不了；加键前可先 `$env:TUSHARE_BASE_URL_BACKUP='<备用完整 POST 地址>'` 临时给）。
 
 ---
 
