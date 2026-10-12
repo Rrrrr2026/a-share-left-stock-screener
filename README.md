@@ -92,6 +92,7 @@ python run_pipeline.py --demo          # 等价于 make_demo_data.py
 # Windows PowerShell
 $env:TUSHARE_TOKEN="你的token"
 ```
+基址与备用基址（2026-10-12）：`data/secrets.json` 的 `tushare_base_url`（镜像站要写完整 POST 地址）与可选的 `tushare_base_url_backup`（环境变量 `TUSHARE_BASE_URL` / `TUSHARE_BASE_URL_BACKUP` 可覆盖）；主站连续 3 次传输层失败（HTTP 非 200 / 非 JSON / 硬期限超时 / 连接错）或返回 token 失效类错误码（2002 / 40101）时，本进程余下调用自动切到备用站（日志 grep `tushare 基址切换`，只打 host，token 永不进日志）；无权限等业务错误不触发切换；没配备用键时行为不变。
 
 ---
 

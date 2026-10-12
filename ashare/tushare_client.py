@@ -13,10 +13,21 @@ Tushare Pro (及协议兼容镜像) 原生 HTTP 客户端  ——  P0
 token 与基址只从 `data/secrets.json` 的 `tushare_token` / `tushare_base_url` 读 (环境变量
 TUSHARE_TOKEN / TUSHARE_BASE_URL 可覆盖, 用于临时切官方站)。**token 永不进日志/异常文本/git**。
 基址走配置是因为老板买的是协议兼容镜像 (design/tushare_adapter_design.md §5), 可随时切回
-api.tushare.pro。
+api.tushare.pro。镜像站的基址是**完整 POST 地址** (2026-10-10 起 tl.kaixin8.top 带 /tushare/sdk 路径)。
+
+备用基址 (2026-10-12 卡 TS-FALLBACK): 可选键 `tushare_base_url_backup` (环境变量 TUSHARE_BASE_URL_BACKUP
+可覆盖) 配第二个站 (同一 key; 老板给的 datahubco 只有 15000 积分档, 权限可能少于主站)。主站**连续
+FAILOVER_AFTER=3 次传输层失败** (HTTP 非 200 / 非 JSON / 硬期限超时 / 连接错; 跨调用、跨线程累计, 主站任何
+一次 JSON 应答即清零) 或返回 **token 失效类错误** (code 2002 / 40101, 或文案 token+无效/过期) → 本进程
+余下调用全部走备用 (不自动回切; 触发切换的那次调用在备用上重新来一轮完整重试), journal 打一行 INFO
+「tushare 基址切换: 主站 <host> → 备用 <host> (原因: …)」(只打 host)。备用也失败 → 按原逻辑抛错。
+**业务错误 (无权限 40203 / 参数 / 超频) 不触发切换** —— 15000 档把权限错误当成故障会循环切换。没配备用
+键时一切照旧。进程池里跑的 `_post_json` 只拿主进程选好的基址当参数, 切换状态只在主进程 (加锁) 判定。
 
 本模块提供:
     available()                      -> 是否配了 token
+    credentials()                    -> (token, base_url, backup_base_url); 没配备用则第三项为 ""
+    failover_state() / failover_reset() -> 备用基址切换状态 (诊断 / 用例用)
     query(api, **params)             -> pandas DataFrame (空结果也带列名)
     index_daily(ts_code, start, end) -> 指数日线 DataFrame (升序)
     trade_cal(start, end)            -> 开市日列表 ["YYYY-MM-DD", ...]
@@ -52,6 +63,8 @@ DEADLINE_SEC = 120          # 进程级墙钟硬期限 (fina_indicator_vip 实�
 MAX_RETRIES = 3
 BACKOFF_SEC = 2.0           # 瞬时错误退避基数 (指数退避)
 BACKOFF_RATE_SEC = 12.0     # 超频退避基数 (线性退避)
+FAILOVER_AFTER = 3          # 主站连续这么多次传输层失败 → 本进程余下调用切到备用基址 (配了备用才计)
+TOKEN_ERROR_CODES = (2002, 40101)   # token 过期/无效类错误码 → 立即切备用 (10-08 旧镜像就是 code=2002 token已过期)
 
 #: 测试用: 置 False 后在本进程内直调 (进程池里 mock 的 session 不生效)。生产恒为 True。
 USE_PROCESS_DEADLINE = True
@@ -76,6 +89,11 @@ class TushareTransport(TushareError):
     """网络/HTTP/JSON 解析层错误 —— 可重试。"""
 
 
+class TushareBadToken(TushareTransport):
+    """token 过期/无效 (code 2002 / 40101, 或文案 token+无效/过期)。仍是 TushareTransport 的子类: 同一基址上的
+    重试语义与以前一样 (没配备用时行为不变), 只多一件事 —— 在主站遇到它就立即切备用 (各镜像各自校验 key)。"""
+
+
 class TushareRateLimited(TushareError):
     """超频 ("每分钟最多访问该接口N次") —— 退避后重试。"""
 
@@ -91,12 +109,25 @@ class TushareBadParams(TushareError):
 _RATE_HINTS = ("每分钟最多访问", "每小时最多访问", "抽取失败", "频率", "too many", "rate limit")
 _PARAM_HINTS = ("必填参数", "参数错误", "缺少参数", "不能为空", "invalid param")
 _PERM_HINTS = ("没有接口访问权限", "权限", "积分", "permission", "未开通")
+_TOKEN_HINTS = ("无效", "过期", "invalid", "expired")     # 与 "token" 同时出现才算 (镜像各家文案不一)
+
+
+def _is_token_error(code, low: str) -> bool:
+    """token 失效类: 错误码 2002 / 40101 (字符串形态也认), 或文案同时含 token 与 无效/过期。"""
+    try:
+        if int(code) in TOKEN_ERROR_CODES:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return "token" in low and any(h in low for h in _TOKEN_HINTS)
 
 
 def _classify(api: str, code, msg: str) -> TushareError:
-    """按镜像返回的错误文本判断该不该重试。顺序要紧: 超频文本里也含"权限"二字。"""
+    """按镜像返回的错误码/文本判断该不该重试。顺序要紧: token 失效按 code 最先判; 超频文本里也含"权限"二字。"""
     m = str(msg or "")
     low = m.lower()
+    if _is_token_error(code, low):
+        return TushareBadToken(f"{api}: token 过期/无效 code={code} ({m[:120]})", api, code)
     if any(h in m or h in low for h in _RATE_HINTS):
         return TushareRateLimited(f"{api}: 超频 ({m[:120]})", api, code)
     if any(h in m or h in low for h in _PARAM_HINTS):
@@ -123,7 +154,9 @@ def _read_secrets() -> dict:
 
 
 def credentials(refresh: bool = False):
-    """-> (token, base_url)。token 只在进程内存里流转, 永不打印。"""
+    """-> (token, base_url, backup_base_url)。token 只在进程内存里流转, 永不打印。
+    backup_base_url 没配就是 "" (secrets 键 tushare_base_url_backup / 环境变量 TUSHARE_BASE_URL_BACKUP);
+    refresh=True 重读 secrets 并把基址切换状态复位 (新凭据从主站重新开始)。"""
     global _CRED
     if _CRED is None or refresh:
         with _CRED_LOCK:
@@ -131,8 +164,15 @@ def credentials(refresh: bool = False):
             token = (os.environ.get("TUSHARE_TOKEN") or s.get("tushare_token") or "").strip()
             base = (os.environ.get("TUSHARE_BASE_URL") or s.get("tushare_base_url")
                     or DEFAULT_BASE).strip()
-            _CRED = (token, base or DEFAULT_BASE)
-    return _CRED
+            backup = (os.environ.get("TUSHARE_BASE_URL_BACKUP") or s.get("tushare_base_url_backup")
+                      or "").strip()
+            _CRED = (token, base or DEFAULT_BASE, backup)
+        if refresh:
+            failover_reset()
+    c = _CRED
+    if len(c) == 2:             # 旧形态 (用例直接塞 (token, base)): 等价于没配备用
+        c = (c[0], c[1], "")
+    return c
 
 
 def available() -> bool:
@@ -141,6 +181,85 @@ def available() -> bool:
         return bool(credentials()[0])
     except Exception:           # noqa: BLE001
         return False
+
+
+# ---------------------------------------------------------------- 备用基址切换 (状态只在主进程, 加锁)
+_FO_LOCK = threading.Lock()
+_FO = {"active": False, "fails": 0, "reason": "", "switched_at": None}
+
+
+def _host(url) -> str:
+    """只取主机名: 日志/异常文本里基址只以 host 出现 (完整地址虽不含 token, 也没必要进 journal)。"""
+    try:
+        from urllib.parse import urlsplit
+        return urlsplit(str(url)).netloc or str(url)
+    except Exception:           # noqa: BLE001
+        return str(url)
+
+
+def _has_backup(base, backup) -> bool:
+    return bool(backup) and backup != base
+
+
+def _active_base(base: str, backup) -> tuple:
+    """主进程判定本次请求打哪个基址 -> (base_url, on_primary)。
+    on_primary=True 表示打的是主站**且配了备用** (失败要计数、JSON 应答要清零、token 失效要切);
+    没配备用时恒为 (base, False): 什么都不计, 行为与没有这套机制时完全一样。"""
+    if not _has_backup(base, backup):
+        return base, False
+    with _FO_LOCK:
+        if _FO["active"]:
+            return backup, False
+    return base, True
+
+
+def _switch_locked(base: str, backup: str, reason: str) -> None:
+    """调用方持 _FO_LOCK。只打 host; token 不在这里也不在 reason 里 (reason 来自异常文本/错误码)。"""
+    _FO["active"] = True
+    _FO["reason"] = reason
+    _FO["switched_at"] = time.time()
+    log.info("tushare 基址切换: 主站 %s → 备用 %s (原因: %s)", _host(base), _host(backup), reason)
+
+
+def _note_primary_transport_failure(base: str, backup: str, reason: str) -> bool:
+    """主站一次传输层失败 (HTTP 非 200 / 非 JSON / 硬期限超时 / 连接错)。连续满 FAILOVER_AFTER 次 → 切换并
+    返回 True (本次调用随即在备用上重来一轮); 已经切过 (本线程或别的线程) → False, 不再计数。"""
+    with _FO_LOCK:
+        if _FO["active"]:
+            return False
+        _FO["fails"] += 1
+        if _FO["fails"] < FAILOVER_AFTER:
+            return False
+        _switch_locked(base, backup, f"主站连续 {_FO['fails']} 次传输层失败, 最后一次: {reason}")
+        return True
+
+
+def _note_primary_token_error(base: str, backup: str, reason: str) -> bool:
+    """主站返回 token 失效类错误 → 立即切换 (同一 key 在备用站可能仍有效: 各镜像各自校验)。"""
+    with _FO_LOCK:
+        if _FO["active"]:
+            return False
+        _switch_locked(base, backup, f"主站返回 token 失效类错误: {reason}")
+        return True
+
+
+def _note_primary_ok() -> None:
+    """主站答了 JSON (code 0 或业务错误码都算): 传输层正常, 连续失败计数清零。"""
+    with _FO_LOCK:
+        _FO["fails"] = 0
+
+
+def failover_state() -> dict:
+    """诊断用: 切换状态的副本 (active / fails / reason / switched_at), 不含任何凭据。"""
+    with _FO_LOCK:
+        return dict(_FO)
+
+
+def failover_reset() -> None:
+    """回到主站、计数清零 (用例与 credentials(refresh=True) 用)。生产里**不自动回切**: 本进程余下都走备用,
+    下一个进程重新从主站开始 —— 每天的跑批都是新进程, 主站恢复后自然回去。"""
+    with _FO_LOCK:
+        _FO.update(active=False, fails=0, reason="", switched_at=None)
 
 
 # ---------------------------------------------------------------- 限频
@@ -198,6 +317,8 @@ def _post_json(base: str, payload: dict, timeout: float) -> dict:
 
     **必须是模块级函数**: 它要被 pickle 到工作进程里执行 (进程级硬期限)。
     这里只判传输层, 业务错误码留给主进程分类 (自定义异常跨进程 pickle 越简单越好)。
+    `base` 是主进程按切换状态选好的基址 (主站或备用), 当参数传进来; 工作进程 (spawn 出来的模块副本) 的
+    切换状态永远是初始值, 这里不看也不改它。
     """
     r = _session().post(base, json=payload, timeout=timeout)
     if r.status_code != 200:
@@ -237,27 +358,42 @@ def query(api: str, fields: str = "", retries: int = MAX_RETRIES,
     params 里值为 None 的键会被丢掉 (方便可选参数直接传)。
     抛 TushareUnavailable (没 token) / TushareNoPermission / TushareBadParams (都不重试) /
     TushareRateLimited / TushareTransport (重试耗尽)。
+    配了备用基址时, 每次请求前由主进程按切换状态选基址 (`_active_base`): 主站连续 FAILOVER_AFTER 次传输层
+    失败或返回 token 失效类错误 → 切备用, **本次调用在备用上重新来一轮** (完整 retries 预算, 切换瞬间不退避);
+    备用上的失败按原逻辑重试/抛错, 不切回。没配备用键时与以前完全一样。
     """
-    token, base = credentials()
+    token, base, backup = credentials()
     if not token:
         raise TushareUnavailable(f"{api}: 未配置 tushare_token (data/secrets.json)", api)
     p = {k: v for k, v in params.items() if v is not None}
     payload = {"api_name": api, "token": token, "params": p, "fields": fields or ""}
     last: Exception | None = None
-    for attempt in range(1, max(1, retries) + 1):
+    budget = max(1, retries)
+    attempt = 0
+    while attempt < budget:
+        attempt += 1
+        use_base, on_primary = _active_base(base, backup)   # 主进程判定; 工作进程只拿结果当参数
         waited = _BUCKET.acquire()
         if waited > 1.0:
             log.debug("tushare 限频等待 %.1fs (%s)", waited, api)
         t0 = time.time()
+        switched = False
         try:
-            j = _deadline_call(_post_json, (base, payload, TIMEOUT_SEC), {}, deadline_sec)
+            j = _deadline_call(_post_json, (use_base, payload, TIMEOUT_SEC), {}, deadline_sec)
         except TimeoutError as e:                       # 进程级硬期限 (源站滴流/黑洞)
             last = TushareTransport(f"{api}: 超过 {deadline_sec}s 硬期限 ({e})", api)
-            log.warning("tushare %s 硬期限超时 %d/%d", api, attempt, retries)
+            log.warning("tushare %s 硬期限超时 %d/%d (%s)", api, attempt, budget, _host(use_base))
+            if on_primary:
+                switched = _note_primary_transport_failure(base, backup, f"{api} 超过 {deadline_sec}s 硬期限")
         except (TushareTransport, OSError, ValueError) as e:   # requests 异常继承 OSError
             last = e if isinstance(e, TushareError) else TushareTransport(f"{api}: {e}", api)
-            log.warning("tushare %s 传输失败 %d/%d: %s", api, attempt, retries, str(e)[:120])
+            log.warning("tushare %s 传输失败 %d/%d (%s): %s", api, attempt, budget, _host(use_base),
+                        str(e)[:120])
+            if on_primary:
+                switched = _note_primary_transport_failure(base, backup, f"{api} {str(e)[:80]}")
         else:
+            if on_primary:
+                _note_primary_ok()          # 主站答了 JSON = 传输层正常, 连续失败清零 (业务错误码也算答了)
             code = j.get("code")
             if code == 0:
                 d = j.get("data") or {}
@@ -272,8 +408,13 @@ def query(api: str, fields: str = "", retries: int = MAX_RETRIES,
                 log.warning("tushare %s 永久性失败, 不重试: %s", api, err)
                 raise err
             last = err
-            log.warning("tushare %s 失败 %d/%d: %s", api, attempt, retries, err)
-        if attempt < max(1, retries):
+            log.warning("tushare %s 失败 %d/%d (%s): %s", api, attempt, budget, _host(use_base), err)
+            if on_primary and isinstance(err, TushareBadToken):
+                switched = _note_primary_token_error(base, backup, f"{api} code={code}")
+        if switched:
+            attempt = 0             # 刚切到备用: 本次调用在备用上重新来一轮, 不退避
+            continue
+        if attempt < budget:
             if isinstance(last, TushareRateLimited):
                 nap = BACKOFF_RATE_SEC * attempt
             else:

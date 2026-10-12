@@ -5,7 +5,9 @@ Tushare 客户端离线自测 (不联网, 打桩 requests.Session)。
 
 覆盖: 正常返回成表 / 请求体结构 / 错误文本分类 (超频文本里也含"权限" -> 必须判超频) /
 权限与必填参数不重试 / 传输错误退避重试 / 令牌桶限频 / ts_code 与日期归一 /
-index_daily 升序 / trade_cal 转 ISO / 硬期限走 datasource 的**进程级**执行器。
+index_daily 升序 / trade_cal 转 ISO / 硬期限走 datasource 的**进程级**执行器 /
+备用基址自动切换 (文末 pytest 风格: 主站 3 次传输层失败 / token 失效立即切 / 业务错误不切 /
+备用也坏按原逻辑抛 / 没配备用键一切照旧 / 基址由主进程选好传给 _post_json; 不写任何 token)。
 运行:  python tests/test_tushare_client.py    或    python -m pytest tests/test_tushare_client.py -q
 """
 from __future__ import annotations
@@ -357,3 +359,273 @@ def test_trade_cal_filters_is_open_locally_even_when_server_ignores_the_param(mo
     # is_open 列缺失时照旧不过滤 (只能信服务端)
     monkeypatch.setattr(tc, "query", lambda api, **kw: pd.DataFrame({"cal_date": ["20261012"]}))
     assert tc.trade_cal("2026-10-12", "2026-10-12") == ["2026-10-12"]
+
+
+# ---------------------------------------------------------------------------
+# 备用基址自动切换 (2026-10-12 卡 TS-FALLBACK)。pytest 风格 (monkeypatch / caplog), 不联网, 不出现任何真 token。
+# 背景: 10-10 换到镜像 tl.kaixin8.top 后老板另给了备用站 (同一 key, 15000 积分档); 旧镜像的 token 10-08 起 code=2002。
+import logging
+import pytest
+
+PRIMARY = "https://primary.invalid/tushare/sdk"
+BACKUP = "https://backup.invalid/api/tushare"
+_FO_INITIAL = {"active": False, "fails": 0, "reason": "", "switched_at": None}
+
+
+@pytest.fixture(autouse=True)
+def _failover_clean():
+    """每条用例后把切换状态与 sleep 桩复位 (pytest 下用例之间没有别的清理钩子)。"""
+    yield
+    tc.failover_reset()
+    tc.time.sleep = _REAL_SLEEP
+
+
+def _install_fo(script, backup=BACKUP):
+    """假 session + 三元组凭据 (含备用) + 切换状态复位 + 退避 sleep 打桩 -> (session, naps)。"""
+    s = _install(script)
+    tc._CRED = (TOKEN, PRIMARY, backup)
+    tc.failover_reset()
+    return s, _no_sleep()
+
+
+def _fo_session(script):
+    """只换剧本, 不碰凭据与切换状态 (验证「切换后余下调用」)。"""
+    tc._SESSION = FakeSession(script)
+    return tc._SESSION
+
+
+def _urls(s):
+    return [c["url"] for c in s.calls]
+
+
+def _switch_lines(caplog):
+    return [r for r in caplog.records if "基址切换" in r.getMessage()]
+
+
+def test_failover_after_three_transport_failures_on_primary(caplog):
+    """主站连续 3 次 5xx → 切备用; 触发切换的那次调用在备用上重来并成功 (不退避); 之后的调用直接走备用。
+    journal 只有一行 INFO, 只写 host (不写完整地址, 更不写 token)。"""
+    s, naps = _install_fo([FakeResp({}, status=502), FakeResp({}, status=503), FakeResp({}, status=502),
+                           _ok(["cal_date", "is_open"], [["20261012", 1]])])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df = tc.query("trade_cal", exchange="SSE")
+    assert len(df) == 1
+    assert _urls(s) == [PRIMARY, PRIMARY, PRIMARY, BACKUP]
+    assert naps == [tc.BACKOFF_SEC, tc.BACKOFF_SEC * 2]        # 主站两次退避; 切换瞬间不退避
+    assert s.calls[3]["json"]["token"] == TOKEN                 # 备用站用同一个 key
+    st = tc.failover_state()
+    assert st["active"] is True and "连续 3 次传输层失败" in st["reason"] and TOKEN not in st["reason"]
+    lines = _switch_lines(caplog)
+    assert len(lines) == 1 and lines[0].levelno == logging.INFO
+    msg = lines[0].getMessage()
+    assert "tushare 基址切换: 主站 primary.invalid → 备用 backup.invalid (原因: " in msg
+    assert "/tushare/sdk" not in msg and "/api/tushare" not in msg and TOKEN not in caplog.text
+    # 本进程余下调用全部走备用, 主站不再碰, 也不再打切换行
+    s2 = _fo_session([_ok(["a"], [[1]])])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        tc.query("daily", trade_date="20261012")
+    assert _urls(s2) == [BACKUP] and len(_switch_lines(caplog)) == 1
+
+
+def test_failover_counter_spans_calls_and_resets_on_any_primary_reply(monkeypatch):
+    """连续计数跨调用累计 (retries=1 的多次调用也能触发); 四种传输层失败都算 (5xx / 连接错 / 非 JSON / 硬期限超时);
+    主站任何一次 JSON 应答 (哪怕是超频错误码) 都把计数清零 —— 要的是「连续」。"""
+    s, _ = _install_fo([FakeResp({}, status=502)])
+    with pytest.raises(tc.TushareTransport):
+        tc.query("daily", retries=1)
+    _fo_session([OSError("Connection refused")])
+    with pytest.raises(tc.TushareTransport):
+        tc.query("daily", retries=1)
+    assert tc.failover_state()["fails"] == 2 and tc.failover_state()["active"] is False
+    _fo_session([_err("抱歉，您每分钟最多访问该接口500次")])            # 超频 = 主站传输层正常
+    with pytest.raises(tc.TushareRateLimited):
+        tc.query("daily", retries=1)
+    assert tc.failover_state()["fails"] == 0 and tc.failover_state()["active"] is False
+    _fo_session([FakeResp(ValueError("no json"), status=200, text="<html>502</html>")])
+    with pytest.raises(tc.TushareTransport):
+        tc.query("daily", retries=1)
+    # 硬期限超时 (进程级执行器抛 TimeoutError) 也是传输层失败
+    real_call = tc._deadline_call
+
+    def timeout_on_primary(fn, args, kwargs, dl):
+        if args[0] == PRIMARY:
+            raise TimeoutError("_post_json 超过 42s 硬期限 (工作进程已终止)")
+        return real_call(fn, args, kwargs, dl)
+
+    monkeypatch.setattr(tc, "_deadline_call", timeout_on_primary)
+    _fo_session([])
+    with pytest.raises(tc.TushareTransport):
+        tc.query("daily", retries=1, deadline_sec=42)
+    assert tc.failover_state()["fails"] == 2 and tc.failover_state()["active"] is False
+    s = _fo_session([_ok(["a"], [[1]])])                        # 第 3 次 → 切换, 同一次调用在备用上成功
+    df = tc.query("daily", retries=1, deadline_sec=42)
+    assert len(df) == 1 and _urls(s) == [BACKUP]
+    st = tc.failover_state()
+    assert st["active"] is True and "硬期限" in st["reason"]
+
+
+@pytest.mark.parametrize("code,msg", [(2002, "token已过期"), (40101, "token无效"), ("2002", "token已过期"),
+                                      (2002, "认证失败"), (40101, "Unauthorized"),       # 只看码, 文案没有 token 字样
+                                      (-1, "抱歉，您输入的TOKEN无效，请确认后重试。")])   # 只看文案, 码不在表里
+def test_token_error_on_primary_switches_immediately(code, msg, caplog):
+    """主站返回 token 失效类错误 (code 2002 / 40101, 字符串码也认, 或文案 token+无效/过期) → 不等 3 次、不退避, 立即切备用。"""
+    s, naps = _install_fo([_err(msg, code=code), _ok(["cal_date", "is_open"], [["20261012", 1]])])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df = tc.query("trade_cal", exchange="SSE")
+    assert len(df) == 1 and _urls(s) == [PRIMARY, BACKUP]
+    assert naps == []
+    st = tc.failover_state()
+    assert st["active"] is True and "token 失效类错误" in st["reason"] and f"code={code}" in st["reason"]
+    assert len(_switch_lines(caplog)) == 1 and TOKEN not in caplog.text
+
+
+def test_business_errors_do_not_trigger_failover(caplog):
+    """无权限 40203 (15000 档权限比主站少, 切过去只会更糟) / 必填参数 / 超频 → 不切换; 下一次调用仍打主站。"""
+    s, naps = _install_fo([_err("抱歉，您没有接口访问权限，请确认您的积分", code=40203)])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        with pytest.raises(tc.TushareNoPermission):
+            tc.query("fina_indicator_vip", period="20250630")
+        assert _urls(s) == [PRIMARY]
+        s = _fo_session([_err("必填参数 标的", code=40001)])
+        with pytest.raises(tc.TushareBadParams):
+            tc.query("forecast")
+        assert _urls(s) == [PRIMARY]
+        s = _fo_session([_err("抱歉，您每分钟最多访问该接口500次")] * 3)
+        with pytest.raises(tc.TushareRateLimited):
+            tc.query("daily")
+        assert _urls(s) == [PRIMARY] * 3
+        s = _fo_session([_ok(["a"], [[1]])])
+        tc.query("daily")
+    assert _urls(s) == [PRIMARY]
+    assert tc.failover_state() == _FO_INITIAL and not _switch_lines(caplog)
+
+
+def test_backup_failure_raises_like_before_and_never_flaps_back():
+    """备用也坏 → 按原逻辑 (备用上一轮完整重试 + 退避) 抛 TushareTransport; 之后不回切主站;
+    备用上的权限错误也按原逻辑不重试、不再切。"""
+    s, naps = _install_fo([FakeResp({}, status=502)] * 6)
+    with pytest.raises(tc.TushareTransport):
+        tc.query("daily")
+    assert _urls(s) == [PRIMARY] * 3 + [BACKUP] * 3
+    assert naps == [tc.BACKOFF_SEC, tc.BACKOFF_SEC * 2, tc.BACKOFF_SEC, tc.BACKOFF_SEC * 2]
+    assert tc.failover_state()["active"] is True
+    s = _fo_session([FakeResp({}, status=502)] * 3)
+    with pytest.raises(tc.TushareTransport):
+        tc.query("daily")
+    assert _urls(s) == [BACKUP] * 3
+    s = _fo_session([_err("抱歉，您没有接口访问权限", code=40203)])
+    with pytest.raises(tc.TushareNoPermission):
+        tc.query("daily")
+    assert _urls(s) == [BACKUP]
+    s = _fo_session([_err("token已过期", code=2002)] * 3)       # 备用上的 token 失效: 原逻辑 (传输层重试后抛)
+    with pytest.raises(tc.TushareTransport):
+        tc.query("daily")
+    assert _urls(s) == [BACKUP] * 3
+
+
+@pytest.mark.parametrize("backup", ["", None, PRIMARY])
+def test_without_backup_key_nothing_changes(backup, caplog):
+    """没配 tushare_base_url_backup (空 / 缺 / 与主站相同) → 不计数、不切换、不打切换行, 退避与异常与以前一样;
+    2002 没备用时仍按传输层错误重试 3 次后抛 (类型仍是 TushareTransport, 其子类 TushareBadToken)。"""
+    s, naps = _install_fo([FakeResp({}, status=502)] * 3, backup=backup)
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        with pytest.raises(tc.TushareTransport):
+            tc.query("daily")
+        assert _urls(s) == [PRIMARY] * 3 and naps == [tc.BACKOFF_SEC, tc.BACKOFF_SEC * 2]
+        assert tc.failover_state() == _FO_INITIAL
+        s = _fo_session([_err("token已过期", code=2002)] * 3)
+        with pytest.raises(tc.TushareTransport) as ei:
+            tc.query("trade_cal")
+    assert isinstance(ei.value, tc.TushareBadToken) and _urls(s) == [PRIMARY] * 3
+    assert tc.failover_state() == _FO_INITIAL and not _switch_lines(caplog)
+    # 旧形态 2 元组凭据 (老用例直接塞的) 等价于没配备用
+    tc._CRED = (TOKEN, PRIMARY)
+    assert tc.credentials() == (TOKEN, PRIMARY, "")
+
+
+def test_credentials_backup_key_and_env_override(monkeypatch):
+    """备用基址从 secrets.json 的 tushare_base_url_backup 读, 环境变量 TUSHARE_BASE_URL_BACKUP 覆盖;
+    没这个键 → ""; refresh=True 把切换状态复位 (新凭据从主站重新开始)。"""
+    for k in ("TUSHARE_TOKEN", "TUSHARE_BASE_URL", "TUSHARE_BASE_URL_BACKUP"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(tc, "_read_secrets", lambda: {"tushare_token": TOKEN, "tushare_base_url": PRIMARY,
+                                                      "tushare_base_url_backup": BACKUP})
+    assert tc.credentials(refresh=True) == (TOKEN, PRIMARY, BACKUP)
+    monkeypatch.setenv("TUSHARE_BASE_URL_BACKUP", "https://env-backup.invalid/x")
+    assert tc.credentials(refresh=True) == (TOKEN, PRIMARY, "https://env-backup.invalid/x")
+    monkeypatch.delenv("TUSHARE_BASE_URL_BACKUP")
+    monkeypatch.setattr(tc, "_read_secrets", lambda: {"tushare_token": TOKEN, "tushare_base_url": PRIMARY})
+    assert tc.credentials(refresh=True) == (TOKEN, PRIMARY, "")
+    monkeypatch.setattr(tc, "_read_secrets", lambda: {"tushare_token": TOKEN, "tushare_base_url": PRIMARY,
+                                                      "tushare_base_url_backup": BACKUP})
+    tc.credentials(refresh=True)
+    assert tc._note_primary_token_error(PRIMARY, BACKUP, "x") is True and tc.failover_state()["active"] is True
+    tc.credentials(refresh=True)
+    assert tc.failover_state() == _FO_INITIAL
+    assert tc.available() is True
+    tc._CRED = (TOKEN, "https://example.invalid/")              # 还原老用例的凭据形态
+
+
+def test_switch_decided_in_main_process_and_passed_to_post_json(monkeypatch):
+    """_post_json 被 pickle 到工作进程跑: 基址由主进程选好后当**参数**传下去 (工作进程里的模块副本不参与判定)。
+    用假的进程级执行器记录每次传给 _post_json 的 base; _post_json 自己不看切换状态; 仍可 pickle。"""
+    seen = []
+    real_call = tc._deadline_call
+
+    def runner(fn, args, kwargs, dl):
+        seen.append((getattr(fn, "__name__", ""), args[0]))
+        return real_call(fn, args, kwargs, dl)
+
+    monkeypatch.setattr(tc, "_deadline_call", runner)
+    s, _ = _install_fo([FakeResp({}, status=502)] * 3 + [_ok(["a"], [[1]])])
+    tc.query("daily")
+    assert seen == [("_post_json", PRIMARY)] * 3 + [("_post_json", BACKUP)]
+    s = _fo_session([_ok(["a"], [[1]])])
+    assert tc.failover_state()["active"] is True
+    tc._post_json(PRIMARY, {"api_name": "daily", "token": TOKEN, "params": {}, "fields": ""}, 5)
+    assert _urls(s) == [PRIMARY]                                # 给哪个基址就打哪个, 不看状态
+    import pickle
+    pickle.dumps((tc._post_json, (BACKUP, {"api_name": "daily"}, 5), {}))
+
+
+def test_switch_happens_once_under_concurrency():
+    """多线程同时报主站失败: 只切换一次 (一个 True), 计数停在 FAILOVER_AFTER, 之后的失败不再累计。"""
+    import threading
+    tc._CRED = (TOKEN, PRIMARY, BACKUP)
+    tc.failover_reset()
+    results = []
+    lock = threading.Lock()
+
+    def worker():
+        r = tc._note_primary_transport_failure(PRIMARY, BACKUP, "daily HTTP 502")
+        with lock:
+            results.append(r)
+
+    ts = [threading.Thread(target=worker) for _ in range(32)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert results.count(True) == 1 and len(results) == 32
+    st = tc.failover_state()
+    assert st["active"] is True and st["fails"] == tc.FAILOVER_AFTER
+    assert tc._active_base(PRIMARY, BACKUP) == (BACKUP, False)
+    assert tc._active_base(PRIMARY, "") == (PRIMARY, False)     # 没配备用: 状态无关紧要, 永远主站
+    tc._CRED = (TOKEN, "https://example.invalid/")
+
+
+def test_classify_token_errors():
+    """token 失效类的分类: code 2002 / 40101 (含字符串码) 或文案 token+无效/过期 → TushareBadToken (仍是 Transport 子类);
+    其它文案的分类不变。"""
+    e = tc._classify("trade_cal", 2002, "token已过期")
+    assert isinstance(e, tc.TushareBadToken) and isinstance(e, tc.TushareTransport) and e.code == 2002
+    assert isinstance(tc._classify("daily", "40101", "invalid token"), tc.TushareBadToken)
+    assert isinstance(tc._classify("daily", 2002, "认证失败"), tc.TushareBadToken)          # 只凭码
+    assert isinstance(tc._classify("daily", "40101", "Unauthorized"), tc.TushareBadToken)   # 只凭码 (字符串)
+    assert type(tc._classify("daily", 2001, "认证失败")) is tc.TushareTransport               # 码不在表里、文案无 token → 普通传输错
+    assert isinstance(tc._classify("daily", -1, "抱歉，您输入的TOKEN无效，请确认后重试。"), tc.TushareBadToken)
+    assert type(tc._classify("daily", -1, "系统内部错误")) is tc.TushareTransport
+    assert isinstance(tc._classify("daily", -1, "抱歉，您没有接口访问权限，请确认积分"), tc.TushareNoPermission)
+    assert isinstance(tc._classify("daily", -1, "抱歉，您每分钟最多访问该接口500次，权限的具体详情访问：…"),
+                      tc.TushareRateLimited)
+    assert isinstance(tc._classify("daily", 40203, "token 字样但只是说明: 请检查权限"), tc.TushareNoPermission)
