@@ -40,9 +40,10 @@ WARN, 提醒补表。
   ③ daily_basic 按 P (日期不符同样 FAIL: 生产估值兜底 `fetch_valuation_tushare` 也不看 trade_date) / stock_basic (L、D、
      P 各一次) / index_daily (区间截至 D + 单日 P; 指数不停牌, 区间缺开市日 = FAIL) / ths_daily 按 P (生产只认所问那天:
      别日的行 WARN, 当天的 .TI 一行没有 = FAIL) / fina_indicator_vip + income_vip (最近已过法定披露截止的一期,
-     limit = 湖的翻页步长 FIN_PAGE; 不足一页就补一次 offset 续页, 分清「镜像单页上限 < FIN_PAGE → 湖静默少拉」与
-     「该期就这么多」) / 研究湖每月重拉的申万三件 index_classify (L1) / index_member_all (一个 L1, is_new=Y, limit =
-     MEMBER_PAGE; 核回包是否真按 l1_code / is_new 过滤) / sw_daily (申万行业指数, 同样不停牌): 字段集与行数是否与
+     limit = 湖的翻页步长 FIN_PAGE; 不足一页就补一次 offset 续页, 分清「镜像单页上限 < FIN_PAGE」与「该期就这么多」;
+     上限截断时看湖自己兜不兜得住: lake.py 有 PAGE_CONFIRM_MIN (stock-core 7df1e67 起) 且上限 ≥ 它 → 湖会续页确认、
+     按上限接着翻, 只判 WARN; 否则湖「不足一页即停」会静默少拉 = FAIL) / 研究湖每月重拉的申万三件 index_classify (L1) /
+     index_member_all (一个 L1, is_new=Y, limit = MEMBER_PAGE; 核回包是否真按 l1_code / is_new 过滤) / sw_daily (申万行业指数, 同样不停牌): 字段集与行数是否与
      代码期望一致; 按区间查的端点 (指数 / 个股 / 申万日线) 回包里任何一行落在内置表的休市日上 = FAIL (那是假数据);
   ④ 每次调用: HTTP 状态 / code / 行数 / 列数 / 延迟 (工作进程里量的纯 HTTP 时间) / 字节。延迟按**每档自己最严的
      消费方期限**判 (> 期限 = FAIL, > 一半 = WARN) —— 例: trade_cal 的生产档期限是数据总览子进程的 10 s, 研究湖档是
@@ -1236,11 +1237,13 @@ def check_range(item: str, rec: dict, open_days: list, expect: list, start: str,
     return item, lv, ev + (f"; {txt}" if txt else "")
 
 
-def check_fin(item: str, rec: dict, expect: list, page: int, ref_rows, rec2=None):
+def check_fin(item: str, rec: dict, expect: list, page: int, ref_rows, rec2=None, confirm_min=None):
     """财务一期 (limit = 湖翻页步长 FIN_PAGE): 字段表全回 + 单页是否被镜像上限截断。
 
-    湖的翻页 (`Lake._pages`) 是「不足一页即停」: 镜像单页上限若低于 FIN_PAGE, 第一页就不足一页, 湖会**静默少拉**。
-    所以不足一页时补一次 offset=n 的续页调用 (rec2) 定性: 续页还有行 = 上限截断 (FAIL); 0 行 = 该期就这么多。"""
+    不足一页时补一次 offset=n 的续页调用 (rec2) 定性: 0 行 = 该期就这么多; 还有行 = 镜像单页上限 n < FIN_PAGE。
+    上限截断的后果看湖的翻页 (`Lake._pages`): confirm_min = lake.py 的 PAGE_CONFIRM_MIN (stock-core 7df1e67 起才有,
+    从代码读) —— 有它且 n >= 它: 湖首页不足一页也会续一页确认、按 n 接着翻, 不丢, 只多花调用 (WARN); 没有它或
+    n < 它: 湖「不足一页即停」, **静默少拉** (FAIL)。"""
     bad = call_level(rec)
     if bad:
         return item, bad[0], bad[1]
@@ -1257,9 +1260,13 @@ def check_fin(item: str, rec: dict, expect: list, page: int, ref_rows, rec2=None
         parts.append(("WARN", f"不足一页且没能补续页调用 (调用上限/预算), 判不了是否被单页上限截断"))
     elif call_level(rec2):
         parts.append(("WARN", f"续页 offset={n} 调用失败: {call_level(rec2)[1]}"))
+    elif rec2["rows"] > 0 and confirm_min and n >= confirm_min:
+        parts.append(("WARN", f"镜像单页上限 {n} 行 < 湖翻页步长 {page} (续页 offset={n} 还有 {rec2['rows']} 行): "
+                              f"湖首页 >= PAGE_CONFIRM_MIN {confirm_min} 会续页确认、按 {n} 接着翻, 不丢, 多花调用"))
     elif rec2["rows"] > 0:
         parts.append(("FAIL", f"单页只给 {n} 行 < 湖翻页步长 {page}, 续页 offset={n} 还有 {rec2['rows']} 行: "
-                              "湖的翻页不足一页即停, 会静默少拉"))
+                              + (f"湖首页不到 PAGE_CONFIRM_MIN {confirm_min} 行不续页确认" if confirm_min else
+                                 "湖的翻页不足一页即停") + ", 会静默少拉"))
     else:
         ev += f"; 续页 offset={n} 0 行 = 该期就 {n} 行"
         if ref_rows and n < 0.9 * min(page, ref_rows):
@@ -1270,9 +1277,8 @@ def check_fin(item: str, rec: dict, expect: list, page: int, ref_rows, rec2=None
 
 def check_filtered(item: str, rec: dict, expect: list, filters: dict, page):
     """按参数过滤的维表 (申万分类 / 成员): 有行 + 回包里的过滤列是否等于所问 + 分页是否满页/超页。
-    镜像不认过滤参数时湖的数据靠主键去重多半仍对, 代价是调用量与下载量: 按 lake.db 现有成员数 (31 个 L1, is_new
-    Y 5,913 / N 2,006 行) 算, 每个 L1 都拉全市场后湖的成员调用约 62 → 155 次 (×2.5), 下载行数 ×31 —— 判 WARN;
-    调不通 / 0 行判 FAIL。"""
+    镜像不认过滤参数 = 湖得自己兜 (湖怎么兜、代价多大随 lake.py 版本变, 见 stock-core HANDBOOK「研究湖镜像兼容性」),
+    探针只判 WARN; 调不通 / 0 行判 FAIL。"""
     bad = call_level(rec)
     if bad:
         return item, bad[0], bad[1]
@@ -1286,7 +1292,8 @@ def check_filtered(item: str, rec: dict, expect: list, filters: dict, page):
         if ds and col in ds[0]:
             wrong = sum(1 for r in ds if str(r.get(col)) != str(want))
             if wrong:
-                parts.append(("WARN", f"镜像不认 {col} 过滤: {wrong}/{n} 行不是 {want} (湖会多拉, 靠主键去重)"))
+                parts.append(("WARN", f"镜像不认 {col} 过滤: {wrong}/{n} 行不是 {want} (湖得自己兜, 见 HANDBOOK"
+                                      "「研究湖镜像兼容性」)"))
     if page:
         if n > page:
             parts.append(("WARN", f"回了 {n} 行 > limit {page}: 镜像不认 limit"))
@@ -1603,6 +1610,7 @@ def run_compat(args, post=None, now: dt.datetime | None = None, out=print, sleep
     lake_c = exp["consts"].get("stock-core/research/lake.py", {})
     sw_src = lake_c.get("SW_SRC") if isinstance(lake_c.get("SW_SRC"), str) else "SW2021"
     m_page = lake_c.get("MEMBER_PAGE") if isinstance(lake_c.get("MEMBER_PAGE"), int) else 2000
+    confirm_min = lake_c.get("PAGE_CONFIRM_MIN") if isinstance(lake_c.get("PAGE_CONFIRM_MIN"), int) else None
     r_cls = r_mem = r_swd = None
     l1 = SW_L1_FALLBACK
     if "index_classify" in A:
@@ -1736,7 +1744,8 @@ def run_compat(args, post=None, now: dt.datetime | None = None, out=print, sleep
     for api, rec, rec2 in fin_recs:
         tbl = {"fina_indicator_vip": "fina_indicator", "income_vip": "income"}.get(api, api)
         ref = lake_meta["rows"].get((tbl, _iso(period)))
-        add(*check_fin(f"{api} period={period}", rec, E(api)["expect"], page, ref, rec2), api, rec, rec2)
+        add(*check_fin(f"{api} period={period}", rec, E(api)["expect"], page, ref, rec2, confirm_min), api, rec,
+            rec2)
     # 申万三件
     if r_cls is not None:
         add(*check_filtered(f"index_classify level=L1 src={sw_src}", r_cls, E("index_classify")["expect"],

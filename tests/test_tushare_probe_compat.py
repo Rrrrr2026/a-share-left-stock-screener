@@ -285,10 +285,10 @@ def not_the_client(t):
 """
 
 
-def _mini_core(tmp_path):
+def _mini_core(tmp_path, lake_src=MINI_LAKE):
     core = tmp_path / "stock-core"
     (core / "research").mkdir(parents=True, exist_ok=True)
-    (core / "research" / "lake.py").write_text(MINI_LAKE, encoding="utf-8")
+    (core / "research" / "lake.py").write_text(lake_src, encoding="utf-8")
     (core / "research" / "data_catalog.py").write_text(MINI_CATALOG, encoding="utf-8")
     return str(core)
 
@@ -319,9 +319,9 @@ def _secrets(tmp_path):
     return str(p)
 
 
-def _run(tmp_path, mirror, extra=(), lake_db=True, now=NOW):
+def _run(tmp_path, mirror, extra=(), lake_db=True, now=NOW, lake_src=MINI_LAKE):
     tmp_path.mkdir(parents=True, exist_ok=True)
-    args = ["compat", "--secrets", _secrets(tmp_path), "--core", _mini_core(tmp_path), "--gap", "0"]
+    args = ["compat", "--secrets", _secrets(tmp_path), "--core", _mini_core(tmp_path, lake_src), "--gap", "0"]
     args += (["--lake-db", _mini_lake_db(tmp_path)] if lake_db else ["--no-lake-db"])
     args += list(extra)
     ns = P.build_parser().parse_args(args)
@@ -626,6 +626,20 @@ def test_fin_page_cap_below_lake_page_fails_lake_tier_only(tmp_path):
     rows = _check_rows(text)
     assert rc == 0 and "研究湖档不可用" in text
     assert rows["income_vip period=20260630"] == "FAIL" and "静默少拉" in text
+
+
+def test_fin_page_cap_handled_when_lake_confirms_pages(tmp_path):
+    """lake.py 有 PAGE_CONFIRM_MIN (stock-core 7df1e67 起): 镜像单页上限 >= 它时湖会续页确认、按上限接着翻, 不丢 -> 只 WARN,
+    研究湖档仍可用; 上限比它还小 -> 湖不续页, 静默少拉 -> FAIL。没有这个常量的老湖照旧 FAIL (上一条用例)。"""
+    src = MINI_LAKE + "PAGE_CONFIRM_MIN = 1000"            # MINI_LAKE 以换行结尾: 这是模块级一行
+    rc, text = _run(tmp_path / "cap5000", FakeMirror(single_quirk=False, page_cap=5000), lake_src=src)
+    rows = _check_rows(text)
+    assert rc == 0 and rows["income_vip period=20260630"] == "WARN" and "按 5000 接着翻, 不丢" in text, text
+    assert "结论: 生产档可用 · 研究湖档可用" in text
+    rc2, text2 = _run(tmp_path / "cap500", FakeMirror(single_quirk=False, page_cap=500), lake_src=src)
+    rows2 = _check_rows(text2)
+    assert rc2 == 0 and rows2["income_vip period=20260630"] == "FAIL" and "不到 PAGE_CONFIRM_MIN 1000" in text2
+    assert "研究湖档不可用" in text2
 
 
 def test_fin_period_shorter_than_page_gets_one_followup_and_passes(tmp_path):
