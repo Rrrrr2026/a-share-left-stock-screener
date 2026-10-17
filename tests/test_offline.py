@@ -161,13 +161,18 @@ def test_module3_valuation():
     )
     ds._ak = lambda: fake
     ds.CONFIG["source"]["use_cache"] = False
-
-    raw = ds.fetch_valuation_hist("000001")
+    # yjbb 预取对 12 个报告期每期 time.sleep(0.3) 限频 (datasource.fetch_profit_reports_ex), 假 akshare 下是纯等待 3.6 s
+    # (卡 TEST-SPEED 10-17 实测本条 3.77 s, 全套第二慢) —— 掐掉, 用例禁真等待
+    _real_sleep = ds.time.sleep
+    ds.time.sleep = lambda s: None
+    try:
+        raw = ds.fetch_valuation_hist("000001")
+        f = m3.pull_fundamentals("000001", industry=None, industry_pe_median=25.0,
+                                 spot_row={"pe_ttm": 22, "pb": 2.2})
+    finally:
+        ds.time.sleep = _real_sleep
     check("估值历史: 含 date/pe_ttm/pb 列",
           raw is not None and all(c in raw.columns for c in ["date", "pe_ttm", "pb"]))
-
-    f = m3.pull_fundamentals("000001", industry=None, industry_pe_median=25.0,
-                             spot_row={"pe_ttm": 22, "pb": 2.2})
     check("PE-TTM 取到值", f["pe_ttm"] is not None)
     check("PE 历史分位在 0-100", f["pe_pct"] is not None and 0 <= f["pe_pct"] <= 100)
     check("当前PE处历史低位 -> 低分位(<50)", f["pe_pct"] is not None and f["pe_pct"] < 50)

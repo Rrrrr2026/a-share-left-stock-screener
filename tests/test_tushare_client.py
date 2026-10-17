@@ -206,16 +206,17 @@ def test_token_bucket():
     for _ in range(60):
         b.acquire()
     check("桶被取空", b.tokens < 1.0)
-    slept = []
-    real_sleep = tc.time.sleep
-    tc.time.sleep = lambda s: slept.append(s)
+    # 假时钟: sleep 只拨快 monotonic, 不真等。原版只打桩 sleep 不打桩 monotonic, acquire 的 while 循环按真时钟空转
+    # 约 1 s 才攒出一个令牌 (卡 TEST-SPEED 10-17 --durations 实测 1.02 s, 本文件唯一上榜的用例)
+    slept, clock = [], [tc.time.monotonic()]
+    real_sleep, real_monotonic = tc.time.sleep, tc.time.monotonic
+    tc.time.sleep = lambda s: (slept.append(s), clock.__setitem__(0, clock[0] + s))
+    tc.time.monotonic = lambda: clock[0]
     try:
-        b.acquire()                        # 令牌不足 -> 至少睡一次 (打桩后不真等)
-    except Exception:                      # noqa: BLE001
-        pass
+        waited = b.acquire()               # 令牌不足 -> 睡到够 (假时钟下一两轮就够)
     finally:
-        tc.time.sleep = real_sleep
-    check("空桶时会等待", bool(slept))
+        tc.time.sleep, tc.time.monotonic = real_sleep, real_monotonic
+    check("空桶时会等待", bool(slept) and waited > 0)
     b2 = tc.TokenBucket(6000)              # 100 次/秒, 不该等
     check("充裕时零等待", b2.acquire() == 0.0)
 

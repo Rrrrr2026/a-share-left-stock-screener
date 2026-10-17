@@ -195,16 +195,20 @@ def test_pe_basis_on_every_valuation_path(ts_box, monkeypatch):
 def test_dashboard_payload_and_history_snapshot_meta_carry_basis():
     """看板 dashboard_data.js 的 meta 与历史快照 day_<日>.json 的 meta 都带 pe_basis="ttm" / industry_basis="em_f100"
     (同一份 build_payload); 没有这两个键的历史快照按老口径解释 (DEPLOY/HANDBOOK 一句)。"""
-    from ashare import db, export_data as ex, backtest as bt
+    from ashare import db, export_data as ex, backtest as bt, earnings_cal
     tmp = tempfile.mkdtemp(prefix="pebasis_")
     hist = os.path.join(tmp, "history")
     os.makedirs(hist)
-    saved = (db.DB_PATH, ex.HISTORY_DIR, ds.fetch_benchmark_close, bt._paths, CONFIG["source"]["use_cache"])
+    saved = (db.DB_PATH, ex.HISTORY_DIR, ds.fetch_benchmark_close, bt._paths, CONFIG["source"]["use_cache"],
+             earnings_cal.fetch_appoint_map)
     db.DB_PATH = os.path.join(tmp, "ashare.db")
     ex.HISTORY_DIR = hist
     ds.fetch_benchmark_close = lambda: None
     bt._paths = lambda: (hist, os.path.join(tmp, "bt.js"), os.path.join(tmp, "bt.json"))
     CONFIG["source"]["use_cache"] = False
+    # build_payload 顺带拉的财报预约日 (earnings_cal → 东财数据中心) 与口径无关, 掐掉: 不掐就真联网 (卡 TEST-SPEED 10-17 实测
+    # 本条 38 s, 东财滴流时无上界; tests/conftest.py 现已禁真联网, 不掐会直接报错)
+    earnings_cal.fetch_appoint_map = lambda *a, **k: {}
     try:
         db.init_db()
         db.log_run("2026-09-24", "2026-09-24 10:01:25", "2026-09-24 11:14:19", 4915, 1,
@@ -222,7 +226,8 @@ def test_dashboard_payload_and_history_snapshot_meta_carry_basis():
         snap = json.load(open(path, encoding="utf-8"))
         assert snap["meta"]["pe_basis"] == "ttm" and snap["meta"]["industry_basis"] == "em_f100"
     finally:
-        db.DB_PATH, ex.HISTORY_DIR, ds.fetch_benchmark_close, bt._paths, CONFIG["source"]["use_cache"] = saved
+        db.DB_PATH, ex.HISTORY_DIR, ds.fetch_benchmark_close, bt._paths, CONFIG["source"]["use_cache"], \
+            earnings_cal.fetch_appoint_map = saved
 
 
 # ============================================================ (c) run_pipeline: 归属只认快照 industry 列

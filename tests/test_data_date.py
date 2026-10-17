@@ -455,13 +455,13 @@ def test_benchmark_legacy_path_when_store_off():
 
 def test_snapshot_and_paper_consume_runlog_data_date():
     """db.log_run(data_date=X) -> 看板 meta / 快照 meta / paper 的 sig_date 都是 X (③ 的链)。"""
-    from ashare import db, export_data as ex, paper as _paper   # noqa: F401
+    from ashare import db, export_data as ex, paper as _paper, earnings_cal   # noqa: F401
     from leftside_core import paper as lp
     tmp = tempfile.mkdtemp(prefix="ddx_")
     hist = os.path.join(tmp, "history")
     os.makedirs(hist)
     saved = (db.DB_PATH, ex.HISTORY_DIR, ds.fetch_benchmark_close, bt._paths, lp._paths,
-             CONFIG["source"]["use_cache"])
+             CONFIG["source"]["use_cache"], earnings_cal.fetch_appoint_map)
     db.DB_PATH = os.path.join(tmp, "ashare.db")
     ex.HISTORY_DIR = hist
     ds.fetch_benchmark_close = lambda: None
@@ -470,6 +470,9 @@ def test_snapshot_and_paper_consume_runlog_data_date():
     # 优质榜信号按那份文件自己的日期登记 (与本链无关), 会混进断言
     lp._paths = lambda: (hist, os.path.join(tmp, "paper.json"), os.path.join(tmp, "paper.js"))
     CONFIG["source"]["use_cache"] = False
+    # build_payload 顺带拉的财报预约日 (earnings_cal → 东财数据中心) 与本链无关, 掐掉: use_cache 关着、干净导出树又没缓存,
+    # 不掐就真联网 (卡 TEST-SPEED 10-17 实测本条 43 s, 东财滴流时无上界; tests/conftest.py 现已禁真联网, 不掐会直接报错)
+    earnings_cal.fetch_appoint_map = lambda *a, **k: {}
     try:
         db.init_db()
         db.log_run("2026-09-14", "2026-09-14 10:01:25", "2026-09-14 11:14:19", 4915, 1,
@@ -492,7 +495,7 @@ def test_snapshot_and_paper_consume_runlog_data_date():
         assert sigs and all(s[1] == "2026-09-14" for s in sigs), sigs[:3]
     finally:
         db.DB_PATH, ex.HISTORY_DIR, ds.fetch_benchmark_close, bt._paths, lp._paths, \
-            CONFIG["source"]["use_cache"] = saved
+            CONFIG["source"]["use_cache"], earnings_cal.fetch_appoint_map = saved
 
 
 # ---------------------------------------------------------------- 修正表 + 迁移脚本
