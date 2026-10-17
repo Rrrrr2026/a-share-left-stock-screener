@@ -713,19 +713,22 @@ def test_bad_backup_three_failures_then_primary_probe_returns_and_call_retries_o
     assert _urls(s) == [PRIMARY]
 
 
-def test_backup_failures_count_consecutively_across_calls_and_timeouts_count_too(monkeypatch):
-    """备用的连续失败也跨调用累计 (retries=1 的三次调用也会触发试探), 硬期限超时在备用上照计;
-    备用一次 JSON 应答 (哪怕业务错误) 把 backup_fails 清零。"""
+def test_backup_failures_count_consecutively_across_calls_and_timeouts_count_separately(monkeypatch):
+    """备用的连续失败也跨调用累计 (retries=1 的三次调用也会触发试探); 备用上的硬期限超时**单独计** (backup_timeouts, 阈值 6,
+    与主站同口径 —— 卡 TS-FALLBACK-3, 校验员 LOW「备用侧硬期限没有单独计」); 备用一次 JSON 应答 (参数错之类的业务错误) 把两个计数
+    都清零; 备用无权限 40203 **算**一次备用失败 (不清零, 见 test_backup_no_permission_counts_toward_probe…)。"""
     s, _ = _install_fo([_err("token已过期", code=2002), _ok(["a"], [[1]])])
     tc.query("daily")
     assert tc.failover_state()["active"] is True
     _fo_session([FakeResp({}, status=502)])
     with pytest.raises(tc.TushareTransport):
         tc.query("daily", retries=1)
-    _fo_session([_err("抱歉，您没有接口访问权限", code=40203)])  # 备用答了 JSON → 清零
-    with pytest.raises(tc.TushareNoPermission):
+    assert tc.failover_state()["backup_fails"] == 1
+    _fo_session([_err("必填参数 标的", code=40001)])          # 备用答了 JSON (参数错) → 两个计数清零
+    with pytest.raises(tc.TushareBadParams):
         tc.query("daily", retries=1)
-    assert tc.failover_state()["backup_fails"] == 0 and tc.failover_state()["active"] is True
+    assert tc.failover_state()["backup_fails"] == 0 and tc.failover_state()["backup_timeouts"] == 0
+    assert tc.failover_state()["active"] is True
     _fo_session([FakeResp({}, status=502)])
     with pytest.raises(tc.TushareTransport):
         tc.query("daily", retries=1)
@@ -739,12 +742,18 @@ def test_backup_failures_count_consecutively_across_calls_and_timeouts_count_too
     monkeypatch.setattr(tc, "_deadline_call", timeout_on_backup)
     with pytest.raises(tc.TushareTransport):
         tc.query("daily", retries=1, deadline_sec=42)
-    assert tc.failover_state()["backup_fails"] == 2 and tc.failover_state()["probes"] == 0
+    st = tc.failover_state()
+    assert st["backup_fails"] == 1 and st["backup_timeouts"] == 1 and st["probes"] == 0     # 超时不进 backup_fails
     monkeypatch.setattr(tc, "_deadline_call", real_call)
+    _fo_session([FakeResp({}, status=502)])
+    with pytest.raises(tc.TushareTransport):
+        tc.query("daily", retries=1)
+    assert tc.failover_state()["backup_fails"] == 2 and tc.failover_state()["probes"] == 0
     s = _fo_session([FakeResp({}, status=502), _cal_ok(), _ok(["a"], [[1]])])   # 第 3 次 → 试探主站 → 回切 → 本次在主站成功
     df = tc.query("daily", retries=1)
     assert len(df) == 1 and _urls(s) == [BACKUP, PRIMARY, PRIMARY] and _is_probe(s.calls[1])
-    assert tc.failover_state()["active"] is False and tc.failover_state()["returns"] == 1
+    st = tc.failover_state()
+    assert st["active"] is False and st["returns"] == 1 and st["backup_timeouts"] == 0 and st["backup_fails"] == 0
 
 
 def test_both_sites_dead_stays_on_backup_no_pingpong(caplog):
@@ -766,11 +775,11 @@ def test_both_sites_dead_stays_on_backup_no_pingpong(caplog):
         tc.query("daily")
     assert _urls(s) == [BACKUP] * 3 + [PRIMARY] and _is_probe(s.calls[3])
     assert tc.failover_state()["active"] is True and tc.failover_state()["probes"] == 2
-    # 备用上的权限错误照旧不重试、不切
+    # 备用上的权限错误照旧不重试、不切; 算一次备用失败 (1 < 3, 不试探), 见 test_backup_no_permission_counts_toward_probe…
     s = _fo_session([_err("抱歉，您没有接口访问权限", code=40203)])
     with pytest.raises(tc.TushareNoPermission):
         tc.query("daily")
-    assert _urls(s) == [BACKUP]
+    assert _urls(s) == [BACKUP] and tc.failover_state()["backup_fails"] == 1 and tc.failover_state()["probes"] == 2
 
 
 def test_at_most_two_rounds_per_call_even_if_primary_recovers_midway():
@@ -924,7 +933,10 @@ def test_backup_failure_raises_like_before_and_never_flaps_back_when_primary_dea
     s = _fo_session([_err("抱歉，您没有接口访问权限", code=40203)])
     with pytest.raises(tc.TushareNoPermission):
         tc.query("daily")
-    assert _urls(s) == [BACKUP]
+    assert _urls(s) == [BACKUP] and tc.failover_state()["backup_fails"] == 1   # 无权限算一次备用失败 (TS-FALLBACK-3)
+    s = _fo_session([_ok(["a"], [[1]])])                          # 备用成功一次 → 清零, 下面的三连从 0 数起
+    tc.query("daily")
+    assert _urls(s) == [BACKUP] and tc.failover_state()["backup_fails"] == 0
     s = _fo_session([_err("token已过期", code=2002)] * 3 + [FakeResp({}, status=502)])
     with pytest.raises(tc.TushareBadToken):                       # 备用不认这把 key: 算备用失败, 重试 3 次 → 试探主站 (坏) → 抛
         tc.query("daily")
@@ -1084,8 +1096,22 @@ _CAL = [["20260922", 1], ["20260923", 1], ["20260924", 1], ["20260925", 1], ["20
 _OPEN = sorted(f"{d[:4]}-{d[4:6]}-{d[6:]}" for d, o in _CAL if o == 1)
 
 
-def _daily_rows(n):
-    return [[f"{600000 + i:06d}.SH", "20261013", 1.0, 1.1, 0.9, 1.0, 100.0, 1000.0] for i in range(n)]
+def _daily_rows(n, day="20261013", distinct=None):
+    """n 行 daily; distinct=k 时只有 k 个不同代码 (重复行凑数的回包, 校验员 J2)。"""
+    k = distinct or n
+    return [[f"{600000 + (i % k):06d}.SH", day, 1.0, 1.1, 0.9, 1.0, 100.0, 1000.0] for i in range(n)]
+
+
+_D, _P2 = "2026-10-13", "2026-09-28"        # _CAL 窗口里最近开市日 D, 与往前 PROBE_SECOND_DAY_BACK=5 个开市日的 P (10-13 ← 10-12, 10-09, 09-30, 09-29, 09-28)
+_CAL_SPEC = _ok(["cal_date", "is_open"], _CAL)
+
+
+def _probe_script(backup_daily_d=None, backup_daily_p=None, n_p=5000, n_p2=4990, n_b=4600):
+    """6 次调用的标准剧本: 主站 trade_cal / daily D / daily P 走生产路径, 备用 trade_cal / daily D / daily P 直调。"""
+    return [_CAL_SPEC, _ok(_DAILY_COLS, _daily_rows(n_p, "20261013")), _ok(_DAILY_COLS, _daily_rows(n_p2, "20260928")),
+            _ok(["cal_date", "is_open"], _CAL),
+            backup_daily_d if backup_daily_d is not None else _ok(_DAILY_COLS, _daily_rows(n_b, "20261013")),
+            backup_daily_p if backup_daily_p is not None else _ok(_DAILY_COLS, _daily_rows(n_b, "20260928"))]
 
 
 def _probe_setup(monkeypatch, script, backup=BACKUP):
@@ -1100,47 +1126,65 @@ def _probe_setup(monkeypatch, script, backup=BACKUP):
     return s, naps, lines
 
 
-def test_probe_backup_real_calls_and_pass_verdict(monkeypatch):
-    """4 次调用: 主站 trade_cal + daily 走生产路径 query() (经切换机制), 备用同两项直调 (带同一个 token, 服务端过滤 is_open=1);
-    备用日历与主站一致、daily 行数 ≥ 90% → rc 0; 输出只有 host / 行数 / 耗时, 没有 token 没有完整地址。"""
-    s, naps, lines = _probe_setup(monkeypatch, [_ok(["cal_date", "is_open"], _CAL), _ok(_DAILY_COLS, _daily_rows(5000)),
-                                                _ok(["cal_date", "is_open"], _CAL), _ok(_DAILY_COLS, _daily_rows(4600))])
+def test_probe_backup_six_calls_and_pass_verdict(monkeypatch):
+    """6 次调用: 主站 trade_cal + daily D + daily P 走生产路径 query() (经切换机制), 备用同三项直调 (同一个 token, 服务端过滤 is_open=1);
+    备用日历与主站一致、两天行数 ≥ 90%、代码重合 ≥ 90%、回包日期全对 → rc 0; 输出只有 host / 行数 / 代码数 / 耗时, 没有 token 没有完整地址。
+    P = D 往前 PROBE_SECOND_DAY_BACK=5 个开市日 (已知的过去开市日, 抓「一律回最新一天」的镜像)。"""
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script())
     rc = tc.probe_backup(out=lines.append, today=_TODAY)
     text = "\n".join(lines)
     assert rc == 0, text
-    assert _urls(s) == [PRIMARY, PRIMARY, BACKUP, BACKUP]
+    assert _urls(s) == [PRIMARY] * 3 + [BACKUP] * 3
     apis = [c["json"]["api_name"] for c in s.calls]
-    assert apis == ["trade_cal", "daily", "trade_cal", "daily"]
+    assert apis == ["trade_cal", "daily", "daily", "trade_cal", "daily", "daily"]
     assert s.calls[0]["json"]["params"] == {"exchange": "SSE", "start_date": "20260922", "end_date": "20261020", "is_open": "1"}
-    assert s.calls[2]["json"]["params"] == s.calls[0]["json"]["params"]
-    assert s.calls[1]["json"]["params"] == {"trade_date": "20261013"} == s.calls[3]["json"]["params"]
-    assert s.calls[1]["json"]["fields"] == tc.PROBE_DAILY_FIELDS == s.calls[3]["json"]["fields"]
+    assert s.calls[3]["json"]["params"] == s.calls[0]["json"]["params"]
+    assert s.calls[1]["json"]["params"] == {"trade_date": "20261013"} == s.calls[4]["json"]["params"]
+    assert s.calls[2]["json"]["params"] == {"trade_date": "20260928"} == s.calls[5]["json"]["params"]
+    assert all(c["json"]["fields"] == tc.PROBE_DAILY_FIELDS for c in s.calls if c["json"]["api_name"] == "daily")
     assert all(c["json"]["token"] == TOKEN for c in s.calls)
+    assert all(not _is_probe(c) for c in s.calls)               # 验收不触发主站试探 (状态一直在主站)
     assert naps == [] and tc.failover_state()["active"] is False
-    assert "结论 (rc 0): 备用 backup.invalid 可用" in text and f"日历一致 {len(_OPEN)} 天" in text
-    assert "daily 2026-10-13 4600/5000 行" in text and "切换状态 active=False" in text
+    assert "共 6 次调用" in text and "结论 (rc 0): 备用 backup.invalid 可用" in text and f"日历一致 {len(_OPEN)} 天" in text
+    assert f"daily {_D} 4600/5000 行" in text and f"daily {_P2} 4600/4990 行" in text and "两天回包日期都对" in text
+    assert "切换状态 active=False" in text and f"主站 daily {_D}: 5000 行, 5000 个代码" in text
     assert TOKEN not in text and "/tushare/sdk" not in text and "/api/tushare" not in text
 
 
+def test_probe_backup_second_day_falls_back_to_earliest_when_window_is_short(monkeypatch):
+    """窗口里过去开市日 ≤ 5 天 (长假后 / 刚开市) → 第二个核对日取窗口里最早的过去开市日 (仍 ≠ D); 不足 2 天 → rc 2。"""
+    today = _dt.date(2026, 9, 24)                               # _CAL 里 ≤ 09-24 的开市日只有 09-22/23/24 → D=24, P=22
+    script = [_CAL_SPEC, _ok(_DAILY_COLS, _daily_rows(100, "20260924")), _ok(_DAILY_COLS, _daily_rows(100, "20260922")),
+              _CAL_SPEC, _ok(_DAILY_COLS, _daily_rows(100, "20260924")), _ok(_DAILY_COLS, _daily_rows(100, "20260922"))]
+    s, naps, lines = _probe_setup(monkeypatch, script)
+    assert tc.probe_backup(out=lines.append, today=today) == 0, "\n".join(lines)
+    assert s.calls[2]["json"]["params"] == {"trade_date": "20260922"} == s.calls[5]["json"]["params"]
+    s, naps, lines = _probe_setup(monkeypatch, [_ok(["cal_date", "is_open"], [["20260922", 1], ["20260923", 1]])])
+    assert tc.probe_backup(out=lines.append, today=_dt.date(2026, 9, 22)) == 2 and "过去开市日不足 2 天" in lines[-1]
+    assert len(s.calls) == 1
+
+
 def test_probe_backup_fails_when_backup_rejects_key_or_disagrees(monkeypatch):
-    """备用不认这把 key (2002) / 日历不一致 / daily 行数不够 / 打不通 → rc 1, 结论点名原因; 主站那两项照常。"""
-    s, naps, lines = _probe_setup(monkeypatch, [_ok(["cal_date", "is_open"], _CAL), _ok(_DAILY_COLS, _daily_rows(100)),
-                                                _err("token已过期", code=2002), _err("抱歉，您没有接口访问权限", code=40203)])
+    """备用不认这把 key (2002) / 日历不一致 / daily 行数不够 / 打不通 → rc 1, 结论点名原因与日子; 主站那三项照常; 直调不重试。"""
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script(n_p=100, n_p2=100)[:3] + [
+        _err("token已过期", code=2002), _err("抱歉，您没有接口访问权限", code=40203), _err("抱歉，您没有接口访问权限", code=40203)])
     rc = tc.probe_backup(out=lines.append, today=_TODAY)
     text = "\n".join(lines)
-    assert rc == 1 and _urls(s) == [PRIMARY, PRIMARY, BACKUP, BACKUP] and naps == []    # 直调不重试
-    assert "结论 (rc 1): 备用 backup.invalid 不可用" in text
-    assert "trade_cal 打不通或不认这把 key" in text and "daily 打不通或不认这把 key" in text and TOKEN not in text
-    s, naps, lines = _probe_setup(monkeypatch, [_ok(["cal_date", "is_open"], _CAL), _ok(_DAILY_COLS, _daily_rows(100)),
-                                                _ok(["cal_date", "is_open"], _CAL[:-2]), _ok(_DAILY_COLS, _daily_rows(80))])
+    assert rc == 1 and _urls(s) == [PRIMARY] * 3 + [BACKUP] * 3 and naps == []    # 直调不重试
+    assert "结论 (rc 1): 备用 backup.invalid 不可用" in text and TOKEN not in text
+    assert "trade_cal 打不通或不认这把 key" in text
+    assert f"daily {_D} 打不通或不认这把 key" in text and f"daily {_P2} 打不通或不认这把 key" in text
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script(n_p=100, n_p2=100)[:3] + [
+        _ok(["cal_date", "is_open"], _CAL[:-2]), _ok(_DAILY_COLS, _daily_rows(80, "20261013")), _ok(_DAILY_COLS, _daily_rows(100, "20260928"))])
     rc = tc.probe_backup(out=lines.append, today=_TODAY)
     text = "\n".join(lines)
-    assert rc == 1 and "日历与主站不一致" in text and "daily 行数 80 < 主站 100 × 0.9" in text
-    s, naps, lines = _probe_setup(monkeypatch, [_ok(["cal_date", "is_open"], _CAL), _ok(_DAILY_COLS, _daily_rows(100)),
-                                                OSError("Connection refused"), _ok(["ts_code", "close"], [["600000.SH", 1.0]] * 100)])
+    assert rc == 1 and "日历与主站不一致" in text and f"daily {_D} 行数 80 < 主站 100 × 0.9" in text
+    assert f"daily {_P2} 行数" not in text and f"daily {_P2} 与主站重合代码" not in text     # P 那天没毛病就不点名
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script(n_p=100, n_p2=100)[:3] + [
+        OSError("Connection refused"), _ok(["ts_code", "close"], [["600000.SH", 1.0]] * 100), _ok(_DAILY_COLS, _daily_rows(100, "20260928"))])
     rc = tc.probe_backup(out=lines.append, today=_TODAY)
     text = "\n".join(lines)
-    assert rc == 1 and "备用 trade_cal 失败: OSError" in text and "缺列" in text
+    assert rc == 1 and "备用 trade_cal 失败: OSError" in text and "缺列" in text and "回包日期" not in text   # 没 trade_date 列只报缺列
 
 
 def test_probe_backup_cannot_judge_without_backup_or_when_primary_itself_fails(monkeypatch):
@@ -1175,3 +1219,320 @@ def test_main_cli_arguments(monkeypatch, capsys):
     assert tc.main([]) == 2
     assert TOKEN not in capsys.readouterr().out
     tc._CRED = (TOKEN, "https://example.invalid/")
+
+
+# ---------------------------------------------------------------------------
+# 卡 TS-FALLBACK-3 (2026-10-17, 对 verify:TS-FALLBACK-2 的 1 MEDIUM + 4 LOW 逐条)
+def test_probe_backup_rejects_backup_that_ignores_or_mislabels_trade_date(monkeypatch):
+    """校验员 MEDIUM (J1): 备用 daily 问 D 回的却是别的日子 (无视 / 错配 trade_date) → rc 1 并点名 —— 生产 _rows_from_daily /
+    fetch_adj_by_date 按所问日期写价格库、不看回包日期, 这种备用切过去会静默写错 K 线和复权因子。
+    「一律回最新一天」的镜像在 D 上与正确镜像一样, 靠第二个日子 P 抓出来。"""
+    wrong_d = _ok(_DAILY_COLS, _daily_rows(5000, "20261012"))
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script(backup_daily_d=wrong_d))
+    rc = tc.probe_backup(out=lines.append, today=_TODAY)
+    text = "\n".join(lines)
+    assert rc == 1, text
+    assert f"daily {_D} 回包日期与所问不符 (备用无视或错配 trade_date, 生产会按所问日期写错价格库)" in text
+    assert "回包日期 ['20261012'] 与所问 20261013 不符" in text
+    assert f"daily {_P2} 回包日期" not in text                      # P 那天是对的
+    # 「一律回最新一天」: D 对, P 却回了 D 的行
+    latest_only = _ok(_DAILY_COLS, _daily_rows(4600, "20261013"))
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script(backup_daily_p=latest_only))
+    rc = tc.probe_backup(out=lines.append, today=_TODAY)
+    text = "\n".join(lines)
+    assert rc == 1 and f"daily {_P2} 回包日期与所问不符" in text and f"daily {_D} 回包日期" not in text
+    assert "回包日期 ['20261013'] 与所问 20260928 不符" in text
+    # 混着几行别的日子也不行
+    mixed = _ok(_DAILY_COLS, _daily_rows(4600, "20261013") + _daily_rows(3, "20261009"))
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script(backup_daily_d=mixed))
+    assert tc.probe_backup(out=lines.append, today=_TODAY) == 1 and "['20261009']" in "\n".join(lines)
+
+
+def test_probe_backup_rejects_duplicate_rows_padding(monkeypatch):
+    """校验员 J2: 备用 5000 行但只有 10 个不同代码 (重复行凑数) → 行数够、日期对, 但「与主站重合代码」10 < 5000 × 0.9 → rc 1。"""
+    dup = _ok(_DAILY_COLS, _daily_rows(5000, "20261013", distinct=10))
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script(backup_daily_d=dup))
+    rc = tc.probe_backup(out=lines.append, today=_TODAY)
+    text = "\n".join(lines)
+    assert rc == 1, text
+    assert f"daily {_D} 与主站重合代码 10 < 5000 × 0.9" in text and f"daily {_D} 行数" not in text
+    assert f"备用 daily {_D}: 5000 行 (100% of 主站), 与主站重合代码 10/5000" in text
+    # 代码集对不上 (回的是另一批票) 同样不行
+    other = _ok(_DAILY_COLS, [[f"{300000 + i:06d}.SZ", "20261013", 1.0, 1.1, 0.9, 1.0, 100.0, 1000.0] for i in range(5000)])
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script(backup_daily_d=other))
+    assert tc.probe_backup(out=lines.append, today=_TODAY) == 1 and "与主站重合代码 0 < 5000 × 0.9" in "\n".join(lines)
+
+
+def test_probe_backup_missing_column_alone_fails(monkeypatch):
+    """校验员 LOW (变异 m5 存活): 只缺一列 (其它全对) 也必须 rc 1, 结论里只有这一条。"""
+    cols = [c for c in _DAILY_COLS if c != "amount"]
+    rows = [r[:-1] for r in _daily_rows(4600, "20261013")]
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script(backup_daily_d=_ok(cols, rows)))
+    rc = tc.probe_backup(out=lines.append, today=_TODAY)
+    assert rc == 1
+    assert lines[-1] == f"结论 (rc 1): 备用 backup.invalid 不可用 —— daily {_D} 缺列 ['amount']; 不要加键 / 加了就去掉"
+
+
+def test_probe_backup_primary_zero_rows_or_wrong_date_cannot_judge(monkeypatch):
+    """校验员 LOW (变异 m11 存活): 主站 daily 0 行 → rc 2, 不再往下打备用; 主站自己回包日期不对 → 也 rc 2 (那是主站的问题, 判不了备用)。"""
+    s, naps, lines = _probe_setup(monkeypatch, [_CAL_SPEC, _ok(_DAILY_COLS, [])])
+    rc = tc.probe_backup(out=lines.append, today=_TODAY)
+    assert rc == 2 and f"主站 daily {_D} 0 行" in lines[-1] and _urls(s) == [PRIMARY, PRIMARY]
+    s, naps, lines = _probe_setup(monkeypatch, [_CAL_SPEC, _ok(_DAILY_COLS, _daily_rows(5000, "20261012"))])
+    rc = tc.probe_backup(out=lines.append, today=_TODAY)
+    assert rc == 2 and f"主站 daily {_D} 回包日期与所问不符" in lines[-1] and "tushare_probe.py compat" in lines[-1]
+    assert _urls(s) == [PRIMARY, PRIMARY]
+    s, naps, lines = _probe_setup(monkeypatch, [_CAL_SPEC, _ok(_DAILY_COLS, _daily_rows(5000, "20261013")), _ok(_DAILY_COLS, [])])
+    rc = tc.probe_backup(out=lines.append, today=_TODAY)
+    assert rc == 2 and f"主站 daily {_P2} 0 行" in lines[-1] and _urls(s) == [PRIMARY] * 3
+
+
+def test_probe_call_thread_deadline_returns_raises_and_times_out():
+    """_probe_call: 自己的守护线程 + 墙钟; 正常返回值 / 异常原样带回 / 到点抛 TimeoutError 而不 terminate 任何东西。"""
+    import threading
+    assert tc._probe_call(lambda a, b=0: a + b, (2,), {"b": 3}, 1.0) == 5
+
+    def boom():
+        raise ValueError("x")
+    with pytest.raises(ValueError):
+        tc._probe_call(boom, (), {}, 1.0)
+    gate = threading.Event()
+    try:
+        with pytest.raises(TimeoutError) as ei:
+            tc._probe_call(gate.wait, (), {}, 0.02)
+        assert "墙钟" in str(ei.value) and "0.02" in str(ei.value)
+    finally:
+        gate.set()                                              # 放被弃的线程走
+
+
+def test_probe_runs_in_its_own_thread_not_through_the_shared_pool(monkeypatch):
+    """校验员 LOW: 试探不得经 datasource 的共享进程池 (撞期限会 terminate 整池连带在途请求; 池满时在队列里等到超时)。
+    试探经 _probe_call 在别的线程里跑; _deadline_call (池的入口) 只见到正常请求, 见不到试探。"""
+    import threading
+    seen = []
+    real_call = tc._deadline_call
+
+    def spy(fn, args, kwargs, dl):
+        seen.append((getattr(fn, "__name__", ""), args[2], dl))
+        return real_call(fn, args, kwargs, dl)
+
+    monkeypatch.setattr(tc, "_deadline_call", spy)
+    idents = []
+
+    class ThreadSession(FakeSession):
+        def post(self, url, json=None, timeout=None):      # noqa: A002
+            idents.append((timeout, threading.get_ident()))
+            return super().post(url, json=json, timeout=timeout)
+
+    s, _ = _install_fo([_err("token已过期", code=2002), _ok(["a"], [[1]])])
+    tc.query("daily")
+    assert tc.failover_state()["active"] is True
+    with tc._FO_LOCK:
+        tc._FO["last_probe_at"] = tc.time.monotonic() - tc.PROBE_EVERY_SEC - 1
+    tc._SESSION = ThreadSession([_cal_ok(), _ok(["a"], [[1]])])
+    idents.clear()
+    seen.clear()
+    df = tc.query("daily", deadline_sec=77)
+    assert len(df) == 1 and tc.failover_state()["active"] is False
+    assert [t for t, _ in idents] == [tc.PROBE_TIMEOUT_SEC, tc.TIMEOUT_SEC]
+    assert idents[0][1] != threading.get_ident() and idents[1][1] == threading.get_ident()   # 试探在别的线程, 正常请求在本线程
+    assert seen == [("_post_json", tc.TIMEOUT_SEC, 77)]                                      # 池入口只见到正常请求
+
+
+def test_probe_unexpected_exception_is_a_failed_probe_and_slot_is_released(monkeypatch, caplog):
+    """校验员 LOW (场景 G): 试探里抛了捕获元组以外的异常 (MaybeEncodingError / MemoryError 一类) → 只算「试探失败」, 调用方的 query()
+    照走备用; probing 位子释放, 到点还会再试探并回切。"""
+    s, _ = _install_fo([_err("token已过期", code=2002), _ok(["a"], [[1]])])
+    tc.query("daily")
+    with tc._FO_LOCK:
+        tc._FO["last_probe_at"] = tc.time.monotonic() - tc.PROBE_EVERY_SEC - 1
+
+    def boom(fn, args, kwargs, dl):
+        raise RuntimeError("simulated MaybeEncodingError inside probe")
+    monkeypatch.setattr(tc, "_probe_call", boom)
+    s = _fo_session([_ok(["a"], [[1]])])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df = tc.query("daily")
+    assert len(df) == 1 and _urls(s) == [BACKUP]
+    st = tc.failover_state()
+    assert st["probing"] is False and st["probes"] == 1 and st["active"] is True
+    lines = [r for r in caplog.records if "试探失败" in r.getMessage()]
+    assert len(lines) == 1 and "试探异常 RuntimeError" in lines[0].getMessage() and TOKEN not in caplog.text
+    # 位子是空的: 到点再试探, 这回正常 → 回切
+    monkeypatch.undo()
+    with tc._FO_LOCK:
+        tc._FO["last_probe_at"] = tc.time.monotonic() - tc.PROBE_EVERY_SEC - 1
+    s = _fo_session([_cal_ok(), _ok(["a"], [[1]])])
+    tc.query("daily")
+    assert _urls(s) == [PRIMARY, PRIMARY] and _is_probe(s.calls[0]) and tc.failover_state()["active"] is False
+
+
+def test_probe_slot_released_even_when_probe_raises_baseexception(monkeypatch):
+    """位子释放是 finally 兜底的: 连 BaseException (KeyboardInterrupt / SystemExit 一类) 穿过去, probing 也复位。"""
+    class _Boom(BaseException):
+        pass
+
+    def boom(token, base):
+        raise _Boom()
+    s, _ = _install_fo([_err("token已过期", code=2002), _ok(["a"], [[1]])])
+    tc.query("daily")
+    with tc._FO_LOCK:
+        tc._FO["last_probe_at"] = tc.time.monotonic() - tc.PROBE_EVERY_SEC - 1
+    monkeypatch.setattr(tc, "_probe_primary", boom)
+    with pytest.raises(_Boom):
+        tc._maybe_probe_primary(TOKEN, PRIMARY, BACKUP)
+    st = tc.failover_state()
+    assert st["probing"] is False and st["active"] is True and tc.time.monotonic() - st["last_probe_at"] < 60
+    monkeypatch.undo()
+    with tc._FO_LOCK:
+        tc._FO["last_probe_at"] = tc.time.monotonic() - tc.PROBE_EVERY_SEC - 1
+    _fo_session([_cal_ok()])
+    assert tc._maybe_probe_primary(TOKEN, PRIMARY, BACKUP) is True and tc.failover_state()["active"] is False
+
+
+def test_backup_hard_deadline_timeouts_counted_separately_with_threshold_6(monkeypatch, caplog):
+    """校验员 LOW: 备用侧硬期限超时单独计 (backup_timeouts, 阈值 FAILBACK_AFTER_TIMEOUTS=6, 与主站同口径): 5 次超时 + 2 次传输层失败
+    都不试探 (各算各的); 第 6 次超时 → 试探主站 → 成功即回切且本次在主站重来, 回切原因写「备用连续 6 次硬期限超时」;
+    备用一次 JSON 应答把两个计数都清零。"""
+    s, _ = _install_fo([_err("token已过期", code=2002), _ok(["a"], [[1]])])
+    tc.query("daily")
+    assert tc.failover_state()["active"] is True
+    real_call = tc._deadline_call
+
+    def timeout_on_backup(fn, args, kwargs, dl):
+        if args[0] == BACKUP:
+            raise TimeoutError("_post_json 超过 42s 硬期限 (工作进程已终止)")
+        return real_call(fn, args, kwargs, dl)
+
+    monkeypatch.setattr(tc, "_deadline_call", timeout_on_backup)
+    s = _fo_session([])
+    for _ in range(5):
+        with pytest.raises(tc.TushareTransport):
+            tc.query("daily", retries=1, deadline_sec=42)
+    st = tc.failover_state()
+    assert st["backup_timeouts"] == 5 and st["backup_fails"] == 0 and st["probes"] == 0 and len(s.calls) == 0
+    monkeypatch.setattr(tc, "_deadline_call", real_call)
+    s = _fo_session([FakeResp({}, status=502), FakeResp({}, status=503)])
+    for _ in range(2):
+        with pytest.raises(tc.TushareTransport):
+            tc.query("daily", retries=1)
+    st = tc.failover_state()
+    assert st["backup_timeouts"] == 5 and st["backup_fails"] == 2 and st["probes"] == 0 and st["active"] is True
+    monkeypatch.setattr(tc, "_deadline_call", timeout_on_backup)
+    s = _fo_session([_cal_ok(), _ok(["a"], [[1]])])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df = tc.query("daily", retries=1, deadline_sec=42)          # 第 6 次超时 → 试探 → 回切 → 本次在主站成功
+    assert len(df) == 1 and _urls(s) == [PRIMARY, PRIMARY] and _is_probe(s.calls[0])
+    st = tc.failover_state()
+    assert st["active"] is False and st["returns"] == 1 and st["backup_timeouts"] == 0 and st["backup_fails"] == 0
+    lines = _return_lines(caplog)
+    assert len(lines) == 1 and "备用连续 6 次硬期限超时, 最后一次: daily 超过 42s 硬期限" in lines[0].getMessage()
+    # 备用一次 JSON 应答 → 两个计数都清零
+    monkeypatch.setattr(tc, "_deadline_call", real_call)
+    s = _fo_session([_err("token已过期", code=2002), _ok(["a"], [[1]])])
+    tc.query("daily")
+    with tc._FO_LOCK:
+        tc._FO["backup_timeouts"], tc._FO["backup_fails"] = 4, 2
+    s = _fo_session([_ok(["a"], [[1]])])
+    tc.query("daily")
+    assert tc.failover_state()["backup_timeouts"] == 0 and tc.failover_state()["backup_fails"] == 0
+
+
+def test_backup_no_permission_counts_toward_probe_and_call_redoes_on_primary_when_back(caplog):
+    """校验员 MEDIUM 的「缺口」: 备用 NoPermission (40203 / unknown_api; 15000 档比主站少) 以前不触发试探, 要等 20 次 / 10 分钟。
+    现在算一次备用失败: 连续 3 次 → 试探主站 → 主站回来了就回切并让**本次调用在主站重来** (主站有权限); 主站没回来照旧抛 NoPermission
+    (不在备用重试, 不退避); 参数错 (BadParams) 仍是「JSON 应答清零」, 不触发试探。"""
+    s, naps = _install_fo([_err("token已过期", code=2002), _ok(["a"], [[1]])])
+    tc.query("daily")
+    assert tc.failover_state()["active"] is True
+    for n in (1, 2):
+        s = _fo_session([_err("抱歉，您没有接口访问权限", code=40203)])
+        with pytest.raises(tc.TushareNoPermission):
+            tc.query("daily_basic")
+        assert _urls(s) == [BACKUP] and tc.failover_state()["backup_fails"] == n and tc.failover_state()["probes"] == 0
+    naps.clear()
+    s = _fo_session([_err("[unknown_api] 接口不存在或未开放", code=404), _cal_ok(), _ok(["a"], [[1]])])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df = tc.query("daily_basic")
+    assert len(df) == 1 and _urls(s) == [BACKUP, PRIMARY, PRIMARY] and _is_probe(s.calls[1]) and naps == []
+    st = tc.failover_state()
+    assert st["active"] is False and st["returns"] == 1 and st["backup_fails"] == 0
+    lines = _return_lines(caplog)
+    assert len(lines) == 1 and "备用连续 3 次失败, 最后一次: daily_basic code=404 (备用无权限或没这个接口)" in lines[0].getMessage()
+    assert any("在备用无权限" in r.getMessage() and "本次在主站重来" in r.getMessage() for r in caplog.records)
+    assert not any("永久性失败" in r.getMessage() for r in caplog.records if "daily_basic code=404" in r.getMessage())
+    # 主站没回来: 第 3 次 → 试探 (502) → 留在备用, 抛的仍是 NoPermission (不是传输错), WARNING「两站」
+    caplog.clear()
+    s, naps = _install_fo([_err("token已过期", code=2002), _ok(["a"], [[1]])])
+    tc.query("daily")
+    with tc._FO_LOCK:
+        tc._FO["backup_fails"] = 2
+    s = _fo_session([_err("抱歉，您没有接口访问权限", code=40203), FakeResp({}, status=502)])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        with pytest.raises(tc.TushareNoPermission):
+            tc.query("daily_basic")
+    assert _urls(s) == [BACKUP, PRIMARY] and _is_probe(s.calls[1]) and naps == []
+    st = tc.failover_state()
+    assert st["active"] is True and st["probes"] == 1 and st["backup_fails"] == 0
+    warn = [r for r in caplog.records if "试探失败" in r.getMessage()]
+    assert len(warn) == 1 and warn[0].levelno == logging.WARNING and "备用连续 3 次失败" in warn[0].getMessage()
+    # 参数错: JSON 应答清零, 不触发试探
+    with tc._FO_LOCK:
+        tc._FO["backup_fails"] = 2
+    s = _fo_session([_err("必填参数 标的", code=40001)])
+    with pytest.raises(tc.TushareBadParams):
+        tc.query("forecast")
+    assert _urls(s) == [BACKUP] and tc.failover_state()["backup_fails"] == 0 and tc.failover_state()["probes"] == 1
+
+
+def test_failed_probe_resets_backup_timeouts_too(monkeypatch):
+    """试探失败 (两站都不可用) 时备用的两个计数都归零重数 (变异 n10: 只清 backup_fails 不清 backup_timeouts, 下一次超时就又试探)。"""
+    s, _ = _install_fo([_err("token已过期", code=2002), _ok(["a"], [[1]])])
+    tc.query("daily")
+    real_call = tc._deadline_call
+
+    def timeout_on_backup(fn, args, kwargs, dl):
+        if args[0] == BACKUP:
+            raise TimeoutError("_post_json 超过 42s 硬期限 (工作进程已终止)")
+        return real_call(fn, args, kwargs, dl)
+
+    monkeypatch.setattr(tc, "_deadline_call", timeout_on_backup)
+    with tc._FO_LOCK:
+        tc._FO["backup_timeouts"] = 5
+    s = _fo_session([FakeResp({}, status=502)])                  # 第 6 次超时 → 试探主站 (502) → 留在备用
+    with pytest.raises(tc.TushareTransport):
+        tc.query("daily", retries=1, deadline_sec=42)
+    assert _urls(s) == [PRIMARY] and _is_probe(s.calls[0])
+    st = tc.failover_state()
+    assert st["active"] is True and st["probes"] == 1 and st["backup_timeouts"] == 0 and st["backup_fails"] == 0
+    s = _fo_session([])
+    with pytest.raises(tc.TushareTransport):                      # 紧接着再超时一次: 重新从 1 数起, 不再试探
+        tc.query("daily", retries=1, deadline_sec=42)
+    assert tc.failover_state()["backup_timeouts"] == 1 and tc.failover_state()["probes"] == 1 and len(s.calls) == 0
+
+
+def test_return_clears_timeouts_counter_even_without_a_primary_success(monkeypatch):
+    """校验员 LOW (变异 m1 存活): 回切必须把主站的 timeouts 也清零, 而且不能靠回切后那次主站成功顺手清 —— 回切后主站第一次就撞
+    硬期限 (共享进程池连带) 时, 切换前攒下的 5 次不得凑成第 6 次再切。"""
+    s, _ = _install_fo([_err("token已过期", code=2002), _ok(["a"], [[1]])])
+    tc.query("daily")
+    with tc._FO_LOCK:
+        tc._FO["timeouts"] = 5                                  # 切换前攒下的 (切换时不清, 回切时必须清)
+        tc._FO["last_probe_at"] = tc.time.monotonic() - tc.PROBE_EVERY_SEC - 1
+    real_call = tc._deadline_call
+    hits, mid = [], []
+
+    def first_primary_times_out(fn, args, kwargs, dl):
+        hits.append(args[0])
+        if args[0] == PRIMARY and len(hits) == 1:
+            raise TimeoutError("_post_json 超过 42s 硬期限 (工作进程已终止)")
+        mid.append(tc.failover_state())                         # 重试那一刻的状态: 超时已计 1 次, 还没被成功清零
+        return real_call(fn, args, kwargs, dl)
+
+    monkeypatch.setattr(tc, "_deadline_call", first_primary_times_out)
+    s = _fo_session([_cal_ok(), _ok(["a"], [[1]])])             # 试探 (不走 _deadline_call) → 回切 → 主站超时 1 次 → 成功
+    df = tc.query("daily", retries=2, deadline_sec=42)
+    assert len(df) == 1 and _urls(s) == [PRIMARY, PRIMARY] and _is_probe(s.calls[0])   # 回切不清 timeouts 的话这里是 [PRIMARY, BACKUP]
+    assert len(mid) == 1 and mid[0]["timeouts"] == 1 and mid[0]["active"] is False and mid[0]["switches"] == 1
+    st = tc.failover_state()
+    assert st["active"] is False and st["switches"] == 1 and st["returns"] == 1 and st["timeouts"] == 0   # 成功后清零
