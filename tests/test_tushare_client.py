@@ -9,7 +9,9 @@ index_daily 升序 / trade_cal 转 ISO / 硬期限走 datasource 的**进程级*
 备用基址自动切换 (文末 pytest 风格: 主站 3 次传输层失败 / token 失效立即切 / 业务错误不切 /
 硬期限超时单独计阈值 6 / HTTP 429 按超频退避不计 / 备用三连败试探主站回切 / 每 20 次调用或 10 分钟试探主站 /
 一次调用最多两轮 / 没配备用键分类顺序与异常类型同 7b92bb6 版 (逐字节钉住) / unknown_api·invalid_params 不重试 /
-镜像回显的 token 进不了日志 / --probe-backup 真验收; 基址由主进程选好传给 _post_json; 不写任何 token)。
+镜像回显的 token 进不了日志 / --probe-backup 真验收; 基址由主进程选好传给 _post_json; 不写任何 token) /
+分页 (2026-10-24 卡 TS-PAGINATE: 恰满本站单页上限才带 offset 续页, has_more, 合并去重, 调用方自己翻页不插手, 镜像不认 offset 即停,
+--probe-backup 的备用直调同样分页) / 进程池起不来或挂住 → 线程版硬期限一次即永久 (文末)。
 运行:  python tests/test_tushare_client.py    或    python -m pytest tests/test_tushare_client.py -q
 """
 from __future__ import annotations
@@ -75,6 +77,8 @@ def _install(script):
     tc._CRED = (TOKEN, "https://example.invalid/")
     tc.USE_PROCESS_DEADLINE = False
     tc._BUCKET = tc.TokenBucket(100000)                # 限频单独测, 别拖慢其它用例
+    tc._PAGE_LIMIT = tc.PAGE_LIMIT_DEFAULT             # 单页上限固定取缺省 5000 (不读真 secrets / 环境变量); 要别的值用例自己设
+    tc._pool_fallback_reset()                          # 进程池回退开关复位 (一次即永久, 用例间要清)
     return tc._SESSION
 
 
@@ -382,6 +386,7 @@ def _failover_clean():
     """每条用例后把切换状态与 sleep 桩复位 (pytest 下用例之间没有别的清理钩子)。"""
     yield
     tc.failover_reset()
+    tc._pool_fallback_reset()
     tc.time.sleep = _REAL_SLEEP
 
 
@@ -1114,12 +1119,16 @@ def _probe_script(backup_daily_d=None, backup_daily_p=None, n_p=5000, n_p2=4990,
             backup_daily_p if backup_daily_p is not None else _ok(_DAILY_COLS, _daily_rows(n_b, "20260928"))]
 
 
-def _probe_setup(monkeypatch, script, backup=BACKUP):
-    for k in ("TUSHARE_TOKEN", "TUSHARE_BASE_URL", "TUSHARE_BASE_URL_BACKUP"):
+def _probe_setup(monkeypatch, script, backup=BACKUP, page_limit=6000):
+    """page_limit: 旧剧本的 daily 恰 5000 行 (与备用站 datahubco 的单页上限撞数), 缺省把 secrets 键 tushare_page_limit 写成 6000 让它们
+    不触发自动分页 (分页另有用例); None = 不写键 (客户端按缺省 5000 分页)。"""
+    for k in ("TUSHARE_TOKEN", "TUSHARE_BASE_URL", "TUSHARE_BASE_URL_BACKUP", "TUSHARE_PAGE_LIMIT"):
         monkeypatch.delenv(k, raising=False)
     sec = {"tushare_token": TOKEN, "tushare_base_url": PRIMARY}
     if backup:
         sec["tushare_base_url_backup"] = backup
+    if page_limit is not None:
+        sec["tushare_page_limit"] = page_limit
     monkeypatch.setattr(tc, "_read_secrets", lambda: sec)
     s, naps = _install_fo(script)
     lines = []
@@ -1536,3 +1545,409 @@ def test_return_clears_timeouts_counter_even_without_a_primary_success(monkeypat
     assert len(mid) == 1 and mid[0]["timeouts"] == 1 and mid[0]["active"] is False and mid[0]["switches"] == 1
     st = tc.failover_state()
     assert st["active"] is False and st["switches"] == 1 and st["returns"] == 1 and st["timeouts"] == 0   # 成功后清零
+
+
+# ---------------------------------------------------------------------------
+# 分页 (2026-10-24 卡 TS-PAGINATE): 备用站 datahubco 单页上限 5000 行 (全市场按 trade_date 的 daily / adj_factor / daily_basic 恰 5000 行,
+# offset=5000 再回 559; limit=6000 → 400); 主站 kaixin8 单页能回 5,2xx 行所以从未暴露 —— 切到备用后不分页就静默丢 ~560 只。不联网, 无真 token。
+_PG_COLS = ["ts_code", "trade_date", "close"]
+
+
+def _pg_rows(n, start=0, day="20260929"):
+    return [[f"{start + i:06d}.SZ", day, 1.0] for i in range(n)]
+
+
+def _pg_ok(n, start=0, has_more=None, day="20260929"):
+    j = {"code": 0, "msg": "", "data": {"fields": _PG_COLS, "items": _pg_rows(n, start, day)}}
+    if has_more is not None:
+        j["data"]["has_more"] = has_more
+    return FakeResp(j)
+
+
+def _page_lines(caplog):
+    return [r for r in caplog.records if ": 分页 " in r.getMessage()]
+
+
+def test_paginates_when_first_page_equals_site_limit(caplog):
+    """恰 5000 行 → 带 offset=5000 续一页 (559 行) → 5559 行; 第一页请求体与以前逐字节相同 (不带 offset / limit); 续页同 fields 同基址;
+    一行 INFO「tushare daily: 分页 2 页 5559 行 (host) trade_date=…」; 结果 .attrs["pages"] = 2。"""
+    s = _install([_pg_ok(5000), _pg_ok(559, 5000)])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df = tc.query("daily", trade_date="20260929", fields="ts_code,trade_date,close")
+    assert len(df) == 5559 and df.attrs.get("pages") == 2 and list(df.columns) == _PG_COLS
+    assert len(s.calls) == 2
+    assert s.calls[0]["json"] == {"api_name": "daily", "token": TOKEN, "params": {"trade_date": "20260929"}, "fields": "ts_code,trade_date,close"}
+    assert s.calls[1]["json"]["params"] == {"trade_date": "20260929", "offset": 5000}
+    assert s.calls[1]["json"]["fields"] == "ts_code,trade_date,close" and s.calls[1]["url"] == s.calls[0]["url"]
+    lines = _page_lines(caplog)
+    assert len(lines) == 1 and lines[0].levelno == logging.INFO
+    assert "tushare daily: 分页 2 页 5559 行 (example.invalid) trade_date=20260929" in lines[0].getMessage() and TOKEN not in caplog.text
+    assert df["ts_code"].is_unique and df["ts_code"].iloc[0] == "000000.SZ" and df["ts_code"].iloc[-1] == "005558.SZ"
+
+
+def test_no_paging_below_limit_and_zero_change_for_small_endpoints(caplog):
+    """4999 行 (不足一页) → 1 次调用, 不翻, 不打分页行, 返回的就是那一页 (attrs 没有 pages); 5559 行 (主站 kaixin8 形态: 上限其实更高) 同样不翻;
+    trade_cal 之类小接口请求体里没有 offset / limit。"""
+    s = _install([_pg_ok(4999)])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df = tc.query("daily", trade_date="20260929")
+    assert len(df) == 4999 and len(s.calls) == 1 and not _page_lines(caplog) and "pages" not in df.attrs
+    s = _install([_pg_ok(5559)])
+    assert len(tc.query("daily", trade_date="20260929")) == 5559 and len(s.calls) == 1
+    s = _install([_ok(["cal_date", "is_open"], [["20260929", 1]])])
+    assert tc.trade_cal("2026-09-29", "2026-09-29") == ["2026-09-29"] and len(s.calls) == 1
+    assert "offset" not in s.calls[0]["json"]["params"] and "limit" not in s.calls[0]["json"]["params"]
+    s = _install([_ok(["a"], [])])                              # 0 行也不翻
+    assert len(tc.query("daily", trade_date="20260929")) == 0 and len(s.calls) == 1
+
+
+def test_has_more_from_server_overrides_row_count_heuristic():
+    """回包带 has_more: False → 恰 5000 行也不翻 (提前停); has_more: True → 不足一页也续, 直到 False; 字符串 'true'/'false' 也认; 0 行即停。"""
+    s = _install([_pg_ok(5000, has_more=False)])
+    assert len(tc.query("daily", trade_date="20260929")) == 5000 and len(s.calls) == 1
+    s = _install([_pg_ok(4000, has_more=True), _pg_ok(1000, 4000, has_more=True), _pg_ok(300, 5000, has_more=False)])
+    df = tc.query("daily", trade_date="20260929")
+    assert len(df) == 5300 and len(s.calls) == 3 and df.attrs["pages"] == 3
+    assert [c["json"]["params"].get("offset") for c in s.calls] == [None, 4000, 5000]
+    s = _install([_pg_ok(5000, has_more="false")])
+    assert len(tc.query("daily", trade_date="20260929")) == 5000 and len(s.calls) == 1
+    s = _install([_pg_ok(10, has_more="true"), _pg_ok(0, 10)])
+    assert len(tc.query("daily", trade_date="20260929")) == 10 and len(s.calls) == 2
+    assert tc._has_more({"has_more": 1}) is True and tc._has_more({"has_more": "0"}) is False
+    assert tc._has_more({"has_more": "maybe"}) is None and tc._has_more({}) is None and tc._has_more(None) is None
+
+
+def test_pages_are_merged_and_deduped_by_endpoint_primary_key(caplog):
+    """第二页里 5 行与第一页同 (ts_code, trade_date) (镜像翻页边界漂移) → 去重后 5554 行, INFO 行带「去重 5 行」; 没登记主键、也没有 ts_code+trade_date
+    的接口按整行去重; 登记了主键但回包缺列 (daily 没要 trade_date) → 整行去重。"""
+    s = _install([_pg_ok(5000), _pg_ok(559, 4995)])                     # 004995..004999 与第一页重复
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df = tc.query("adj_factor", trade_date="20260929")
+    assert len(df) == 5554 and df["ts_code"].is_unique and df.attrs["pages"] == 2 and len(s.calls) == 2
+    assert "tushare adj_factor: 分页 2 页 5554 行 (example.invalid), 去重 5 行 trade_date=20260929" in _page_lines(caplog)[0].getMessage()
+    s = _install([_ok(["a", "b"], [[f"{i}", "x"] for i in range(5000)]), _ok(["a", "b"], [["4999", "x"], ["5000", "y"]])])
+    df = tc.query("some_api", foo="bar")
+    assert len(df) == 5001 and len(s.calls) == 2
+    s = _install([_ok(["ts_code", "close"], [[f"{i:06d}.SZ", 1.0] for i in range(5000)]),
+                  _ok(["ts_code", "close"], [["004999.SZ", 1.0], ["005000.SZ", 2.0]])])
+    assert len(tc.query("daily", trade_date="20260929")) == 5001
+
+
+def test_caller_offset_or_limit_or_paginate_false_disables_auto_paging():
+    """调用方自己翻页 (传了 offset / limit —— 研究湖 lake._pages 的形态) 或 paginate=False → 恰 5000 行也不续页 (剧本只有一页, 多打一次就
+    AssertionError); paginate=True 带 limit 也按本站上限翻 (续页保留 limit, 只加 offset), 传了 offset 仍不翻。"""
+    for kw in ({"limit": 5000}, {"offset": 0}, {"limit": 5000, "offset": 0}, {"paginate": False}):
+        s = _install([_pg_ok(5000)])
+        assert len(tc.query("fina_indicator_vip", period="20260630", **kw)) == 5000, kw
+        assert len(s.calls) == 1 and "offset" not in s.calls[0]["json"]["params"] or "offset" in kw
+    s = _install([_pg_ok(5000), _pg_ok(10, 5000)])
+    df = tc.query("daily", trade_date="20260929", limit=5000, paginate=True)
+    assert len(df) == 5010
+    assert [c["json"]["params"] for c in s.calls] == [{"trade_date": "20260929", "limit": 5000},
+                                                       {"trade_date": "20260929", "limit": 5000, "offset": 5000}]
+    s = _install([_pg_ok(5000)])
+    assert len(tc.query("daily", trade_date="20260929", offset=0, paginate=True)) == 5000 and len(s.calls) == 1
+
+
+def test_stops_when_mirror_ignores_offset_or_rejects_it(caplog):
+    """镜像不认 offset (第二页原样回第一页) → 停, WARNING「镜像不认 offset」, 结果就是第一页 (去重后 5000 行), 不翻到 PAGE_MAX;
+    续页被拒参数 ([invalid_params]) → WARNING「不支持 offset 翻页」, 返回已拿到的页, 不抛; 续页传输失败重试耗尽 → 整次调用抛 (不返回被截断的表)。"""
+    s = _install([_pg_ok(5000), _pg_ok(5000)])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df = tc.query("daily", trade_date="20260929")
+    assert len(df) == 5000 and len(s.calls) == 2 and df.attrs["pages"] == 1
+    warn = [r for r in caplog.records if "镜像不认 offset" in r.getMessage()]
+    assert len(warn) == 1 and warn[0].levelno == logging.WARNING and "offset=5000" in warn[0].getMessage()
+    caplog.clear()
+    s = _install([_pg_ok(5000), _err("[invalid_params] 业务参数缺失或格式不合法", code=400)])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df = tc.query("daily", trade_date="20260929")
+    assert len(df) == 5000 and len(s.calls) == 2
+    assert any("不支持 offset 翻页" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+    s = _install([_pg_ok(5000), FakeResp({}, status=502), FakeResp({}, status=502), FakeResp({}, status=502)])
+    _no_sleep()
+    with pytest.raises(tc.TushareTransport):
+        tc.query("daily", trade_date="20260929")
+    assert len(s.calls) == 4
+
+
+def test_page_max_truncates_runaway_paging(monkeypatch, caplog):
+    """每页都不同却永远满页 → PAGE_MAX 截断 + WARNING (兜底, 正常接口到不了)。"""
+    monkeypatch.setattr(tc, "PAGE_MAX", 3)
+    s = _install([_pg_ok(5000, i * 5000) for i in range(4)])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df = tc.query("daily", trade_date="20260929")
+    assert len(df) == 15000 and len(s.calls) == 3 and df.attrs["pages"] == 3
+    assert any("翻到 3 页仍满页, 截断" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_page_limit_from_env_secrets_default_and_off(monkeypatch, caplog):
+    """page_limit(): 环境变量 TUSHARE_PAGE_LIMIT > secrets 键 tushare_page_limit > 缺省 5000; 非整数按缺省并 WARNING; 缓存; ≤ 0 关掉自动分页;
+    credentials(refresh=True) 清缓存重读; 上限 3000 时恰 3000 行翻、5000 行不翻 (多于上限 = 本站上限其实更高)。"""
+    monkeypatch.setattr(tc, "_read_secrets", lambda: {"tushare_page_limit": "2500"})
+    monkeypatch.setenv("TUSHARE_PAGE_LIMIT", "3000")
+    tc._PAGE_LIMIT = None
+    assert tc.page_limit() == 3000
+    monkeypatch.delenv("TUSHARE_PAGE_LIMIT")
+    assert tc.page_limit() == 3000                               # 缓存
+    tc._PAGE_LIMIT = None
+    assert tc.page_limit() == 2500
+    monkeypatch.setattr(tc, "_read_secrets", lambda: {"tushare_page_limit": "many"})
+    tc._PAGE_LIMIT = None
+    with caplog.at_level(logging.WARNING, logger="ashare.tushare"):
+        assert tc.page_limit() == tc.PAGE_LIMIT_DEFAULT == 5000
+    assert any("tushare_page_limit 不是整数" in r.getMessage() for r in caplog.records)
+    monkeypatch.setattr(tc, "_read_secrets", lambda: {})
+    tc._PAGE_LIMIT = None
+    assert tc.page_limit() == 5000
+    s = _install([_pg_ok(3000), _pg_ok(7, 3000)])
+    tc._PAGE_LIMIT = 3000
+    assert len(tc.query("daily", trade_date="20260929")) == 3007 and len(s.calls) == 2
+    s = _install([_pg_ok(5000)])
+    tc._PAGE_LIMIT = 3000
+    assert len(tc.query("daily", trade_date="20260929")) == 5000 and len(s.calls) == 1
+    s = _install([_pg_ok(5000)])
+    tc._PAGE_LIMIT = 0
+    assert len(tc.query("daily", trade_date="20260929")) == 5000 and len(s.calls) == 1
+    monkeypatch.setattr(tc, "_read_secrets", lambda: {"tushare_token": TOKEN, "tushare_base_url": PRIMARY, "tushare_page_limit": 4000})
+    for k in ("TUSHARE_TOKEN", "TUSHARE_BASE_URL", "TUSHARE_BASE_URL_BACKUP"):
+        monkeypatch.delenv(k, raising=False)
+    tc.credentials(refresh=True)
+    assert tc.page_limit() == 4000
+
+
+def test_each_page_goes_through_failover_counting_and_deadline(monkeypatch):
+    """每页都是一次完整的 _query_page: 第二页主站 502×3 → 切备用 → 在备用拿到 559 行 → 合并 5559 (基址切换对调用方透明);
+    每页都带同一个 deadline_sec 进硬期限执行器; 切换计数照算。"""
+    seen = []
+    real_call = tc._deadline_call
+
+    def spy(fn, args, kwargs, dl):
+        seen.append((args[0], args[1]["params"].get("offset"), dl))
+        return real_call(fn, args, kwargs, dl)
+
+    monkeypatch.setattr(tc, "_deadline_call", spy)
+    s, naps = _install_fo([_pg_ok(5000), FakeResp({}, status=502), FakeResp({}, status=503), FakeResp({}, status=502), _pg_ok(559, 5000)])
+    df = tc.query("daily", trade_date="20260929", deadline_sec=42)
+    assert len(df) == 5559 and _urls(s) == [PRIMARY] * 4 + [BACKUP]
+    assert seen == [(PRIMARY, None, 42), (PRIMARY, 5000, 42), (PRIMARY, 5000, 42), (PRIMARY, 5000, 42), (BACKUP, 5000, 42)]
+    assert tc.failover_state()["active"] is True and tc.failover_state()["switches"] == 1
+    assert naps == [tc.BACKOFF_SEC, tc.BACKOFF_SEC * 2]
+
+
+def test_direct_query_paginates_for_probe_backup():
+    """--probe-backup 的备用直调同样按上限分页 (否则备用 5000/5559 = 89.9% 过不了 ≥ 90% 的门): 两页 → 5559 行, 都打给定基址, 不碰切换状态;
+    调用方传了 limit 则不翻。"""
+    s, _ = _install_fo([_pg_ok(5000), _pg_ok(559, 5000)])
+    df = tc._direct_query(BACKUP, TOKEN, "daily", "ts_code,trade_date,close", {"trade_date": "20260929"})
+    assert len(df) == 5559 and df.attrs["pages"] == 2 and _urls(s) == [BACKUP, BACKUP]
+    assert s.calls[0]["json"]["params"] == {"trade_date": "20260929"} and s.calls[1]["json"]["params"] == {"trade_date": "20260929", "offset": 5000}
+    assert all(c["json"]["token"] == TOKEN and c["json"]["fields"] == "ts_code,trade_date,close" for c in s.calls)
+    assert tc.failover_state() == _FO_INITIAL
+    s, _ = _install_fo([_pg_ok(5000)])
+    assert len(tc._direct_query(BACKUP, TOKEN, "daily", "", {"trade_date": "20260929", "limit": 5000})) == 5000 and len(s.calls) == 1
+
+
+def test_probe_backup_passes_when_backup_needs_two_pages_per_day(monkeypatch):
+    """10-24 实况: 主站 kaixin8 一页回全市场 5559 行, 备用 datahubco 每天 5000 + 559 两页 → 8 次 HTTP, 备用 5559/5559 行 → rc 0;
+    备用 daily 行带「[分页 2 页]」; 不分页的旧判法是 5000/5559 = 89.9% < 90% → rc 1。secrets 不写 tushare_page_limit = 缺省 5000。"""
+    full_d, full_p = _daily_rows(5559, "20261013"), _daily_rows(5559, "20260928")
+    script = [_CAL_SPEC, _ok(_DAILY_COLS, full_d), _ok(_DAILY_COLS, full_p), _ok(["cal_date", "is_open"], _CAL),
+              _ok(_DAILY_COLS, full_d[:5000]), _ok(_DAILY_COLS, full_d[5000:]),
+              _ok(_DAILY_COLS, full_p[:5000]), _ok(_DAILY_COLS, full_p[5000:])]
+    s, naps, lines = _probe_setup(monkeypatch, script, page_limit=None)
+    rc = tc.probe_backup(out=lines.append, today=_TODAY)
+    text = "\n".join(lines)
+    assert rc == 0, text
+    assert _urls(s) == [PRIMARY] * 3 + [BACKUP] * 5 and len(s.calls) == 8
+    assert [c["json"]["params"].get("offset") for c in s.calls] == [None, None, None, None, None, 5000, None, 5000]
+    assert f"备用 daily {_D}: 5559 行 (100% of 主站), 与主站重合代码 5559/5559" in text and text.count("[分页 2 页]") == 2
+    assert f"daily {_D} 5559/5559 行" in text and f"daily {_P2} 5559/5559 行" in text and "结论 (rc 0)" in text
+    assert "硬期限执行器: 直调" in text and TOKEN not in text and naps == []
+    # 对照: 备用只给第一页、第二页 0 行 (镜像认 offset 但真的只有 5000 只) → 89.9% → rc 1
+    script = [_CAL_SPEC, _ok(_DAILY_COLS, full_d), _ok(_DAILY_COLS, full_p), _ok(["cal_date", "is_open"], _CAL),
+              _ok(_DAILY_COLS, full_d[:5000]), _ok(_DAILY_COLS, []), _ok(_DAILY_COLS, full_p[:5000]), _ok(_DAILY_COLS, [])]
+    s, naps, lines = _probe_setup(monkeypatch, script, page_limit=None)
+    assert tc.probe_backup(out=lines.append, today=_TODAY) == 1 and f"daily {_D} 行数 5000 < 主站 5559 × 0.9" in "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 进程池起不来 / 挂住 → 线程版硬期限 (卡 TS-PAGINATE 第 3 项; 10-24 GM 在非交互 Bash 里 --probe-backup 挂死到 300s)
+def _stub_datasource(monkeypatch, runner, **attrs):
+    """装一个假 ashare.datasource (sys.modules 与包属性都换 —— `from . import datasource` 走 _handle_fromlist, 包上有属性就不看 sys.modules)。"""
+    import ashare as _pkg
+    stub = types.ModuleType("ashare.datasource")
+    stub._call_with_deadline = runner
+    stub._POOL_DISABLED = False
+    for k, v in attrs.items():
+        setattr(stub, k, v)
+    monkeypatch.setitem(sys.modules, "ashare.datasource", stub)
+    monkeypatch.setattr(_pkg, "datasource", stub, raising=False)
+    return stub
+
+
+def _pool_lines(caplog):
+    return [r for r in caplog.records if "进程池硬期限不可用" in r.getMessage()]
+
+
+def test_pool_permission_error_falls_back_to_thread_deadline_once(monkeypatch, caplog):
+    """执行器建池抛 PermissionError [WinError 5] (计划任务 / 非交互 Bash 的 DuplicateHandle 形态) → WARNING 一行, 本次与余下调用走线程版硬期限
+    (结果正常), 执行器不再被碰, datasource._POOL_DISABLED 也被置 True; 回退后期限仍生效 (线程版到点抛 TimeoutError, 不 terminate 任何东西)。"""
+    hits = []
+
+    def boom(fn, args, kwargs, dl):
+        hits.append(dl)
+        raise PermissionError(5, "拒绝访问")
+
+    stub = _stub_datasource(monkeypatch, boom)
+    s = _install([_ok(["a"], [[1]]), _ok(["a"], [[2]])])
+    tc.USE_PROCESS_DEADLINE = True
+    try:
+        with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+            df = tc.query("daily", trade_date="20260929", deadline_sec=42)
+            df2 = tc.query("daily", trade_date="20260930", deadline_sec=42)
+    finally:
+        tc.USE_PROCESS_DEADLINE = False
+    assert len(df) == 1 and len(df2) == 1 and len(s.calls) == 2
+    assert hits == [42] and stub._POOL_DISABLED is True
+    st = tc.pool_state()
+    assert st["disabled"] is True and "PermissionError" in st["reason"] and TOKEN not in st["reason"]
+    lines = _pool_lines(caplog)
+    assert len(lines) == 1 and lines[0].levelno == logging.WARNING and "线程版硬期限" in lines[0].getMessage() and TOKEN not in caplog.text
+    import threading
+    gate = threading.Event()
+    tc.USE_PROCESS_DEADLINE = True
+    try:
+        with pytest.raises(TimeoutError) as ei:
+            tc._deadline_call(gate.wait, (), {}, 0.02)
+        assert "0.02" in str(ei.value) and "线程版" in str(ei.value) and "硬期限" in str(ei.value)
+    finally:
+        gate.set()
+        tc.USE_PROCESS_DEADLINE = False
+    assert hits == [42]                                         # 回退后再没碰执行器
+
+
+def test_pool_infra_errors_vs_business_errors(monkeypatch):
+    """_is_pool_infra_error: BrokenProcessPool / _PoolUnavailable / 裸 PermissionError·BrokenPipeError·EOFError = 池的; TimeoutError / TushareError /
+    requests 的异常 / 带 RemoteTraceback (工作进程里 fn 抛的) / 普通 OSError·RuntimeError = 业务的 → 原样进 query 的重试与分类, 不回退。"""
+    from concurrent.futures.process import BrokenProcessPool
+    from multiprocessing.pool import RemoteTraceback
+    import requests
+    assert tc._is_pool_infra_error(BrokenProcessPool("A child process terminated abruptly"))
+    assert tc._is_pool_infra_error(PermissionError(5, "拒绝访问")) and tc._is_pool_infra_error(BrokenPipeError()) and tc._is_pool_infra_error(EOFError("Ran out of input"))
+
+    class _PoolUnavailable(RuntimeError):
+        pass
+    assert tc._is_pool_infra_error(_PoolUnavailable("进程池已判定不可用"))
+    assert not tc._is_pool_infra_error(TimeoutError("x 超过 42s 硬期限")) and not tc._is_pool_infra_error(tc.TushareTransport("x"))
+    assert not tc._is_pool_infra_error(OSError("Connection refused")) and not tc._is_pool_infra_error(RuntimeError("业务"))
+    assert not tc._is_pool_infra_error(requests.exceptions.ConnectionError("x")) and not tc._is_pool_infra_error(ValueError("x"))
+    e = PermissionError(13, "fn 自己抛的")
+    e.__cause__ = RemoteTraceback("...")
+    assert not tc._is_pool_infra_error(e)
+
+    def fn_error(fn, args, kwargs, dl):
+        raise OSError("Connection refused")
+
+    _stub_datasource(monkeypatch, fn_error)
+    _install([])
+    _no_sleep()
+    tc.USE_PROCESS_DEADLINE = True
+    try:
+        with pytest.raises(tc.TushareTransport):
+            tc.query("daily", retries=2)
+    finally:
+        tc.USE_PROCESS_DEADLINE = False
+    assert tc.pool_state()["disabled"] is False
+
+
+def test_pool_machinery_hang_trips_watchdog_and_falls_back(monkeypatch, caplog):
+    """执行器自己不回来 (建池 / terminate 挂住: 10-24 形态) → 等 deadline_sec + POOL_GRACE_SEC 后判池机制挂死 → WARNING, 线程版拿到结果 (期限仍是
+    deadline_sec); 之后的调用不再碰执行器 (卡住的线程被弃)。"""
+    import threading
+    gate = threading.Event()
+    hits = []
+
+    def hang(fn, args, kwargs, dl):
+        hits.append(dl)
+        gate.wait(5)
+
+    stub = _stub_datasource(monkeypatch, hang)
+    monkeypatch.setattr(tc, "POOL_GRACE_SEC", 0.05)
+    s = _install([_ok(["a"], [[1]]), _ok(["a"], [[2]])])
+    tc.USE_PROCESS_DEADLINE = True
+    try:
+        with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+            t0 = tc.time.monotonic()
+            df = tc.query("daily", deadline_sec=0.05)
+            dt = tc.time.monotonic() - t0
+            df2 = tc.query("daily", deadline_sec=0.05)
+    finally:
+        gate.set()
+        tc.USE_PROCESS_DEADLINE = False
+    assert len(df) == 1 and len(df2) == 1 and len(s.calls) == 2 and hits == [0.05] and dt < 2
+    st = tc.pool_state()
+    assert st["disabled"] is True and "仍未从进程池机制返回" in st["reason"] and stub._POOL_DISABLED is True
+    assert len(_pool_lines(caplog)) == 1
+
+
+def test_pool_fallback_with_real_datasource_make_pool_permission_error(caplog):
+    """真 datasource: 建池 (_make_pool) 抛 PermissionError → 它自己兜住 (WARNING「进程池不可用」, _POOL_DISABLED) 并走它的线程版, Tushare 调用结果正常;
+    tushare_client 这侧不另告警 (异常没漏出来) —— 两层各管一段, 不打架。"""
+    from ashare import datasource as ds
+    ds._pool_reset()
+    orig_make, orig_flag = ds._make_pool, ds._POOL_DISABLED
+    ds._POOL_DISABLED = False
+    calls = []
+
+    def boom(ctx):
+        calls.append(1)
+        raise PermissionError(5, "拒绝访问")
+    ds._make_pool = boom
+    s = _install([_ok(["a"], [[1]]), _ok(["a"], [[2]])])
+    tc.USE_PROCESS_DEADLINE = True
+    try:
+        with caplog.at_level(logging.INFO):
+            df = tc.query("daily", trade_date="20260929")
+            df2 = tc.query("daily", trade_date="20260930")
+        flag_after = ds._POOL_DISABLED
+    finally:
+        tc.USE_PROCESS_DEADLINE = False
+        ds._make_pool = orig_make
+        ds._POOL_DISABLED = orig_flag
+        ds._pool_reset()
+    assert len(df) == 1 and len(df2) == 1 and len(s.calls) == 2 and calls == [1] and flag_after is True
+    ds_warn = [r for r in caplog.records if "进程池不可用" in r.getMessage() and r.name == "ashare.datasource"]
+    assert len(ds_warn) == 1 and not _pool_lines(caplog) and tc.pool_state()["disabled"] is False
+
+
+def test_probe_backup_warms_the_pool_first_and_reports_fallback(monkeypatch):
+    """--probe-backup 开头先热身 (_pool_ping, POOL_WARMUP_SEC): 执行器抛 PermissionError → 热身那一次就回退线程版, 6 次调用全在线程版里跑完 (rc 0),
+    输出「硬期限执行器: 线程版硬期限 (进程池不可用: PermissionError…)」; 热身只碰执行器一次。执行器健康 → 「进程池硬期限就绪」。"""
+    hits = []
+
+    def boom(fn, args, kwargs, dl):
+        hits.append((getattr(fn, "__name__", ""), dl))
+        raise PermissionError(5, "拒绝访问")
+
+    _stub_datasource(monkeypatch, boom)
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script())
+    tc.USE_PROCESS_DEADLINE = True
+    try:
+        rc = tc.probe_backup(out=lines.append, today=_TODAY)
+    finally:
+        tc.USE_PROCESS_DEADLINE = False
+    text = "\n".join(lines)
+    assert rc == 0, text
+    assert hits == [("_pool_ping", tc.POOL_WARMUP_SEC)] and len(s.calls) == 6
+    assert "硬期限执行器: 线程版硬期限 (进程池不可用: PermissionError" in text and TOKEN not in text
+    assert tc.pool_state()["disabled"] is True
+    _stub_datasource(monkeypatch, lambda fn, a, k, dl: fn(*a, **k))
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script())
+    tc.USE_PROCESS_DEADLINE = True
+    try:
+        rc = tc.probe_backup(out=lines.append, today=_TODAY)
+    finally:
+        tc.USE_PROCESS_DEADLINE = False
+    text = "\n".join(lines)
+    assert rc == 0 and "硬期限执行器: 进程池硬期限就绪 (本进程)" in text and tc.pool_state()["disabled"] is False
