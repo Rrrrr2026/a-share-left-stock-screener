@@ -25,8 +25,8 @@ PASS/WARN/FAIL 汇总表和**两档结论**。
 假日一例、开市日 D、按日那几次问的日子 P 都从内置表取, 与镜像无关。表没覆盖的年份 (国办通知还没出) 只核周末并
 WARN, 提醒补表。
 
-探什么 (默认 26 次调用, 财务不足一页时各多 1 次续页; `--max-calls` 只能 1..30 —— 硬上限 30, 超了拒跑 (退出码 2);
-用到上限就不再发, 剩下的判 SKIP = 未跑完):
+探什么 (默认 26 次调用, 财务不足一页时各多 1 次续页, 按日全市场端点恰满生产客户端单页上限时前两个各多 1 次 offset 续页 (见 ②);
+`--max-calls` 只能 1..30 —— 硬上限 30, 超了拒跑 (退出码 2); 用到上限就不再发, 剩下的判 SKIP = 未跑完):
   ① trade_cal: 区间 [今天-200 天, 今天+CAL_FWD_DAYS] 带/不带 is_open 各一次 —— 不带的那次逐自然日对照内置休市表
      (逐日一行、周末必 0、假日必 0、开市日必 1), 带的那次把镜像的**原样回包**喂给客户端 `tushare_client.trade_cal`
      回放 (打桩 query, 不联网), 回放结果必须等于内置表的开市日; 单日 周六 / 周日 / 假日 (内置表里今天及之前最近的
@@ -36,7 +36,13 @@ WARN, 提醒补表。
      「无视 trade_date、一律回最新一天」的镜像在最近开市日上与正确镜像分不出来。回包里只要有一行 trade_date ≠ P 就
      FAIL (生产 `market._rows_from_daily` / `fetch_adj_by_date` 不看 trade_date, 会把别日的行情/因子当成 P 写进价格库);
      再核行数 (过 `market._rows_from_daily` / keep_a_code 后与 stock_basic L 的 A 股只数比, 门槛 = 生产未就绪守卫的
-     ready_ratio)、字段集、因子是否覆盖每根日线;
+     ready_ratio)、字段集、因子是否覆盖每根日线; **单页上限** (卡 TS-PAGINATE-3): 全市场按日 daily / adj_factor / daily_basic 的行数恰等于
+     **生产客户端对该站的单页上限** (`tushare_client.page_limit(base)`: 环境变量 TUSHARE_PAGE_LIMIT > data/secrets.json 的 tushare_page_limit >
+     缺省 5000, 按站映射按 host 取) = 生产 `query()` 会带 offset 续页 —— 不再判「疑似单页上限截断」WARN, 写「客户端会分页 (上限 N)」, 并在计划
+     最后按顺序给前 PAGE_FOLLOW_MAX=2 个各加测一次 `offset=N` (`paging_check`): 续页与第一页无重复 = PASS, 行数 / 回包日期 / 因子覆盖按两页合起来判
+     (生产拿到的就是两页); 续页 0 行 = 该日就 N 行 (PASS); 续页与第一页有重复 (行序不稳 / 原样回第一页) / 续页 > N 行 / 拒 offset = FAIL (生产客户端
+     会抛 TushareTruncated, 当天不写库); 别的调用失败或没测成 = WARN; 第三个没单测的按同站已测续页的结论 (都正常 PASS, 否则 WARN)。行数恰为别的整数
+     (ROUND_CAPS) 而 ≠ 客户端上限 → WARN (客户端不会翻页: 若那是该站真实单页上限, 生产会静默少拉 → 在 tushare_page_limit 里按站配);
   ③ daily_basic 按 P (日期不符同样 FAIL: 生产估值兜底 `fetch_valuation_tushare` 也不看 trade_date) / stock_basic (L、D、
      P 各一次) / index_daily (区间截至 D + 单日 P; 指数不停牌, 区间缺开市日 = FAIL) / ths_daily 按 P (生产只认所问那天:
      别日的行 WARN, 当天的 .TI 一行没有 = FAIL) / fina_indicator_vip + income_vip (最近已过法定披露截止的一期,
@@ -111,7 +117,9 @@ LOOKBACK_DAYS = 200         # 区间日历往回看的自然日 (盖住最近两
 RANGE_OPEN_DAYS = 20        # 按 ts_code 区间取最近多少个开市日
 RANGE_CODE = "000001.SZ"    # 按 ts_code 区间的样本股 (平安银行, 极少停牌)
 SW_L1_FALLBACK = "801010.SI"  # 申万分类没拿到时, 成员/日线那两次用的 L1 (农林牧渔)
-ROUND_CAPS = (1000, 2000, 3000, 4000, 5000, 6000, 8000, 9000, 10000)   # 行数恰为整数 -> 疑似单页上限截断
+ROUND_CAPS = (1000, 2000, 3000, 4000, 5000, 6000, 8000, 9000, 10000)   # 行数恰为整数 (而 ≠ 生产客户端对该站的单页上限) -> 疑似单页上限截断
+PAGE_FOLLOW_MAX = 2         # 卡 TS-PAGINATE-3: 按日全市场端点第一页恰等于生产客户端单页上限时, 按计划顺序前这么多个各加测一次 offset 续页 (放在计划
+                            # 最后, 不挤前面的检查; 默认 26 + 财务续页 ≤ 2 + 它 ≤ 30 = MAX_CALLS)
 RATE_BACKOFF_SEC = 12.0     # 超频后重试前等多久 (= tushare_client.BACKOFF_RATE_SEC)
 PAST_DAY_MIN_AGE = 7        # 按日问的 P 至少在这么多自然日之前 (与最近开市日拉开, 测得出「无视 trade_date」的镜像)
 TOKEN_FRAG_MIN = 8          # token 的片段 >= 这么长也抹 (网关/镜像只回显了一截时)
@@ -788,7 +796,7 @@ class Prober:
         rec = {"id": rid, "label": label, "api": api,
                "params": {k: v for k, v in params.items() if v is not None}, "fields_req": fields or "",
                "kind": "SKIP", "http": None, "code": None, "msg": "", "secs": None, "rows": 0,
-               "fields": [], "items": [], "bytes": 0, "tries": 0, "first_fail": ""}
+               "fields": [], "items": [], "bytes": 0, "tries": 0, "first_fail": "", "has_more": None}
         self.records.append(rec)
         for attempt in (1, 2):
             if self.n >= self.max_calls:
@@ -816,7 +824,7 @@ class Prober:
 
     def _one(self, rec: dict, payload: dict, deadline: float) -> None:
         t = self.clock()
-        rec.update(http=None, code=None, msg="", rows=0, fields=[], items=[], bytes=0)
+        rec.update(http=None, code=None, msg="", rows=0, fields=[], items=[], bytes=0, has_more=None)
         try:
             out = self.post(self.base, payload, deadline)
         except TimeoutError:
@@ -850,6 +858,7 @@ class Prober:
         rec["fields"] = [str(x) for x in (d.get("fields") or [])]
         rec["items"] = list(d.get("items") or [])
         rec["rows"] = len(rec["items"])
+        rec["has_more"] = d.get("has_more") if isinstance(d, dict) else None
         rec["kind"] = "OK"
 
 
@@ -927,10 +936,74 @@ def latency_check(rec: dict, deadline: float, who: str = ""):
     return "PASS", f"延迟 {secs:.1f}s / {lab} {deadline:g}s"
 
 
-def round_cap_note(n: int, ref: int | None):
-    if n in ROUND_CAPS and (ref is None or n < ref):
-        return "WARN", f"行数恰为 {n}, 疑似镜像单页上限截断"
-    return None
+def client_page_limit(base: str) -> int:
+    """生产客户端对这个站的单页上限 (`tushare_client.page_limit(base)`: 环境变量 TUSHARE_PAGE_LIMIT > data/secrets.json 的 tushare_page_limit >
+    缺省 5000; {host: n} 映射按 base 的 host 取) —— 回包行数恰等于它, 生产 query() 才带 offset 续页。读不到 = 0 (当作客户端不分页)。"""
+    try:
+        from ashare import tushare_client as tsc
+        return int(tsc.page_limit(base))
+    except Exception:                                          # noqa: BLE001
+        return 0
+
+
+def paging_check(rec: dict, rec2, cap: int, sibling=None):
+    """按日全市场端点 (daily / adj_factor / daily_basic) 第一页的行数对照生产客户端对该站的单页上限 cap (卡 TS-PAGINATE-3)
+    -> (两页合起来的 rec 或 None, (级别, 文案) 或 None)。
+      · 行数 ≠ cap: 客户端不翻页 —— 只在行数恰为整数 (ROUND_CAPS) 时 WARN (若那是该站真实单页上限, 生产会静默少拉 → 按站配 tushare_page_limit)。
+      · 行数 = cap: 生产 query() 会带 offset=cap 续页 (钉同站; 登记了主键的接口续页与第一页有任何重复 = 行序不稳, 整次抛 TushareTruncated)。
+        rec2 = 探针加测的那次续页 (offset=cap): 0 行 → PASS (该日就 cap 行); 有行、与第一页无重复、不超 cap (或服务端给了 has_more) → PASS,
+        返回两页合起来的 rec (后面的行数 / 回包日期 / 因子覆盖都按两页判, 生产拿到的就是两页); 与第一页有重复 / 原样回第一页 / 超 cap / 拒 offset
+        (参数不合法) → FAIL (客户端会抛 TushareTruncated, 当天不写库); 别的调用失败 / 没测成 (调用上限 / 预算) → WARN; rec2 None (加测只给前
+        PAGE_FOLLOW_MAX 个) → 看同站已测的续页 (sibling): 都正常 (True) PASS, 有 FAIL (False) WARN「多半也会被判截断」, 没测成 (None) WARN。"""
+    if not rec or rec.get("kind") != "OK":
+        return None, None
+    n = int(rec.get("rows") or 0)
+    if cap <= 0 or n != cap:
+        if n in ROUND_CAPS:
+            if cap > 0:
+                return None, ("WARN", f"行数恰为 {n} (≠ 生产客户端对该站的单页上限 {cap}, 客户端不会翻页): 若这是该站真实的单页上限, 生产会静默少拉 —— "
+                                      f"在 secrets 的 tushare_page_limit 里按站配 {{\"<host>\": {n}}}")
+            return None, ("WARN", f"行数恰为 {n}, 疑似镜像单页上限截断 (生产客户端对该站的自动分页关着)")
+        return None, None
+    lead = f"恰为生产客户端单页上限 {cap} 行: 客户端会分页 (上限 {cap})"
+    if rec2 is None:
+        if sibling is True:
+            return None, ("PASS", lead + f"; 续页未单测 (加测只给前 {PAGE_FOLLOW_MAX} 个按日端点, 同站那几次续页正常)")
+        if sibling is False:
+            return None, ("WARN", lead + f"; 续页未单测 (加测只给前 {PAGE_FOLLOW_MAX} 个按日端点), 同站已测的续页不正常 —— 这个端点多半也会被客户端判分页截断")
+        return None, ("WARN", lead + "; 续页没测成, 判不了该站认不认 offset")
+    bad = call_level(rec2)
+    if bad:
+        if rec2.get("kind") == "BADPARAM":
+            return None, ("FAIL", lead + f"; 续页 offset={cap} 被拒 ({bad[1]}): 镜像不支持 offset 翻页 —— 生产客户端会抛 TushareTruncated, 当天不写库")
+        return None, ("WARN", lead + f"; 续页 offset={cap} 没测成 ({bad[1]}), 判不了该站认不认 offset")
+    k = int(rec2.get("rows") or 0)
+    if k == 0:
+        return None, ("PASS", lead + f"; 续页 offset={cap} 0 行 = 该日就 {cap} 行 (生产多一次 0 行调用)")
+
+    def key(r):
+        return str(r.get("ts_code")), _ymd(r.get("trade_date"))
+    first = {key(r) for r in _dicts(rec)}
+    rows2 = _dicts(rec2)
+    dup = sum(1 for r in rows2 if key(r) in first)
+    if dup:
+        same = dup == k == n
+        return None, ("FAIL", lead + f"; 续页 offset={cap} 回 {k} 行, 其中 {dup} 行与第一页重复"
+                      + (" (原样回第一页: 镜像不认 offset)" if same else " (行序不稳: 镜像每次排序不同 / 不认 offset)")
+                      + " —— 生产客户端会判分页截断 (TushareTruncated), 当天不写库")
+    try:
+        from ashare import tushare_client as tsc
+        more = tsc._has_more({"has_more": rec2.get("has_more")})
+    except Exception:                                          # noqa: BLE001
+        more = None
+    if k > cap and more is None:
+        return None, ("FAIL", lead + f"; 续页 offset={cap} 回 {k} 行 > 上限 {cap} (服务端没给 has_more): 上限配置与该站不符 —— "
+                              "生产客户端会判分页截断 (TushareTruncated)")
+    fields = list(rec.get("fields") or [])
+    merged = dict(rec, items=list(rec.get("items") or []) + [[r.get(f) for f in fields] for r in rows2], rows=n + k, pages=2)
+    if k >= cap:
+        return merged, ("WARN", lead + f"; 续页 offset={cap} 又回满 {k} 行 (与第一页无重复), 客户端会接着翻 —— 探针只测一页续页")
+    return merged, ("PASS", lead + f"; 续页 offset={cap} 回 {k} 行, 与第一页无重复, 两页合计 {n + k} 行")
 
 
 def combine(parts: list):
@@ -1186,14 +1259,14 @@ def check_stock_basic(recs: dict, expect: list, keep) -> tuple:
     return rows, listed_a, l_codes
 
 
-def check_by_date(item: str, rec: dict, day: str, expect: list, listed_a, ratio: float, parsed_n, extra=None):
+def check_by_date(item: str, rec: dict, day: str, expect: list, listed_a, ratio: float, parsed_n, extra=None, paging=None):
     """全市场按 trade_date 的端点 (daily / adj_factor): 回包日期必须全是所问那天 (生产不过滤, 不符 = FAIL),
-    行数 vs 在市 A 股 × ready_ratio。"""
+    行数 vs 在市 A 股 × ready_ratio。paging = paging_check 的结论 (单页上限 / 续页; 卡 TS-PAGINATE-3); 续页成了时 rec 是两页合起来的。"""
     bad = call_level(rec)
     if bad:
         return item, bad[0], bad[1]
-    parts = [field_check(rec, expect), retry_note(rec), round_cap_note(rec["rows"], None), date_check(rec, day)]
-    ev = f"{rec['rows']} 行, 生产解析后 A 股 {parsed_n}"
+    parts = [field_check(rec, expect), retry_note(rec), paging, date_check(rec, day)]
+    ev = f"{rec['rows']} 行" + (f" ({rec['pages']} 页)" if int(rec.get("pages") or 1) > 1 else "") + f", 生产解析后 A 股 {parsed_n}"
     if listed_a:
         r = parsed_n / listed_a
         ev += f" / 在市 A 股 {listed_a} = {r:.1%}"
@@ -1626,16 +1699,24 @@ def run_compat(args, post=None, now: dt.datetime | None = None, out=print, sleep
         r_swd = pr.call("W03", f"{l1} {r_start}..{D}", "sw_daily",
                         {"ts_code": l1, "start_date": _ymd(r_start), "end_date": _ymd(D)},
                         _fields_arg(E("sw_daily")), dl("sw_daily"))
+    # ② 续页 (卡 TS-PAGINATE-3): 按日全市场端点第一页恰等于生产客户端对该站的单页上限 → 生产 query() 会带 offset 续页; 按计划顺序前 PAGE_FOLLOW_MAX 个
+    #    各加测一次 offset=<上限> (放在计划最后, 不挤前面的检查; 调用上限 30 照旧封顶, 用完的判「没测成」WARN)
+    cap = client_page_limit(base)
+    follow = {}
+    for rid, api, rec in (("B01", "daily", r_daily), ("B02", "adj_factor", r_adj), ("V01", "daily_basic", r_db)):
+        if cap > 0 and rec["kind"] == "OK" and rec["rows"] == cap and len(follow) < PAGE_FOLLOW_MAX:
+            follow[api] = pr.call(f"{rid}c", f"全市场 {pday} offset={cap}", api, {"trade_date": _ymd(pday), "offset": cap},
+                                  _fields_arg(E(api)), dl(api))
 
     # ④ 逐次调用 ---------------------------------------------------------------------------------------------
     out(f"\n④ 逐次调用 ({pr.n} 次 / 上限 {max_calls}; 延迟 = 工作进程里量的 HTTP 往返+下载)")
-    out(f"  {'#':<4}{'端点':<20}{'参数':<34}{'结果':<9}{'HTTP':>5}{'code':>6}{'行':>7}{'列':>5}{'秒':>8}{'KB':>8}")
+    out(f"  {'#':<5}{'端点':<20}{'参数':<34}{'结果':<9}{'HTTP':>5}{'code':>6}{'行':>7}{'列':>5}{'秒':>8}{'KB':>8}")
     for r in pr.records:
         res = r["kind"] + ("*" if r["first_fail"] else "")
         secs = "-" if r["secs"] is None else "%.2f" % r["secs"]
         code = "-" if r["code"] is None else str(r["code"])
         tail = ("  " + r["msg"][:60]) if r["msg"] and r["kind"] != "OK" else ""
-        out(f"  {r['id']:<4}{r['api']:<20}{r['label'][:33]:<34}{res:<9}{str(r['http'] or '-'):>5}"
+        out(f"  {r['id']:<5}{r['api']:<20}{r['label'][:33]:<34}{res:<9}{str(r['http'] or '-'):>5}"
             f"{code:>6}{r['rows']:>7}{len(r['fields']):>5}{secs:>8}{r['bytes'] / 1024:>8.0f}{tail}")
     if any(r["first_fail"] for r in pr.records):
         out("  * = 首发失败, 重试成功 (也算调用数)")
@@ -1661,20 +1742,29 @@ def run_compat(args, post=None, now: dt.datetime | None = None, out=print, sleep
     sb_rows, listed_a, _ = check_stock_basic(sb_recs, E("stock_basic")["expect"], mk.keep_a_code)
     for item, lv, ev, recs in sb_rows:
         add(item, lv, ev, "stock_basic", *recs)
+    # 单页上限 / 续页 (卡 TS-PAGINATE-3): 恰满生产客户端上限的按日端点, 续页成了就按两页合起来判 (生产拿到的就是两页)
+    by_date = (("daily", r_daily), ("adj_factor", r_adj), ("daily_basic", r_db))
+    pg = {api: paging_check(rec, follow[api], cap) for api, rec in by_date if api in follow}
+    lv_tested = [note[0] for _, note in pg.values() if note]
+    sib = False if "FAIL" in lv_tested else (True if lv_tested and set(lv_tested) == {"PASS"} else None)
+    for api, rec in by_date:
+        if api not in pg:
+            pg[api] = paging_check(rec, None, cap, sibling=sib)
+    r_daily_v, r_adj_v, r_db_v = (pg["daily"][0] or r_daily), (pg["adj_factor"][0] or r_adj), (pg["daily_basic"][0] or r_db)
     # daily 全市场: 生产解析 = market._rows_from_daily (价格合法性过滤 + A 股代码)
     parsed_daily, daily_codes = 0, set()
-    if r_daily["kind"] == "OK":
+    if r_daily_v["kind"] == "OK":
         try:
             import pandas as pd
-            rows_ = mk._rows_from_daily(pd.DataFrame(r_daily["items"], columns=r_daily["fields"] or None))
+            rows_ = mk._rows_from_daily(pd.DataFrame(r_daily_v["items"], columns=r_daily_v["fields"] or None))
             parsed_daily, daily_codes = len(rows_), set(rows_)
         except Exception as e:                                 # noqa: BLE001
-            parsed_daily = a_code_count(r_daily, mk.keep_a_code)[0]
+            parsed_daily = a_code_count(r_daily_v, mk.keep_a_code)[0]
             out(f"  · daily 生产解析回放失败 ({type(e).__name__}), 退回只数 A 股代码")
-    add(*check_by_date(f"daily 按 trade_date {pday}", r_daily, pday, E("daily")["expect"], listed_a,
-                       th["ready_ratio"], parsed_daily), "daily", r_daily)
+    add(*check_by_date(f"daily 按 trade_date {pday}", r_daily_v, pday, E("daily")["expect"], listed_a,
+                       th["ready_ratio"], parsed_daily, paging=pg["daily"][1]), "daily", r_daily, follow.get("daily"))
     adj_codes = set()
-    for r in _dicts(r_adj):
+    for r in _dicts(r_adj_v):
         c = mk.keep_a_code(r.get("ts_code"))
         try:
             if c and float(r.get("adj_factor")) > 0:
@@ -1682,24 +1772,27 @@ def run_compat(args, post=None, now: dt.datetime | None = None, out=print, sleep
         except (TypeError, ValueError):
             pass
     cover = None
-    if daily_codes and r_adj["kind"] == "OK":
+    if daily_codes and r_adj_v["kind"] == "OK":
         lack = daily_codes - adj_codes
         cover = (("WARN" if len(lack) > 0.01 * len(daily_codes) else "PASS"),
                  f"日线 {len(daily_codes)} 只里缺因子 {len(lack)} 只")
-    add(*check_by_date(f"adj_factor 按 trade_date {pday}", r_adj, pday, E("adj_factor")["expect"], listed_a,
-                       th["ready_ratio"], len(adj_codes), cover), "adj_factor", r_adj)
+    add(*check_by_date(f"adj_factor 按 trade_date {pday}", r_adj_v, pday, E("adj_factor")["expect"], listed_a,
+                       th["ready_ratio"], len(adj_codes), cover, paging=pg["adj_factor"][1]), "adj_factor", r_adj,
+        follow.get("adj_factor"))
     # daily_basic (生产估值兜底不看 trade_date: 日期不符 = FAIL)
     item = f"daily_basic 按 trade_date {pday}"
-    bad = call_level(r_db)
+    bad = call_level(r_db_v)
     if bad:
         add(item, bad[0], bad[1], "daily_basic", r_db)
     else:
-        parts = [field_check(r_db, E("daily_basic")["expect"]), retry_note(r_db), round_cap_note(r_db["rows"], None),
-                 date_check(r_db, pday)]
-        if r_db["rows"] < th["db_min_rows"]:
+        parts = [field_check(r_db_v, E("daily_basic")["expect"]), retry_note(r_db_v), pg["daily_basic"][1],
+                 date_check(r_db_v, pday)]
+        if r_db_v["rows"] < th["db_min_rows"]:
             parts.append(("FAIL", f"< 生产门槛 {th['db_min_rows']} 行: 估值兜底会判当日没出、退回前一交易日"))
         lv, txt = combine(parts)
-        add(item, lv, f"{r_db['rows']} 行 (门槛 {th['db_min_rows']}); {txt}", "daily_basic", r_db)
+        pages = int(r_db_v.get("pages") or 1)
+        add(item, lv, f"{r_db_v['rows']} 行" + (f" ({pages} 页)" if pages > 1 else "") + f" (门槛 {th['db_min_rows']}); {txt}",
+            "daily_basic", r_db, follow.get("daily_basic"))
     # index_daily: 区间 (指数不停牌, 缺开市日 = FAIL) + 单日 P (生产按日期筛)
     add(*check_range(f"index_daily {bench} 区间 {r_start}..{D}", r_idx, rng_days, E("index_daily")["expect"],
                      r_start, D, index=True), "index_daily", r_idx)

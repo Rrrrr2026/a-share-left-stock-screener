@@ -64,18 +64,28 @@ offset 续拉, 直到不足一页 / 0 行 / 服务端 has_more=False (回包里�
 `paginate=True` 带 limit 也按本站上限翻。**一次 query() 的所有页钉在同一个站**: 第一页经切换机制选站, 续页只打第一页那个站 (不试探主站、不跟着切换 / 回切
 过去 —— 两站行集与行序不同, 跨站按 offset 拼页会静默丢行, 校验员 10-24 E1/E2 实证), 失败计数照记, 切换 / 回切只在 query() 之间生效 (「每 20 次调用试探」
 按 query() 数)。**截断一律抛 `TushareTruncated`** (带已拿到行数 / 页数 / 原因, 先打一行 WARNING「分页截断」), 不拼不同站的页也不返回截断表: 续页在钉住的站
-失败耗尽 (或该站被判切换) / 镜像拒 offset (BadParams) / 镜像不认 offset (原样回上一页, 或续页去重后没有新行 —— 行序不稳的镜像) / 续页行数 > 上限
-(上限配置与本站不符) / PAGE_MAX 到顶; 调用方 (pricestore update / datasource daily_basic / 湖 pull_daily_basic / bulk) 都把异常当失败, 当天不写、下次再补。
+失败耗尽 (或该站被判切换) / 镜像拒 offset (BadParams) / 镜像不认 offset (原样回上一页, 或续页去重后一行新的都没有) / **续页与已拿到的行重复 = 行序不稳**
+(10-25 卡 TS-PAGINATE-3: PAGE_KEYS 登记了主键的接口, 续页里只要有一行的主键已出现过就判 —— 稳定的镜像不会把同一主键给两页; 没登记、按 ts_code+trade_date
+或整行去重的接口, 去重后新增不足续页的一半才判。以前只认「一行新的都没有」: 认 offset 但每次排序不同的镜像, 续页大半与前页重复时静默返回并集, 少几百只
+还过得了 pricestore 的 90% 守卫, 校验员 T1) / 续页行数 > 上限 (上限配置与本站不符) / PAGE_MAX 到顶; 调用方 (pricestore update / datasource daily_basic /
+湖 pull_daily_basic / bulk) 都把异常当失败, 当天不写、下次再补。
 `--probe-backup` 的备用直调 (`_direct_query`) 同样分页, 否则备用 5000/5559 = 89.9% 永远过不了 ≥ 90% 的门。
 
-进程池回退 (同卡; 10-25 TS-PAGINATE-2 改宽限): `_deadline_call` 把 datasource 的进程级硬期限跑在一个看门线程里, 先等 deadline_sec + POOL_GRACE_SEC (30s,
-给提交 / 排队 / terminate); 到点没回来而 datasource 的池**还没建成** (`_POOL is None`: 首次调用或上次超时 terminate 之后) → 再给它自己的建池预算
-(`_POOL_DOA_WAIT_SEC + _POOL_PROBE_SEC` = 2 + 90s, 从 datasource 常量读, 不写死) —— 池建得慢 ≠ 池机制挂住 (校验员 10-24 D3: 30s 宽限小于建池预算, 慢但健康的
-池会被误判); 池已建成却不回来、或建池预算也用完 = 池机制挂住 (10-24 GM 在非交互 Bash 里跑 --probe-backup: spawn 报 PermissionError [WinError 5] 后
-Pool.terminate 不回来, 挂到外层 300s 超时), 或从池机制抛出基础设施异常 (PermissionError / BrokenPipeError / EOFError / BrokenProcessPool /
-datasource._PoolUnavailable; 工作进程里 fn 自己抛的异常带 RemoteTraceback, 不算) → WARNING 一行, 本进程余下 Tushare 调用永久改走线程版硬期限
-(`_thread_call`, 期限仍生效), 并把 datasource._POOL_DISABLED 置 True (与 09-05 datasource「基础设施异常一次即永久回退线程版」同口径, 让 akshare 那侧也别再碰
-可能已挂住的池)。`--probe-backup` 开头先用一次 `_pool_ping` (POOL_WARMUP_SEC) 把这条路走通, 池坏了在那里就回退 (最坏 20 + 30 + 92 ≈ 142s), 后面 6 次不再各等一轮。
+进程池回退 (同卡; 10-25 TS-PAGINATE-2 改宽限, 同日 TS-PAGINATE-3 改判据): `_deadline_call` 把 datasource 的进程级硬期限跑在一个看门线程里, **分两段计时、
+各从该段开始时算**: 「取池」段 —— datasource 的池还没建成 (`_POOL is None`: 首次调用或上次超时 terminate 之后) 时, 工作线程先替它的执行器取池 (`ds._pool()`:
+建池, 或等别的线程建完), 上限 = 它自己的建池预算 (`_POOL_DOA_WAIT_SEC + _POOL_PROBE_SEC` = 2 + 90s, 从 datasource 常量读, 不写死) + POOL_GRACE_SEC (30s);
+「调用」段 —— 池已到手, 执行器提交并等结果, 上限 = deadline_sec + 30s (给提交 / 排队 / terminate)。上一版从调用开始统一按 deadline + 宽限计、到点只看
+`_POOL is None`: 池在检查点之前刚建好、随后的调用又接近期限 (建池 45s 健康 + kaixin8 daily 110s) 照样被判挂死 → 永久回退线程版 + 置 datasource._POOL_DISABLED
++ 同一请求重发 (校验员 10-25 W1)。某段到点还没回来先做**二次探针** (`_pool_alive`): 往 datasource 当前的池直接投一个 os.getpid (1ms 的活; 不经 _call_with_deadline,
+那条路超时会 terminate 整池), POOL_PING_SEC=10s 内回了 = 池机制活着、只是慢; 没回但工作进程都活着且任务占满 = 正忙; 池不在而「调用」段里有线程持着建池锁
+= 正在重建 —— 这三种不回退, 再等一轮 (一次调用最多 POOL_EXTEND_MAX=1 轮: 正在重建 = 建池预算 + deadline_sec + 30s, 其余 deadline_sec + 30s)。**探针也不回**
+(池对象拒收 / 不作答; 池不在且没有线程在建 = 刚 terminate 却不回来; 「取池」段给足建池预算后建池锁仍被持着) 或那一轮也用完 = 池机制挂住 (10-24 GM 在非交互 Bash
+里跑 --probe-backup: spawn 报 PermissionError [WinError 5] 后 Pool.terminate 不回来, 挂到外层 300s 超时), 或从池机制抛出基础设施异常 (PermissionError /
+BrokenPipeError / EOFError / BrokenProcessPool / datasource._PoolUnavailable; 工作进程里 fn 自己抛的异常带 RemoteTraceback, 不算) → WARNING 一行, 本进程余下
+Tushare 调用永久改走线程版硬期限 (`_thread_call`, 期限仍生效), 并把 datasource._POOL_DISABLED 置 True (与 09-05 datasource「基础设施异常一次即永久回退线程版」
+同口径, 让 akshare 那侧也别再碰可能已挂住的池)。池机制真挂时第一次调用多等: 建池挂住 92 + 30 ≈ 122s (上一版 deadline + 30 + 92 ≈ 242s); 池到手后 terminate 挂住
+deadline_sec + 30s; 探针把挂住误看成「活着」时再多一轮。`--probe-backup` 开头先用一次 `_pool_ping` (POOL_WARMUP_SEC=20s) 把这条路走通, 池坏了在那里就回退
+(建池挂住 ≈ 122s; 池建好后挂住 建池用时 + 20 + 30s), 后面 6 次不再各等一轮。
 
 本模块提供:
     available()                      -> 是否配了 token
@@ -140,9 +150,11 @@ PAGE_KEYS = {               # 合并去重的主键 (列齐才用); 没登记的
     "ths_daily": ("ts_code", "trade_date"), "index_daily": ("ts_code", "trade_date"), "sw_daily": ("ts_code", "trade_date"),
     "stock_basic": ("ts_code",), "trade_cal": ("exchange", "cal_date"),
 }
-POOL_GRACE_SEC = 30         # 进程级硬期限之外再给池机制这么久 (提交 / 排队 / terminate); 池还没建成时另加 datasource 自己的建池预算 (_pool_build_budget: DOA 2s +
-                            # 就绪探针 90s, 从 datasource 常量读) —— 都用完还没回来才判「池机制挂死」, 回退线程版 (10-24 非交互 Bash 的 WinError 5 形态)
-POOL_WARMUP_SEC = 20        # --probe-backup 开头的进程池热身 (_pool_ping) 期限: 健康的 spawn 池 5–8s 就绪 (2s DOA 等待 + 起解释器 + 导入); 超过它 + 宽限 (+ 建池预算) 即回退线程版
+POOL_GRACE_SEC = 30         # 看门线程每段健康上限之外再给池机制这么久 (提交 / 排队 / terminate): 「取池」段 = datasource 建池预算 (_pool_build_budget: DOA 2s + 就绪探针 90s,
+                            # 从 datasource 常量读) + 它, 「调用」段 = deadline_sec + 它; 到点没回来先做二次探针 (_pool_alive), 探针也不回才判「池机制挂住」回退线程版
+POOL_PING_SEC = 10          # 二次探针: 往池里直接投一个 os.getpid 最多等这么久 (健康的池 ~1ms; 工作进程都在忙时它排在后面 —— 那种看工作进程是否都活着、任务是否占满)
+POOL_EXTEND_MAX = 1         # 二次探针说池没挂 (作答 / 正忙 / 正在重建) 时一次调用最多再等几轮; 用完仍不回 = 池机制挂住 (保证看门线程有界)
+POOL_WARMUP_SEC = 20        # --probe-backup 开头的进程池热身 (_pool_ping) 期限: 健康的 spawn 池 5–8s 就绪 (2s DOA 等待 + 起解释器 + 导入); 池机制挂住时按 _deadline_call 的两段计时回退线程版
 
 #: 测试用: 置 False 后在本进程内直调 (进程池里 mock 的 session 不生效)。生产恒为 True。
 USE_PROCESS_DEADLINE = True
@@ -186,8 +198,9 @@ class TushareBadParams(TushareError):
 
 
 class TushareTruncated(TushareError):
-    """分页截断 (2026-10-25 卡 TS-PAGINATE-2): 第一页恰满本站单页上限, 续页却拿不全 —— 续页在钉住的站失败耗尽 (或该站被判切换) / 镜像拒 offset /
-    镜像不认 offset (原样回上一页, 或续页去重后没有新行) / 续页行数 > 上限 / PAGE_MAX 到顶。**不返回截断表** (全市场按日端点少 ~560 只会被 pricestore 的
+    """分页截断 (2026-10-25 卡 TS-PAGINATE-2; 同日 TS-PAGINATE-3 补「行序不稳」): 第一页恰满本站单页上限, 续页却拿不全 —— 续页在钉住的站失败耗尽
+    (或该站被判切换) / 镜像拒 offset / 镜像不认 offset (原样回上一页, 或续页去重后没有新行) / 续页与已拿到的行重复 (行序不稳: 登记了主键的接口任一重复,
+    没登记的新增不足续页一半) / 续页行数 > 上限 / PAGE_MAX 到顶。**不返回截断表** (全市场按日端点少 ~560 只会被 pricestore 的
     90% 守卫放过去写死进库), 整次 query() 抛这个 (TushareError 的直接子类, 不是 Transport: 不该被当成「可重试的传输抖动」原地重试);
     rows / pages = 已拿到的行数 / 页数, reason = 原因 (都不含 token); 续页失败时 __cause__ 带原始异常。调用方 (pricestore update / datasource
     daily_basic / 湖 pull_daily_basic / bulk) 走各自现有的异常路径把它当失败: 当天不写、下次再补。"""
@@ -755,24 +768,90 @@ def _pool_build_budget(ds) -> float:
         return 0.0
 
 
-def _pool_not_built(ds) -> bool:
-    """datasource 的池还没建成 (首次调用 / 上一次硬期限超时 terminate 之后): `_POOL is None`。这时「还没回来」可能只是建池慢 (spawn 起解释器 + 导入 +
-    就绪探针), 看门线程再给它建池预算; 池已建成却不回来才是池机制挂住。"""
-    return getattr(ds, "_POOL", None) is None
+def _pool_acquire_failed(ds, e) -> None:
+    """工作线程替执行器取池 (`ds._pool()`) 时抛了: 按执行器 `_call_with_deadline` 自己碰到时的口径收尾, 让它随后直接走 datasource 的线程版、**不再建一次池**
+    (卡 TS-PAGINATE-3) —— 已判不可用 (就绪探针失败时 _pool() 自己 _disable_pool 过) 什么都不做; 建池 / 提交阶段的基础设施异常 (它的 _POOL_INFRA_ERRORS;
+    _make_pool 抛 PermissionError [WinError 5] 那一行在 _pool() 的 try 外面, 它自己不告警) → `ds._disable_pool("建池/提交", e)` (告警一次、置 _POOL_DISABLED,
+    与它自己碰到时同一句); 别的异常原样抛 (它自己碰到也是原样抛)。tushare 这侧不另告警 —— 两层各管一段。"""
+    if getattr(ds, "_POOL_DISABLED", False):
+        return
+    disable = getattr(ds, "_disable_pool", None)
+    if isinstance(e, getattr(ds, "_POOL_INFRA_ERRORS", (OSError, EOFError, RuntimeError))) and callable(disable):
+        disable("建池/提交", e)
+        return
+    raise e
+
+
+def _pool_lock_held(ds):
+    """datasource 的建池锁此刻有没有线程持着 (有 = 有线程正在 _pool() 里建池 / 收拾建坏的池) -> True / False / None (看不到锁)。只试取, 不等。"""
+    get = getattr(ds, "_pool_lock", None)
+    if not callable(get):
+        return None
+    try:
+        lk = get()
+        if lk.acquire(blocking=False):
+            lk.release()
+            return False
+        return True
+    except Exception:           # noqa: BLE001
+        return None
+
+
+def _pool_busy(p) -> bool:
+    """池正忙 (二次探针没轮上时看): 状态 RUN、工作进程都活着、在跑 + 排队的任务 (不算探针自己) ≥ 工作进程数 —— 探针排在别的任务后面, 不是池机制挂住。
+    读的是 multiprocessing.pool.Pool 的 _state / _pool / _cache (3.8–3.14 不变); 读不到一律算不忙。"""
+    try:
+        workers = list(getattr(p, "_pool", None) or [])
+        return (str(getattr(p, "_state", "")) == "RUN" and bool(workers) and all(w.is_alive() for w in workers)
+                and len(getattr(p, "_cache", None) or ()) > len(workers))
+    except Exception:           # noqa: BLE001
+        return False
+
+
+def _ping_pool(p, wait):
+    """二次探针的那一下 (在探针自己的线程里跑): 往池 p 直接投一个 os.getpid, 最多等 wait 秒 -> 工作进程的 pid。"""
+    return p.apply_async(os.getpid).get(timeout=wait)
+
+
+def _pool_alive(ds, seg: str) -> tuple:
+    """二次探针 (卡 TS-PAGINATE-3) -> (池机制活着?, 说明, 正在重建?)。看门线程某段到点没等到结果时调用; 探针在自己的守护线程里跑, 最多 POOL_PING_SEC + 1 秒,
+    看门线程不会被它卡住。
+    ① datasource 的池在 (`_POOL` 不是 None): 直接往**这个池**投一个 os.getpid (1ms 的活; 不经 _call_with_deadline —— 那条路超时会 terminate 整池, 连带在途的
+       健康请求), POOL_PING_SEC 内回了 = 活着 (只是慢); 没回但池正忙 (`_pool_busy`) = 活着; 拒收 / 不作答 = 挂住。
+    ② 池不在: seg="call" 而建池锁有线程持着 = 正在重建 (活着; 健康的建池有建池预算封顶); seg="pool" 时建池预算已经给足, 锁还被持着 = 建池 / 收拾建坏的池
+       不回来; 没有线程持锁 = 池刚被 terminate 却不回来 (10-24 WinError 5 形态: Pool.terminate 等一个死掉的 handler 线程) —— 都算挂住。"""
+    p = getattr(ds, "_POOL", None)
+    if p is None:
+        held = _pool_lock_held(ds)
+        if held and seg == "call":
+            return True, "池正在重建 (建池锁有线程持着)", True
+        return False, ("池不在, 给足建池预算后建池锁仍被持着 (建池 / 收拾建坏的池不回来)" if held
+                       else "池不在、也没有线程在建 (刚 terminate 却不回来, 或从没建成)"), False
+    t0 = time.monotonic()
+    try:
+        pid = _thread_call(_ping_pool, (p, POOL_PING_SEC), {}, POOL_PING_SEC + 1, "os.getpid 探针线程没回来")
+    except Exception as e:      # noqa: BLE001
+        if _pool_busy(p):
+            return True, f"os.getpid 探针 {POOL_PING_SEC:g}s 没轮上, 但工作进程都活着且任务占满 (正忙)", False
+        return False, f"os.getpid 探针 {POOL_PING_SEC:g}s 未应答 ({type(e).__name__})", False
+    return True, f"os.getpid 探针 {1000 * (time.monotonic() - t0):.0f}ms 应答 (工作进程 pid {pid})", False
 
 
 def _deadline_call(fn, args, kwargs, deadline_sec):
-    """把一次调用交给 `ashare.datasource` 的**进程级**墙钟期限跑, 外面再套一层看门线程 (2026-10-24 卡 TS-PAGINATE; 10-25 TS-PAGINATE-2 改宽限)。
+    """把一次调用交给 `ashare.datasource` 的**进程级**墙钟期限跑, 外面再套一层看门线程 (2026-10-24 卡 TS-PAGINATE; 10-25 TS-PAGINATE-2 改宽限,
+    同日 TS-PAGINATE-3 改判据)。
 
     懒导入是为了避开 datasource -> market -> tushare_client 的循环导入; 脱离仓库单跑 (或 datasource 导不进来) 时退化为直调, 不让基础设施问题
     变成功能缺失。优先用 `_call_with_deadline` 而不是公开的 `call_with_retry`: 后者在超时路径上会顺手把**东财**标记为不可用 —— Tushare 挂了
     不该冤枉东财 (它还是兜底源)。
-    看门线程: datasource 的执行器在自己的线程里跑, 本线程先等 deadline_sec + POOL_GRACE_SEC —— 正常情况它在 deadline_sec 内要么返回要么抛
-    TimeoutError (硬期限), 多等的 30s 给池机制的提交 / 排队 / terminate; 到点还没回来时看 datasource 的池建成没有: **还没建成** (`_pool_not_built`) 就再等
-    它自己的建池预算 (`_pool_build_budget` = DOA 2s + 就绪探针 90s, 从 datasource 常量读) —— 池建得慢 ≠ 池机制挂住 (以前只给 30s, 比建池预算 2 + 90s 短,
-    慢但健康的池会被误判挂死、永久回退并重发请求: 校验员 10-24 D3); 池已建成却不回来、或建池预算也用完 = 池机制挂死 (10-24 非交互 Bash: spawn 子进程
-    PermissionError [WinError 5] 后 Pool.terminate 等一个死掉的 handler 线程, 永不返回), 或它抛出池机制自己的异常 (_is_pool_infra_error) →
-    `_disable_pool_side` 一次, 本次与余下调用改走 `_thread_call` (期限仍是 deadline_sec)。fn 自己的异常与硬期限 TimeoutError 原样抛。"""
+    看门线程**分两段计时, 各从该段开始时算** (模块 docstring「进程池回退」): datasource 的池还没建成时先过「取池」段 —— 工作线程替执行器调一次 `ds._pool()`
+    (建池, 或等别的线程建完; 池起不来按执行器自己的口径收尾, 见 _pool_acquire_failed), 上限 = 建池预算 (`_pool_build_budget`) + POOL_GRACE_SEC; 池到手后进
+    「调用」段 (执行器提交并等结果, 它的硬期限 deadline_sec 从这里起算), 上限 = deadline_sec + POOL_GRACE_SEC。上一版从调用开始统一计、到点只看
+    `_POOL is None`: 池在检查点前刚建好、随后的调用又接近期限就被误判挂死 (校验员 10-25 W1)。某段到点没回来先做二次探针 (`_pool_alive`): 池能作答 / 正忙 /
+    正在重建 → 不回退, 再等一轮 (最多 POOL_EXTEND_MAX 轮; 探针那几秒里结果到了就直接用, 进了下一段就按新段重新计时); 探针也不回或那一轮也用完 = 池机制挂住 (10-24 非交互 Bash: spawn 子进程 PermissionError
+    [WinError 5] 后 Pool.terminate 等一个死掉的 handler 线程, 永不返回), 或它抛出池机制自己的异常 (_is_pool_infra_error) → `_disable_pool_side` 一次,
+    本次与余下调用改走 `_thread_call` (期限仍是 deadline_sec)。fn 自己的异常与硬期限 TimeoutError 原样抛。fn 要是模块级、可 pickle 的 (生产恒是:
+    _post_json / _pool_ping / 探针的 _raw_post) —— 不可 pickle 的执行器自己走线程版, 「取池」那一步就白建了池。"""
     if not USE_PROCESS_DEADLINE:
         return fn(*args, **kwargs)
     name = getattr(fn, "__name__", "call")
@@ -785,37 +864,59 @@ def _deadline_call(fn, args, kwargs, deadline_sec):
         log.debug("datasource 不可用 (%s), 硬期限降级为直调", type(e).__name__)
         return fn(*args, **kwargs)
     runner = getattr(ds, "_call_with_deadline", None)
-    if runner is None:          # 私有入口若被重构掉, 退回公开入口 (仍是进程级期限)
+    acquire = getattr(ds, "_pool", None) if runner is not None else None
+    if runner is None:          # 私有入口若被重构掉, 退回公开入口 (仍是进程级期限; 不替它取池)
         def runner(f, a, k, _dl):
             return ds.call_with_retry(f, *a, **k)
+    take_pool = callable(acquire) and getattr(ds, "_POOL", None) is None and not getattr(ds, "_POOL_DISABLED", False)
     import queue as _q
     box = _q.Queue(maxsize=1)
+    seg = [("pool" if take_pool else "call", time.monotonic())]    # (段, 该段开始的 monotonic): 工作线程池到手时整体换掉 (单次赋值, 看门线程不会读到半截)
 
     def _run():
         try:
+            if take_pool:
+                try:
+                    acquire()                       # 「取池」: 建池 (或等别的线程建完), 按建池预算计时
+                except Exception as e:              # noqa: BLE001
+                    _pool_acquire_failed(ds, e)     # 池起不来: 按执行器自己的口径收尾 (它随后走线程版, 不再建一次池); 别的异常原样抛
+            seg[0] = ("call", time.monotonic())
             box.put((True, runner(fn, args, kwargs, deadline_sec)))
         except BaseException as e:      # noqa: BLE001
             box.put((False, e))
     threading.Thread(target=_run, daemon=True, name=f"tushare-pool-{name}").start()
     tok = args[1].get("token", "") if len(args) > 1 and isinstance(args[1], dict) else ""
-    grace = POOL_GRACE_SEC
-    try:
-        ok, val = box.get(timeout=float(deadline_sec) + grace)
-    except _q.Empty:
-        build = _pool_build_budget(ds) if _pool_not_built(ds) else 0.0
-        got = False
-        if build > 0:
-            log.info("tushare %s 超过硬期限 %ss + 宽限 %ss 仍未返回, 但 datasource 的池尚未建成 —— 再等建池预算 %.0fs (池建得慢 ≠ 池机制挂住)",
-                     name, deadline_sec, grace, build)
-            try:
-                ok, val = box.get(timeout=build)
-                got = True
-            except _q.Empty:
-                pass
-        if not got:
-            _disable_pool_side(ds, f"{name} 超过硬期限 {deadline_sec}s + 宽限 {grace}s" + (f" + 建池预算 {build:.0f}s" if build > 0 else "")
-                               + " 仍未从进程池机制返回 (建池 / 就绪探针 / terminate 挂住)")
-            return _thread_call(fn, args, kwargs, deadline_sec, thread_msg)
+    grace, build = POOL_GRACE_SEC, _pool_build_budget(ds)
+    cur, due, extended = None, 0.0, 0
+    while True:
+        if seg[0] != cur:                   # 新的一段 (或第一次): 上限从该段开始时算
+            cur = seg[0]
+            due = cur[1] + (build if cur[0] == "pool" else float(deadline_sec)) + grace
+        try:
+            ok, val = box.get(timeout=max(0.0, due - time.monotonic()))
+            break
+        except _q.Empty:
+            pass
+        if seg[0] != cur:                   # 恰在到点时进了下一段: 按新段重新计时
+            continue
+        what = (f"「取池」段超过建池预算 {build:g}s" if cur[0] == "pool" else f"「调用」段超过硬期限 {deadline_sec}s") + f" + 宽限 {grace}s"
+        alive, why, rebuilding = _pool_alive(ds, cur[0])
+        try:
+            ok, val = box.get_nowait()      # 探针那几秒里结果到了: 用它, 不回退、不重发
+            break
+        except _q.Empty:
+            pass
+        if seg[0] != cur:                   # 探针那几秒里进了下一段 (池刚到手): 判的是已经过去的段, 不作数, 按新段重新计时
+            continue
+        if alive and extended < POOL_EXTEND_MAX:
+            extended += 1
+            more = (build if rebuilding else 0.0) + float(deadline_sec) + grace
+            due = time.monotonic() + more
+            log.info("tushare %s %s 仍未返回, 但二次探针说池没挂 (%s) —— 再等一轮 %gs (慢 / 忙 ≠ 池机制挂住)", name, what, why, more)
+            continue
+        _disable_pool_side(ds, f"{name} {what}" + (f" (又等了 {extended} 轮)" if extended else "")
+                           + f" 仍未从进程池机制返回 (建池 / 就绪探针 / terminate 挂住; 二次探针: {why})")
+        return _thread_call(fn, args, kwargs, deadline_sec, thread_msg)
     if ok:
         return val
     if _is_pool_infra_error(val):
@@ -839,7 +940,7 @@ def _has_more(d):
 
 def _page_more(n_rows: int, has_more, limit: int) -> bool:
     """这一页之后还翻不翻: 服务端给了 has_more 就听它的 (True 翻 / False 停; 0 行不翻); 没给 → 行数**恰等于**本站单页上限才翻 (不足一页 = 全部;
-    多于上限 = 本站上限其实更高, 回的已是全部, 不翻 —— 主站 kaixin8 回 5,2xx 行就是这种)。"""
+    多于上限 = 本站上限其实更高, 回的已是全部, 不翻 —— 主站 kaixin8 一页回全市场 5,56x–5,58x 行就是这种)。"""
     if n_rows <= 0 or limit <= 0:
         return False
     if has_more is not None:
@@ -872,14 +973,18 @@ def _paginate(api: str, p: dict, fetch, limit_of) -> pd.DataFrame:
     query() 之间生效, 续页在钉住的站上失败耗尽就整次抛, 不跨站拼页也不返回截断表。
     停止: _page_more 说停 (不足一页 / has_more=False) 或续页 0 行 → 正常返回 (合并去重; 结果 .attrs["pages"] = 页数; 多于一页才打一行 INFO
     「tushare <api>: 分页 N 页 M 行 (<host>)」, 恰满一页而续页 0 行的不打)。**截断一律抛 TushareTruncated** (带已拿到行数 / 页数 / 原因, 先打一行 WARNING
-    「分页截断」): 续页失败 (重试耗尽 / 本站被判切换) / 镜像拒 offset (BadParams) / 镜像不认 offset (原样回上一页, 或续页去重后没有新行 —— 行序不稳的镜像以前
-    会翻满 PAGE_MAX=40 页) / 续页行数 > 上限而服务端没给 has_more (上限配置与本站不符) / PAGE_MAX 到顶。"""
+    「分页截断」): 续页失败 (重试耗尽 / 本站被判切换) / 镜像拒 offset (BadParams) / 镜像不认 offset (原样回上一页, 或续页去重后没有新行 —— 首版会翻满
+    PAGE_MAX=40 页) / **续页与已拿到的行重复 = 行序不稳** (10-25 卡 TS-PAGINATE-3: PAGE_KEYS 登记了主键且列齐的接口任一行重复就判 —— 稳定的镜像不会把同一
+    主键给两页, 认 offset 但每次排序不同的镜像续页大半是前页已给过的行, 并集静默少几百只, 校验员 T1; 没登记主键、按 ts_code+trade_date 或整行去重的接口
+    新增不足续页一半才判, 少量重复照常去重并在 INFO 行带「去重 N 行」) / 续页行数 > 上限而服务端没给 has_more (上限配置与本站不符) / PAGE_MAX 到顶。"""
     df, more, base, role = fetch(dict(p), None)
     limit = limit_of(base)
     if not _page_more(len(df), more, limit):
         return df
     host, pin = _host(base), (base, role)
     tail = "" if not p else " " + ",".join(f"{k}={v}" for k, v in p.items())[:80]
+    keys = PAGE_KEYS.get(api)
+    keyed = bool(keys) and set(keys) <= set(map(str, df.columns))     # 登记了主键且列齐: 主键跨页不该重复, 一行重复就是行序不稳
     merged, _ = _dedupe(api, df)
     pages, offset = [df], len(df)
 
@@ -907,8 +1012,12 @@ def _paginate(api: str, p: dict, fetch, limit_of) -> pd.DataFrame:
         if k == len(pages[-1]) and d2.equals(pages[-1]):
             truncated(f"offset={offset} 回包与上一页相同的 {k} 行, 镜像不认 offset")
         merged2, _ = _dedupe(api, pd.concat([merged, d2], ignore_index=True))
-        if len(merged2) == len(merged):
+        new = len(merged2) - len(merged)
+        if new == 0:
             truncated(f"续页 offset={offset} 的 {k} 行去重后没有新行, 镜像不认 offset (行序不稳)")
+        if new < k and (keyed or 2 * new < k):
+            truncated(f"续页 offset={offset} 的 {k} 行里 {k - new} 行与已拿到的重复、只 {new} 行是新的 —— 行序不稳 (镜像每次排序不同或翻页期间数据在变), "
+                      + ("登记了主键的接口不该跨页重复, " if keyed else "新增不足续页一半, ") + "按 offset 拼出来的表可能缺行")
         pages.append(d2)
         merged = merged2
         offset += k
@@ -1190,8 +1299,9 @@ def _pages_note(df) -> str:
 
 def _warm_pool() -> str:
     """--probe-backup 开头: 先拿最便宜的 _pool_ping 把进程级硬期限这条路走通一次 -> 一句说明 (走的是进程池还是线程版)。池机制挂住 / 起不来
-    (10-24 非交互 Bash 的 WinError 5 形态) 时在这里就按 _deadline_call 的规则回退线程版, 后面 6 次调用不再各等一轮 (最坏 POOL_WARMUP_SEC +
-    POOL_GRACE_SEC + datasource 建池预算 (池还没建成时) = 20 + 30 + 92 ≈ 142s 而不是挂死)。不打 token。"""
+    (10-24 非交互 Bash 的 WinError 5 形态) 时在这里就按 _deadline_call 的两段计时 + 二次探针回退线程版, 后面 6 次调用不再各等一轮 (建池挂住最坏
+    建池预算 + 宽限 = 92 + 30 ≈ 122s; 池建好后挂住 = 建池用时 + POOL_WARMUP_SEC + POOL_GRACE_SEC = 建池用时 + 20 + 30s; 二次探针把挂住误看成「活着」时再多
+    一轮 —— 都有界, 不再挂死)。不打 token。"""
     if not USE_PROCESS_DEADLINE:
         return "直调 (USE_PROCESS_DEADLINE=False)"
     t0 = time.time()

@@ -9,7 +9,8 @@ tools/tushare_probe.py compat (镜像兼容性探针, 卡 TS-PROBE / TS-PROBE-2)
 全从表取。③ 端到端: 10-10 那种「单日 trade_cal 不套 is_open」镜像 → 生产档可用 (单日三例 WARN、客户端回放 []); 日历缺
 假日 / 把开市日标休市 / 指数区间缺开市日 / 按日回包日期不对 (无视 trade_date) / 开市日单日返回空 / daily_basic 缺列 /
 list_status 不认 → 生产档不可用 (rc 1); 研究湖不兼容 (kaixin8 实测形态) / 财务单页上限 → 只研究湖档不可用, 退出码仍 0;
-调用上限 → SKIP = 未跑完; --max-calls 超 30 拒跑 (rc 2); 数据总览 trade_cal 10 s 期限只算生产档。④ token 不进输出与
+调用上限 → SKIP = 未跑完; --max-calls 超 30 拒跑 (rc 2); 数据总览 trade_cal 10 s 期限只算生产档; 按日全市场端点恰满生产客户端单页上限
+(datahubco 5000 形态) → 「客户端会分页」+ 加测 offset 续页 (认 offset PASS / 不认·拒·行序不稳 FAIL / 没测成 WARN / 上限不符 WARN; 卡 TS-PAGINATE-3)。④ token 不进输出与
 --json (JSON msg 回显; 非 JSON 错误页回显且跨在 120 字截断边界上)。⑤ 导入本模块无副作用。
 跑法: python -X utf8 -m pytest -c ../stock-core/pytest.ini --rootdir . tests/test_tushare_probe_compat.py -q
 """
@@ -79,7 +80,9 @@ class FakeMirror:
     member_ignores_l1 = index_member_all 不认 l1_code (回全市场成员); cal_override = {ISO: is_open} 只改 trade_cal
     回包 (行情照真日历出, 只测日历判据); ignore_trade_date = "YYYYMMDD" 按日 (trade_date / 单日区间) 一律回这一天
     (无视所问日期); range_drop = {api: {YYYYMMDD}} 区间查询里缺这些天; slow = {api: 秒} 回包延迟;
-    raw_api = 这个端点走真的 _raw_post (用例把 requests.post 打桩成非 JSON 错误页)。"""
+    raw_api = 这个端点走真的 _raw_post (用例把 requests.post 打桩成非 JSON 错误页); by_date_total = 全市场按日 (daily / adj_factor /
+    daily_basic 带 trade_date) 改成这么多只的大全集, 单页 by_date_cap 行、认 offset (datahubco 10-24 形态: 5000 + 559); offset_mode = ok /
+    ignore (续页原样回第一页) / reject (带 offset 回 [invalid_params]) / shuffle (带 offset 的请求每次换一种排序 = 行序不稳)。"""
 
     def __init__(self, **kw):
         self.single_quirk = kw.get("single_quirk", True)
@@ -96,6 +99,9 @@ class FakeMirror:
         self.range_drop = kw.get("range_drop", {})
         self.slow = kw.get("slow", {})
         self.raw_api = kw.get("raw_api", "")
+        self.by_date_total = kw.get("by_date_total")
+        self.by_date_cap = kw.get("by_date_cap", 5000)
+        self.offset_mode = kw.get("offset_mode", "ok")
         self.calls = []
 
     def __call__(self, base, payload, deadline):
@@ -107,6 +113,10 @@ class FakeMirror:
         if api == self.echo_token_api:
             return {"http": 200, "secs": 0.05, "bytes": 99,
                     "json": {"code": 40203, "msg": f"抱歉，您没有接口访问权限 token={payload['token']}", "data": None}}
+        if (self.by_date_total and self.offset_mode == "reject" and p.get("offset")
+                and api in ("daily", "adj_factor", "daily_basic")):
+            return {"http": 200, "secs": 0.05, "bytes": 99,
+                    "json": {"code": 400, "msg": "[invalid_params] 业务参数缺失或格式不合法", "data": None}}
         if api in self.errors:
             code, msg = self.errors[api]
             return {"http": 200, "secs": 0.05, "bytes": 99, "json": {"code": code, "msg": msg, "data": None}}
@@ -158,8 +168,20 @@ class FakeMirror:
         return [d.strftime("%Y%m%d") for d in _days(p["start_date"], p["end_date"])
                 if _is_open(d) and d.strftime("%Y%m%d") not in drop]
 
+    def _page_codes(self, p):
+        """by_date_total 打开时全市场按日的代码: 单页 by_date_cap, 认 offset (offset_mode 见类 docstring)。"""
+        import random
+        allc = [f"{600000 + i}.SH" for i in range(self.by_date_total)]
+        off = int(p.get("offset") or 0)
+        if off and self.offset_mode == "shuffle":
+            allc = random.Random(off + len(self.calls)).sample(allc, len(allc))
+        if self.offset_mode == "ignore":
+            off = 0
+        return allc[off: off + self.by_date_cap]
+
     def _bars(self, p, fields, extra):
-        codes = [p["ts_code"]] if "ts_code" in p else L_CODES
+        codes = [p["ts_code"]] if "ts_code" in p else \
+            (self._page_codes(p) if self.by_date_total and "trade_date" in p else L_CODES)
         cols = fields or ["ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount"]
         out = []
         for d in self._open_days(p):
@@ -178,7 +200,8 @@ class FakeMirror:
 
     def _daily_basic(self, p, fields):
         cols = fields or ["ts_code", "trade_date", "close"]
-        return cols, [[{"ts_code": c, "trade_date": self._td(p)}.get(k, 1.0) for k in cols] for c in L_CODES * 8][:5600]
+        codes = self._page_codes(p) if self.by_date_total else (L_CODES * 8)[:5600]
+        return cols, [[{"ts_code": c, "trade_date": self._td(p)}.get(k, 1.0) for k in cols] for c in codes]
 
     def _index_daily(self, p, fields):
         cols = fields or ["ts_code", "trade_date", "close", "open", "high", "low", "pre_close", "change",
@@ -533,6 +556,70 @@ def test_kaixin8_like_mirror_production_usable_with_single_day_warn(tmp_path):
     assert len(idx1) == 1 and idx1[0][1]["start_date"] == "20260929"
     assert "回包日期全是 2026-09-29" in text
     assert TOKEN not in text
+
+
+@pytest.fixture
+def _client_cap(monkeypatch):
+    """生产客户端对被测镜像的单页上限固定 5000 (不读本机 secrets / 环境变量, 也不吃别的用例留下的缓存)。"""
+    from ashare import tushare_client as tsc
+    monkeypatch.delenv("TUSHARE_PAGE_LIMIT", raising=False)
+    monkeypatch.setattr(tsc, "_PAGE_LIMIT", 5000)
+    return tsc
+
+
+def test_by_date_at_client_page_limit_is_paged_not_warned(tmp_path, _client_cap):
+    """datahubco 形态 (10-24 GM 实测, 卡 TS-PAGINATE-3): 全市场按日 daily / adj_factor / daily_basic 单页恰 5000 行, offset=5000 再回 559 (合计 5559)。
+    上一版三行都 WARN「行数恰为 5000, 疑似镜像单页上限截断」(生产客户端早已自动分页, GM 只好另跑 --probe-backup 看); 现在写「客户端会分页 (上限 5000)」,
+    计划最后给 daily / adj_factor 各加测一次 offset=5000 (2 次, 共 28 次 ≤ 30) —— 续页 559 行与第一页无重复 → PASS, 行数 / 回包日期 / 因子覆盖按两页
+    5559 判; daily_basic 没单测, 按同站续页的结论 PASS。全表 PASS, 生产档可用。"""
+    m = FakeMirror(single_quirk=False, by_date_total=5559)
+    rc, text = _run(tmp_path, m)
+    rows = _check_rows(text)
+    assert rc == 0 and set(rows.values()) == {"PASS"}, text
+    assert len(m.calls) == 28 and "调用 28 次" in text and "疑似镜像单页上限截断" not in text
+    cont = [c for c in m.calls if c[1].get("offset")]
+    assert cont == [("daily", {"trade_date": "20260929", "offset": 5000}), ("adj_factor", {"trade_date": "20260929", "offset": 5000})]
+    assert text.count("客户端会分页 (上限 5000); 续页 offset=5000 回 559 行, 与第一页无重复, 两页合计 5559 行") == 2
+    assert "续页未单测 (加测只给前 2 个按日端点, 同站那几次续页正常)" in text
+    assert "5559 行 (2 页), 生产解析后 A 股 5559" in text and "日线 5559 只里缺因子 0 只" in text
+    assert re.search(r"B01c\s+daily\s+全市场 2026-09-29 offset=5000\s+OK", text) and TOKEN not in text
+
+
+def test_by_date_mirror_ignoring_rejecting_or_reordering_offset_is_fail(tmp_path, _client_cap):
+    """镜像不认 offset (续页原样回第一页) / 拒 offset ([invalid_params]) / 认 offset 但每次排序不同 (续页大半与第一页重复) —— 生产客户端都会抛
+    TushareTruncated (当天不写库), compat 判 FAIL → 生产档不可用 (rc 1); 加测仍只 2 次, daily_basic 没单测、同站已测的续页 FAIL → WARN「多半也会被判截断」。"""
+    for mode, frag in (("ignore", "原样回第一页: 镜像不认 offset"), ("reject", "镜像不支持 offset 翻页"),
+                       ("shuffle", "行序不稳: 镜像每次排序不同 / 不认 offset")):
+        m = FakeMirror(single_quirk=False, by_date_total=5559, offset_mode=mode)
+        rc, text = _run(tmp_path / mode, m)
+        rows = _check_rows(text)
+        assert rc == 1 and "结论: 生产档不可用" in text, (mode, text)
+        assert rows["daily 按 trade_date"] == "FAIL" and rows["adj_factor 按 trade_date"] == "FAIL" and frag in text, (mode, text)
+        assert rows["daily_basic 按 trade_date"] == "WARN" and "同站已测的续页不正常 —— 这个端点多半也会被客户端判分页截断" in text, (mode, text)
+        assert len(m.calls) == 28 and "TushareTruncated" in text, mode
+
+
+def test_by_date_paging_edge_shapes(tmp_path, _client_cap):
+    """① 调用上限只够原计划 (--max-calls 26): 续页加测排在最后 → SKIP → 「没测成」WARN, 前面的检查一项没被挤掉, 生产档仍可用;
+    ② 当天恰好 5000 行: 续页 0 行 → PASS「该日就 5000 行」; ③ 镜像单页 4000 (≠ 客户端上限 5000): 客户端不会翻页 → WARN 并提示按站配
+    tushare_page_limit, 不加测 (26 次)。"""
+    m = FakeMirror(single_quirk=False, by_date_total=5559)
+    rc, text = _run(tmp_path / "cap", m, extra=["--max-calls", "26"])
+    rows = _check_rows(text)
+    assert rc == 0 and len(m.calls) == 26 and "结论: 生产档可用" in text, text
+    assert rows["daily 按 trade_date"] == "WARN" and rows["adj_factor 按 trade_date"] == "WARN"
+    assert "续页 offset=5000 没测成 (未调用: 调用上限 26 次已用完)" in text and "SKIP" not in set(rows.values())
+    assert rows["daily_basic 按 trade_date"] == "WARN" and "续页没测成, 判不了该站认不认 offset" in text
+    m = FakeMirror(single_quirk=False, by_date_total=5000)
+    rc, text = _run(tmp_path / "exact", m)
+    rows = _check_rows(text)
+    assert rc == 0 and len(m.calls) == 28 and rows["daily 按 trade_date"] == "PASS", text
+    assert "续页 offset=5000 0 行 = 该日就 5000 行" in text
+    m = FakeMirror(single_quirk=False, by_date_total=5559, by_date_cap=4000)
+    rc, text = _run(tmp_path / "4000", m)
+    rows = _check_rows(text)
+    assert rc == 0 and len(m.calls) == 26 and rows["daily 按 trade_date"] == "WARN", text
+    assert "行数恰为 4000 (≠ 生产客户端对该站的单页上限 5000, 客户端不会翻页)" in text and '{"<host>": 4000}' in text
 
 
 def test_strict_mirror_all_pass(tmp_path):

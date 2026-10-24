@@ -11,8 +11,9 @@ index_daily 升序 / trade_cal 转 ISO / 硬期限走 datasource 的**进程级*
 一次调用最多两轮 / 没配备用键分类顺序与异常类型同 7b92bb6 版 (逐字节钉住) / unknown_api·invalid_params 不重试 /
 镜像回显的 token 进不了日志 / --probe-backup 真验收; 基址由主进程选好传给 _post_json; 不写任何 token) /
 分页 (2026-10-24 卡 TS-PAGINATE: 恰满本站单页上限才带 offset 续页, has_more, 合并去重, 调用方自己翻页不插手, --probe-backup 的备用直调同样分页;
-10-25 卡 TS-PAGINATE-2: 所有页钉在第一页那个站、切换/回切只在 query() 之间生效、截断一律抛 TushareTruncated、页上限按 host 配 {host: n}) /
-进程池起不来或挂住 → 线程版硬期限一次即永久 (文末; 10-25 看门线程对未建成的池再给 datasource 自己的建池预算)。
+10-25 卡 TS-PAGINATE-2: 所有页钉在第一页那个站、切换/回切只在 query() 之间生效、截断一律抛 TushareTruncated、页上限按 host 配 {host: n};
+同日 TS-PAGINATE-3: 续页与已拿到的行重复 = 行序不稳, 也抛 TushareTruncated) /
+进程池起不来或挂住 → 线程版硬期限一次即永久 (文末; 10-25 TS-PAGINATE-3 看门线程分「取池 / 调用」两段计时 + os.getpid 二次探针, 慢 / 忙不误判)。
 运行:  python tests/test_tushare_client.py    或    python -m pytest tests/test_tushare_client.py -q
 """
 from __future__ import annotations
@@ -1620,13 +1621,15 @@ def test_has_more_from_server_overrides_row_count_heuristic():
 
 
 def test_pages_are_merged_and_deduped_by_endpoint_primary_key(caplog):
-    """第二页里 5 行与第一页同 (ts_code, trade_date) (镜像翻页边界漂移) → 去重后 5554 行, INFO 行带「去重 5 行」; 没登记主键、也没有 ts_code+trade_date
-    的接口按整行去重; 登记了主键但回包缺列 (daily 没要 trade_date) → 整行去重。"""
-    s = _install([_pg_ok(5000), _pg_ok(559, 4995)])                     # 004995..004999 与第一页重复
+    """登记了主键的接口 (adj_factor) 两页无重复 → 并集 5559 行, INFO 行不带「去重」; 没登记主键、也没有 ts_code+trade_date 的接口按整行去重
+    (续页 2 行里 1 行重复: 新增恰一半, 不判行序不稳); 登记了主键但回包缺列 (daily 没要 trade_date) → 整行去重。登记了主键的接口跨页重复
+    (翻页边界漂移 / 行序不稳) 现在判截断, 见 test_registered_key_overlap_across_pages_is_unstable_order_truncated (卡 TS-PAGINATE-3)。"""
+    s = _install([_pg_ok(5000), _pg_ok(559, 5000)])
     with caplog.at_level(logging.INFO, logger="ashare.tushare"):
         df = tc.query("adj_factor", trade_date="20260929")
-    assert len(df) == 5554 and df["ts_code"].is_unique and df.attrs["pages"] == 2 and len(s.calls) == 2
-    assert "tushare adj_factor: 分页 2 页 5554 行 (example.invalid), 去重 5 行 trade_date=20260929" in _page_lines(caplog)[0].getMessage()
+    assert len(df) == 5559 and df["ts_code"].is_unique and df.attrs["pages"] == 2 and len(s.calls) == 2
+    msg = _page_lines(caplog)[0].getMessage()
+    assert "tushare adj_factor: 分页 2 页 5559 行 (example.invalid) trade_date=20260929" in msg and "去重" not in msg
     s = _install([_ok(["a", "b"], [[f"{i}", "x"] for i in range(5000)]), _ok(["a", "b"], [["4999", "x"], ["5000", "y"]])])
     df = tc.query("some_api", foo="bar")
     assert len(df) == 5001 and len(s.calls) == 2
@@ -1696,18 +1699,64 @@ def test_exact_limit_then_zero_rows_is_not_logged_as_paging(caplog):
 
 
 def test_unstable_order_mirror_stops_early_as_truncated(caplog):
-    """镜像不认 offset 但每次行序不同 (校验员 H1: 以前翻满 PAGE_MAX=40 页才停, 慢站 40 × 30–110s): 某一页去重后没有新主键就判「不认 offset (行序不稳)」
-    → TushareTruncated, 远在 PAGE_MAX 之前; 第二页有新行 (559 只) 照常并入。"""
-    first, again = _pg_rows(5000), _pg_rows(5000, 559)                      # 第二页 559..5558: 新 559 只; 第三页: 全是已有的 (换了顺序)
-    shuffled = list(reversed(first))
+    """镜像不认 offset 但每次行序不同 (校验员 H1: 首版翻满 PAGE_MAX=40 页才停, 慢站 40 × 30–110s): 续页里有已出现过的主键就判「行序不稳」→ TushareTruncated,
+    第 2 次 HTTP 就停 (10-25 卡 TS-PAGINATE-3; 上一版要等到某一页去重后一行新的都没有, 这个剧本第 3 次才停, 还把第二页的 559 只并进去当「已拿到」);
+    续页只是第一页换了顺序 (一行新的都没有) 的, 原因写「去重后没有新行」。"""
+    first, again = _pg_rows(5000), _pg_rows(5000, 559)                      # 续页 000559..005558: 4441 行与第一页重复, 559 行新的
     s = _install([FakeResp({"code": 0, "msg": "", "data": {"fields": _PG_COLS, "items": first}}),
-                  FakeResp({"code": 0, "msg": "", "data": {"fields": _PG_COLS, "items": again}}),
-                  FakeResp({"code": 0, "msg": "", "data": {"fields": _PG_COLS, "items": shuffled}})])
+                  FakeResp({"code": 0, "msg": "", "data": {"fields": _PG_COLS, "items": again}})])
     with caplog.at_level(logging.INFO, logger="ashare.tushare"):
         with pytest.raises(tc.TushareTruncated) as ei:
             tc.query("daily", trade_date="20260929")
-    assert len(s.calls) == 3 < tc.PAGE_MAX and ei.value.rows == 5559 and ei.value.pages == 2
-    assert "没有新行" in ei.value.reason and "行序不稳" in ei.value.reason and "offset=10000" in ei.value.reason
+    assert len(s.calls) == 2 < tc.PAGE_MAX and ei.value.rows == 5000 and ei.value.pages == 1
+    assert "4441 行与已拿到的重复、只 559 行是新的" in ei.value.reason and "行序不稳" in ei.value.reason and "offset=5000" in ei.value.reason
+    s = _install([FakeResp({"code": 0, "msg": "", "data": {"fields": _PG_COLS, "items": first}}),
+                  FakeResp({"code": 0, "msg": "", "data": {"fields": _PG_COLS, "items": list(reversed(first))}})])
+    with pytest.raises(tc.TushareTruncated) as ei:
+        tc.query("daily", trade_date="20260929")
+    assert len(s.calls) == 2 and "去重后没有新行" in ei.value.reason and "行序不稳" in ei.value.reason
+
+
+def test_registered_key_overlap_across_pages_is_unstable_order_truncated(caplog):
+    """校验员 10-25 T1 (LOW): 认 offset、但每次请求行序不同的镜像 (无 ORDER BY 的库) —— 第一页 = 排序 σ1 的前 5000, 续页 = 另一种排序 σ2 的 [5000:]
+    (559 行里约九成已在第一页)。上一版只认「一行新的都没有」, 续页有几十行新的就静默返回并集 (5044/5562 = 90.7%, 过得了 pricestore 的 90% 守卫), 只打
+    INFO「去重 N 行」; 现在 PAGE_KEYS 登记了主键的接口 (daily / adj_factor / daily_basic …) 续页里只要有一行的主键已出现过 → WARNING「分页截断 … 行序不稳」+
+    TushareTruncated (口径同其它截断: 不返回截断表, rows / pages = 已拿到的)。翻页边界漂移的少量重复 (5 行) 同样判 —— 稳定的镜像不会跨页重复。
+    没登记主键的接口 (按 ts_code+trade_date 或整行去重) 只在去重后新增不足续页一半时判, 少量重复照常去重、INFO 带「去重 N 行」。"""
+    import random
+    allc = [f"{i:06d}.SZ" for i in range(5559)]
+    s2 = random.Random(11).sample(allc, len(allc))
+    page1 = [[c, "20260929", 1.0] for c in allc[:5000]]
+    page2 = [[c, "20260929", 1.0] for c in s2[5000:]]
+    dup = sum(1 for c in s2[5000:] if c in set(allc[:5000]))
+    s = _install([FakeResp({"code": 0, "msg": "", "data": {"fields": _PG_COLS, "items": page1}}),
+                  FakeResp({"code": 0, "msg": "", "data": {"fields": _PG_COLS, "items": page2}})])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        with pytest.raises(tc.TushareTruncated) as ei:
+            tc.query("daily", trade_date="20260929")
+    e = ei.value
+    assert 400 < dup < 559 and len(s.calls) == 2 and e.rows == 5000 and e.pages == 1 and e.__cause__ is None
+    assert f"续页 offset=5000 的 559 行里 {dup} 行与已拿到的重复、只 {559 - dup} 行是新的" in e.reason and "行序不稳" in e.reason
+    assert "登记了主键的接口不该跨页重复" in e.reason and TOKEN not in str(e)
+    warn = [r for r in caplog.records if "分页截断" in r.getMessage()]
+    assert len(warn) == 1 and warn[0].levelno == logging.WARNING and "已拿到 5000 行 1 页" in warn[0].getMessage()
+    assert not _page_lines(caplog)
+    # 翻页边界漂移 5 行 (登记了主键的 adj_factor; 上一版返回 5554 行 + INFO「去重 5 行」): 同样判
+    s = _install([_pg_ok(5000), _pg_ok(559, 4995)])
+    with pytest.raises(tc.TushareTruncated) as ei:
+        tc.query("adj_factor", trade_date="20260929")
+    assert "559 行里 5 行与已拿到的重复、只 554 行是新的" in ei.value.reason and len(s.calls) == 2 and ei.value.rows == 5000
+    # 没登记主键 (stk_limit, 按 ts_code+trade_date 去重): 5 行重复 → 照常并集 + INFO「去重 5 行」; 300 行重复 (新增 259 < 559 的一半) → 判截断
+    caplog.clear()
+    s = _install([_pg_ok(5000), _pg_ok(559, 4995)])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df = tc.query("stk_limit", trade_date="20260929")
+    assert len(df) == 5554 and df.attrs["pages"] == 2 and len(s.calls) == 2
+    assert "tushare stk_limit: 分页 2 页 5554 行 (example.invalid), 去重 5 行 trade_date=20260929" in _page_lines(caplog)[0].getMessage()
+    s = _install([_pg_ok(5000), _pg_ok(559, 4700)])
+    with pytest.raises(tc.TushareTruncated) as ei:
+        tc.query("stk_limit", trade_date="20260929")
+    assert "559 行里 300 行与已拿到的重复、只 259 行是新的" in ei.value.reason and "新增不足续页一半" in ei.value.reason
 
 
 def test_continuation_rows_above_limit_is_truncated_unless_server_says_has_more():
@@ -2113,60 +2162,329 @@ def test_probe_backup_warms_the_pool_first_and_reports_fallback(monkeypatch):
     assert rc == 0 and "硬期限执行器: 进程池硬期限就绪 (本进程)" in text and tc.pool_state()["disabled"] is False
 
 
-def test_watchdog_gives_an_unbuilt_pool_the_datasource_build_budget(monkeypatch, caplog):
-    """看门线程宽限不再写死 30s (卡 TS-PAGINATE-2 ③, 校验员 D3): 过了 deadline + POOL_GRACE_SEC 还没回来时, datasource 的池**还没建成** (_POOL is None)
-    就再给它自己的建池预算 (_POOL_DOA_WAIT_SEC + _POOL_PROBE_SEC, 从 datasource 常量读; 生产 2 + 90 = 92s) —— 建得慢但健康的池不回退、不重发请求、
-    不碰 ds._POOL_DISABLED; 池**已建成** (_POOL 不是 None) 却不回来 = 池机制挂住, 只等宽限就回退 (reason 不提建池预算); 建池预算也用完 = 挂住, reason 写明三段时间。"""
+# 看门线程两段计时 + 二次探针 (卡 TS-PAGINATE-3, 对校验员 10-25 W1 = D3 原场景: 上一版到点只看 `_POOL is None`, 池在检查点之前刚建好、随后的调用
+# 又接近期限就被判挂死)。前四条用**真** datasource 的 _pool / _call_with_deadline / _POOL / 建池锁, 只把池对象换成 _FakePool (不起进程), 时间常量按比例缩小。
+class _Abandon(BaseException):
+    """用例收尾专用: 被放开的「挂住的 terminate」抛它, 让被弃的工作线程安静退场 (不再往 FakeSession 发请求、不串到别的用例), 并放开建池锁。"""
+
+
+class _FakeAsync:
+    def __init__(self, fn, args, kwds, delay):
+        self.fn, self.args, self.kwds, self.delay = fn, args, kwds or {}, delay
+
+    def get(self, timeout=None):
+        import multiprocessing as mp
+        import threading
+        if timeout is not None and self.delay > timeout:          # 与真 AsyncResult 一样守 timeout
+            threading.Event().wait(timeout)
+            raise mp.TimeoutError()
+        threading.Event().wait(self.delay)
+        return self.fn(*self.args, **self.kwds)
+
+
+class _FakePool:
+    """datasource._make_pool 换成它: ready = 建池就绪探针 (第一次 os.getpid) 多慢; ping = 之后的 os.getpid (看门线程的二次探针) 多慢; call = 业务调用多慢
+    (到点在调 get 的那个线程里跑 fn, 即 _post_json → 用例的 FakeSession); hang = terminate 等这个 Event (10-24 WinError 5 形态: Pool.terminate 不回来),
+    放开后抛 _Abandon; workers = 给 _pool_busy 看的工作进程 (假); built=True = 就绪探针已经做过 (直接当成建好的池用)。"""
+
+    def __init__(self, ready=0.0, call=0.0, ping=0.0, hang=None, workers=(), built=False):
+        self.ready, self.call, self.ping, self.hang = ready, call, ping, hang
+        self._state, self._pool, self._cache = "RUN", list(workers), {}
+        self.probed, self.pings, self.terminated = built, 0, 0
+
+    def apply_async(self, fn, args=(), kwds=None):
+        if fn is os.getpid:
+            if not self.probed:
+                self.probed = True
+                return _FakeAsync(fn, args, kwds, self.ready)
+            self.pings += 1
+            return _FakeAsync(fn, args, kwds, self.ping)
+        return _FakeAsync(fn, args, kwds, self.call)
+
+    def terminate(self):
+        self.terminated += 1
+        if self.hang is not None:
+            self.hang.wait(30)
+            raise _Abandon()
+        self._state = "TERMINATE"
+
+    def join(self):
+        pass
+
+
+class _AliveWorker:
+    def is_alive(self):
+        return True
+
+
+def _real_ds_fake_pool(monkeypatch, pool, probe_sec=1.0, built=False):
+    """真 datasource, 只换池对象; 建池锁换一把本用例自己的 (被弃的线程持着也碍不着别的用例)。"""
     import threading
+    from ashare import datasource as ds
+    monkeypatch.setattr(ds, "_make_pool", lambda ctx: pool)
+    monkeypatch.setattr(ds, "_POOL_DOA_WAIT_SEC", 0.0)
+    monkeypatch.setattr(ds, "_POOL_PROBE_SEC", probe_sec)
+    monkeypatch.setattr(ds, "_POOL", pool if built else None)
+    monkeypatch.setattr(ds, "_POOL_DISABLED", False)
+    monkeypatch.setattr(ds, "_POOL_LOCK", threading.RLock())
+    if built:
+        pool.probed = True
+    return ds
+
+
+def _pq(deadline_sec):
+    """USE_PROCESS_DEADLINE=True 跑一次 query (retries=1) -> (df, 墙钟秒)。"""
+    tc.USE_PROCESS_DEADLINE = True
+    t0 = tc.time.monotonic()
+    try:
+        df = tc.query("daily", trade_date="20260929", retries=1, deadline_sec=deadline_sec)
+    finally:
+        tc.USE_PROCESS_DEADLINE = False
+    return df, tc.time.monotonic() - t0
+
+
+def _wait_runner_gone(timeout=5.0):
+    """放开挂住的假 terminate 之后, 等被弃的工作线程 (tushare-pool-*) 退场再进下一条用例。"""
+    import threading
+    end = tc.time.monotonic() + timeout
+    while tc.time.monotonic() < end and [x for x in threading.enumerate() if x.name.startswith("tushare-pool-") and x.is_alive()]:
+        threading.Event().wait(0.02)
+
+
+def test_watchdog_d3_slow_pool_build_then_near_deadline_call_is_not_hung(monkeypatch, caplog):
+    """校验员 10-25 W1 = D3 原场景 (MEDIUM): 池建得慢 (就绪探针 0.4s, datasource 自己的预算 1s 内, 健康) + 随后的调用接近期限 (0.3s < 期限 0.4s)。
+    上一版从调用开始统一按 期限 0.4 + 宽限 0.15 = 0.55s 计, 到点池**已建成** (0.4s 时建好) → 判池机制挂死 → 永久回退线程版 + ds._POOL_DISABLED + 同一请求
+    发两次; 现在「取池」段按建池预算计、「调用」段从池到手那一刻起按期限计 → 不回退、各 1 次 HTTP、不碰 ds._POOL_DISABLED、无 WARNING、不触发二次探针。
+    池已建成、上一调用慢但健康, 再来一次接近期限的调用 (0.3s) 同样不回退; 检查点时池还在建 (0.7s, 仍在预算内; 校验员 W3 对照) 也不回退。
+    「取池」段的上限从**真** datasource 常量读: _POOL_DOA_WAIT_SEC + _POOL_PROBE_SEC = 2 + 90 = 92s (不写死)。"""
     from ashare import datasource as real_ds
     assert tc._pool_build_budget(real_ds) == real_ds._POOL_DOA_WAIT_SEC + real_ds._POOL_PROBE_SEC == 92.0
-    monkeypatch.setattr(tc, "POOL_GRACE_SEC", 0.05)
+    pool = _FakePool(ready=0.4, call=0.3)
+    ds = _real_ds_fake_pool(monkeypatch, pool, probe_sec=1.0)
+    monkeypatch.setattr(tc, "POOL_GRACE_SEC", 0.15)
+    s = _install([_ok(["a"], [[1]]), _ok(["a"], [[2]])])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df, dt = _pq(0.4)
+        assert ds._POOL is pool                                       # 池在第一次调用的「取池」段里建好
+        df2, dt2 = _pq(0.4)
+    assert len(df) == 1 and len(df2) == 1 and len(s.calls) == 2       # 各 1 次 HTTP, 没有重发
+    assert 0.6 <= dt < 1.5 and 0.25 <= dt2 < 1.0, (dt, dt2)
+    assert tc.pool_state()["disabled"] is False and ds._POOL_DISABLED is False
+    assert not _pool_lines(caplog) and not [r for r in caplog.records if "二次探针" in r.getMessage()]
+    pool3 = _FakePool(ready=0.7, call=0.1)
+    ds = _real_ds_fake_pool(monkeypatch, pool3, probe_sec=1.0)
+    s = _install([_ok(["a"], [[3]])])
+    df3, dt3 = _pq(0.4)
+    assert len(df3) == 1 and len(s.calls) == 1 and 0.75 <= dt3 < 1.5 and ds._POOL is pool3
+    assert tc.pool_state()["disabled"] is False and ds._POOL_DISABLED is False
 
-    def slow_but_healthy(fn, args, kwargs, dl):
-        threading.Event().wait(0.3)                          # 建池慢 (仍在 datasource 自己的预算内; 这里预算缩成 0.1 + 0.5)
-        return fn(*args, **kwargs)
 
-    stub = _stub_datasource(monkeypatch, slow_but_healthy, _POOL_DOA_WAIT_SEC=0.1, _POOL_PROBE_SEC=0.5, _POOL=None)
+def test_watchdog_waits_for_another_threads_slow_pool_build(monkeypatch, caplog):
+    """「取池」段也盖住「等别的线程建池」: 别的线程 (akshare / 另一个 Tushare 调用) 先进 _pool() 建池 (0.4s, 健康), 本调用晚 0.05s 到, 在建池锁上等它建完,
+    池到手后调用 0.3s (接近期限 0.4s)。上一版检查点 0.05 + 0.4 + 0.15 = 0.6s 时池已建成 → 误判挂死; 现在不回退、池只建一次、1 次 HTTP。"""
+    import threading
+    pool = _FakePool(ready=0.4, call=0.3)
+    ds = _real_ds_fake_pool(monkeypatch, pool, probe_sec=1.0)
+    made = []
+    monkeypatch.setattr(ds, "_make_pool", lambda ctx: made.append(1) or pool)
+    monkeypatch.setattr(tc, "POOL_GRACE_SEC", 0.15)
     s = _install([_ok(["a"], [[1]])])
-    tc.USE_PROCESS_DEADLINE = True
+    other = threading.Thread(target=ds._pool, daemon=True)
+    other.start()
+    threading.Event().wait(0.05)
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df, dt = _pq(0.4)
+    other.join(2)
+    assert len(df) == 1 and len(s.calls) == 1 and made == [1] and ds._POOL is pool and 0.55 <= dt < 1.5, dt
+    assert tc.pool_state()["disabled"] is False and ds._POOL_DISABLED is False and not _pool_lines(caplog)
+
+
+def test_watchdog_true_hang_in_pool_build_falls_back_after_build_budget(monkeypatch, caplog):
+    """真挂死 (10-24 WinError 5 形态之一): 建池的就绪探针不回 (5s > 预算 0.3s) → datasource 去 terminate 这个池, terminate 挂住 (还持着建池锁)。
+    「取池」段给足建池预算 0.3 + 宽限 0.15s 后二次探针: 池不在、建池锁仍被持着 → 挂住 → WARNING 一行, 线程版拿到结果 (1 次 HTTP), ds._POOL_DISABLED 置 True;
+    reason 写明「取池」段与二次探针结论。上一版要等 期限 + 宽限 + 建池预算 (这里 0.4 + 0.15 + 0.3s) 才回退。"""
+    import threading
+    gate = threading.Event()
+    pool = _FakePool(ready=5.0, hang=gate)
+    ds = _real_ds_fake_pool(monkeypatch, pool, probe_sec=0.3)
+    monkeypatch.setattr(tc, "POOL_GRACE_SEC", 0.15)
+    s = _install([_ok(["a"], [[1]])])
     try:
         with caplog.at_level(logging.INFO, logger="ashare.tushare"):
-            df = tc.query("daily", deadline_sec=0.05)
-    finally:
-        tc.USE_PROCESS_DEADLINE = False
-    assert len(df) == 1 and len(s.calls) == 1 and tc.pool_state()["disabled"] is False and stub._POOL_DISABLED is False
-    assert any("再等建池预算" in r.getMessage() and r.levelno == logging.INFO for r in caplog.records) and not _pool_lines(caplog)
-    # 池已建成却不回来: 只等宽限 (deadline 0.05 + 0.05), 不加建池预算 (这里故意给 5s, 等了它就超 dt < 2)
-    gate = threading.Event()
-    stub = _stub_datasource(monkeypatch, lambda fn, a, k, dl: gate.wait(5), _POOL_DOA_WAIT_SEC=0.1, _POOL_PROBE_SEC=5.0, _POOL=object())
-    s = _install([_ok(["a"], [[1]])])
-    tc.USE_PROCESS_DEADLINE = True
-    try:
-        t0 = tc.time.monotonic()
-        df = tc.query("daily", deadline_sec=0.05)
-        dt = tc.time.monotonic() - t0
+            df, dt = _pq(0.4)
+        st = tc.pool_state()
+        assert len(df) == 1 and len(s.calls) == 1 and 0.4 <= dt < 0.85, dt
+        assert st["disabled"] is True and ds._POOL_DISABLED is True and pool.terminated == 1
+        assert "「取池」段超过建池预算 0.3s + 宽限 0.15s" in st["reason"] and "建池锁仍被持着" in st["reason"]
+        assert "仍未从进程池机制返回" in st["reason"] and len(_pool_lines(caplog)) == 1 and TOKEN not in caplog.text
     finally:
         gate.set()
-        tc.USE_PROCESS_DEADLINE = False
-    st = tc.pool_state()
-    assert len(df) == 1 and dt < 2 and st["disabled"] is True and stub._POOL_DISABLED is True
-    assert "宽限 0.05s" in st["reason"] and "建池预算" not in st["reason"] and "仍未从进程池机制返回" in st["reason"]
-    # 池没建成且建池预算也用完: 回退, reason 写明 期限 + 宽限 + 建池预算
+        _wait_runner_gone()
+
+
+def test_watchdog_true_hang_after_call_probe_unanswered_falls_back(monkeypatch, caplog):
+    """真挂死 (另两种形态, 「探针也不回 → 回退」): ① 池已建成, 调用超过硬期限 → datasource terminate 整池 (_POOL 先置 None), terminate 挂住 (不持建池锁)
+    —— 「调用」段到点 (期限 0.3 + 宽限 0.15s) 二次探针: 池不在、也没有线程在建 → 回退 (上一版还要因为 _POOL is None 再白等一份建池预算, 这里 2s);
+    ② 池对象还在, os.getpid 探针也不回 (0.5s > POOL_PING_SEC 0.05s), 工作进程列表为空 (不是「正忙」) → 回退, reason 写明探针未应答。"""
+    import threading
+    gate = threading.Event()
+    pool = _FakePool(call=5.0, hang=gate)
+    ds = _real_ds_fake_pool(monkeypatch, pool, probe_sec=2.0, built=True)
+    monkeypatch.setattr(tc, "POOL_GRACE_SEC", 0.15)
+    s = _install([_ok(["a"], [[1]])])
+    try:
+        with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+            df, dt = _pq(0.3)
+        st = tc.pool_state()
+        assert len(df) == 1 and len(s.calls) == 1 and 0.4 <= dt < 1.2, dt
+        assert st["disabled"] is True and ds._POOL_DISABLED is True and ds._POOL is None and pool.terminated == 1
+        assert "「调用」段超过硬期限 0.3s + 宽限 0.15s" in st["reason"] and "也没有线程在建" in st["reason"]
+    finally:
+        gate.set()
+        _wait_runner_gone()
     tc._pool_fallback_reset()
     gate2 = threading.Event()
-    stub = _stub_datasource(monkeypatch, lambda fn, a, k, dl: gate2.wait(5), _POOL_DOA_WAIT_SEC=0.5, _POOL_PROBE_SEC=0.5, _POOL=None)
+    stub = _stub_datasource(monkeypatch, lambda fn, a, k, dl: gate2.wait(5), _POOL=_FakePool(ping=0.5, built=True))
+    monkeypatch.setattr(tc, "POOL_PING_SEC", 0.05)
     s = _install([_ok(["a"], [[1]])])
-    tc.USE_PROCESS_DEADLINE = True
     try:
-        t0 = tc.time.monotonic()
-        df = tc.query("daily", deadline_sec=0.05)
-        dt = tc.time.monotonic() - t0
+        df, dt = _pq(0.1)
     finally:
         gate2.set()
-        tc.USE_PROCESS_DEADLINE = False
     st = tc.pool_state()
-    assert len(df) == 1 and 1.0 <= dt < 4 and st["disabled"] is True and stub._POOL_DISABLED is True
-    assert "+ 建池预算 1s" in st["reason"] and "仍未从进程池机制返回" in st["reason"]
+    assert len(df) == 1 and len(s.calls) == 1 and dt < 1.5 and st["disabled"] is True and stub._POOL_DISABLED is True
+    assert "os.getpid 探针 0.05s 未应答" in st["reason"] and stub._POOL.pings == 1
+
+
+def test_watchdog_probe_alive_busy_or_rebuilding_waits_one_more_round(monkeypatch, caplog):
+    """「池正忙 / 慢」≠ 挂住: 「调用」段到点 (期限 0.2 + 宽限 0.05s) 时 ① os.getpid 探针应答 → 再等一轮, 结果 0.4s 到 → 不回退、1 次 HTTP; ② 探针没轮上
+    (0.5s > POOL_PING_SEC 0.05s) 但工作进程都活着、任务占满 (_cache 3 > 2) → 正忙 → 同样再等一轮; ③ 池不在而建池锁有线程持着 → 正在重建 → 再等一轮
+    (这一轮加建池预算 0.3s: 0.3 + 0.2 + 0.05); ④ 探针说活着、再等的一轮也用完仍不回 → 回退 (reason 带「又等了 1 轮」) —— 看门线程始终有界。"""
+    import threading
+    monkeypatch.setattr(tc, "POOL_GRACE_SEC", 0.05)
+    monkeypatch.setattr(tc, "POOL_PING_SEC", 0.05)
+
+    def slow(fn, a, k, dl):
+        threading.Event().wait(0.4)
+        return fn(*a, **k)
+
+    def extra_rounds(caplog):
+        return [r.getMessage() for r in caplog.records if "二次探针说池没挂" in r.getMessage()]
+
+    for label, pool in (("应答", _FakePool(ping=0.0, built=True)),
+                        ("正忙", _FakePool(ping=0.5, built=True, workers=[_AliveWorker(), _AliveWorker()]))):
+        if label == "正忙":
+            pool._cache = {0: None, 1: None, 2: None}
+        caplog.clear()
+        stub = _stub_datasource(monkeypatch, slow, _POOL=pool)
+        s = _install([_ok(["a"], [[1]])])
+        with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+            df, dt = _pq(0.2)
+        lines = extra_rounds(caplog)
+        assert len(df) == 1 and len(s.calls) == 1 and tc.pool_state()["disabled"] is False and stub._POOL_DISABLED is False, label
+        assert len(lines) == 1 and label in lines[0] and "再等一轮 0.25s" in lines[0] and not _pool_lines(caplog), lines
+    lk = threading.RLock()
+    hold, release = threading.Event(), threading.Event()
+
+    def holder():
+        with lk:
+            hold.set()
+            release.wait(5)
+    threading.Thread(target=holder, daemon=True).start()
+    hold.wait(2)
+    caplog.clear()
+    try:
+        stub = _stub_datasource(monkeypatch, slow, _POOL=None, _pool_lock=lambda: lk, _POOL_DOA_WAIT_SEC=0.1, _POOL_PROBE_SEC=0.2)
+        s = _install([_ok(["a"], [[1]])])
+        with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+            df, dt = _pq(0.2)
+    finally:
+        release.set()
+    lines = extra_rounds(caplog)
+    assert len(df) == 1 and len(s.calls) == 1 and tc.pool_state()["disabled"] is False
+    assert len(lines) == 1 and "池正在重建" in lines[0] and "再等一轮 0.55s" in lines[0], lines
+    gate = threading.Event()
+    pool = _FakePool(ping=0.0, built=True)
+    stub = _stub_datasource(monkeypatch, lambda fn, a, k, dl: gate.wait(5), _POOL=pool)
+    s = _install([_ok(["a"], [[1]])])
+    try:
+        df, dt = _pq(0.2)
+    finally:
+        gate.set()
+    st = tc.pool_state()
+    assert len(df) == 1 and len(s.calls) == 1 and 0.45 <= dt < 1.5 and pool.pings == 2, dt
+    assert st["disabled"] is True and "(又等了 1 轮)" in st["reason"] and "仍未从进程池机制返回" in st["reason"]
+
+
+def test_watchdog_uses_a_result_that_lands_during_the_probe(monkeypatch, caplog):
+    """二次探针要花时间 (生产最多 POOL_PING_SEC + 1 = 11s): 「调用」段到点 (0.1 + 0.05s) 时结果还没到, 探针 (os.getpid 0.5s 不回, 工作进程列表为空 → 不是「正忙」)
+    判「不活」—— 但探针那 0.3s 里结果到了 (0.3s 时) → 直接用它: 不回退、不重发 (1 次 HTTP)、不碰 ds._POOL_DISABLED、不打 WARNING。"""
+    import threading
+    monkeypatch.setattr(tc, "POOL_GRACE_SEC", 0.05)
+    monkeypatch.setattr(tc, "POOL_PING_SEC", 0.3)
+
+    def lands_mid_probe(fn, a, k, dl):
+        threading.Event().wait(0.3)
+        return fn(*a, **k)
+
+    stub = _stub_datasource(monkeypatch, lands_mid_probe, _POOL=_FakePool(ping=0.5, built=True))
+    s = _install([_ok(["a"], [[1]])])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df, dt = _pq(0.1)
+    assert len(df) == 1 and len(s.calls) == 1 and stub._POOL.pings == 1 and dt < 1.2, dt
+    assert tc.pool_state()["disabled"] is False and stub._POOL_DISABLED is False and not _pool_lines(caplog)
+
+
+def test_watchdog_rejudges_when_segment_advances_during_the_probe(monkeypatch, caplog):
+    """二次探针判的是「已经到点的那一段」: 「取池」段到点 (建池预算 0.2 + 宽限 0.05s) 时开始探针 (池对象已在, os.getpid 0.5s 不回, POOL_PING_SEC 0.2s →
+    「不活」), 探针那 0.2s 里池到手、进了「调用」段 (0.3s) —— 不按过去那段判挂住, 按新段重新计时 (期限 0.5 + 宽限 0.05s), 调用 0.3s 后结果到 →
+    不回退、1 次 HTTP。没有这一步会在 0.45s 判池机制挂住、回退线程版并重发。"""
+    import threading
+    monkeypatch.setattr(tc, "POOL_GRACE_SEC", 0.05)
+    monkeypatch.setattr(tc, "POOL_PING_SEC", 0.2)
+    got_pool = threading.Event()
+    stub = _stub_datasource(monkeypatch, None, _POOL=None, _POOL_DOA_WAIT_SEC=0.1, _POOL_PROBE_SEC=0.1)
+
+    def acquire():                                  # 取池: 池对象先挂上 (探针看得到), 但要等到 0.3s 才「到手」
+        stub._POOL = _FakePool(ping=0.5, built=True)
+        got_pool.wait(5)
+        return stub._POOL
+
+    def call(fn, a, k, dl):
+        threading.Event().wait(0.3)
+        return fn(*a, **k)
+    stub._pool, stub._call_with_deadline = acquire, call
+    threading.Timer(0.3, got_pool.set).start()
+    s = _install([_ok(["a"], [[1]])])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df, dt = _pq(0.5)
+    assert len(df) == 1 and len(s.calls) == 1 and stub._POOL.pings == 1 and 0.55 <= dt < 1.5, dt
+    assert tc.pool_state()["disabled"] is False and stub._POOL_DISABLED is False and not _pool_lines(caplog)
+
+
+def test_pool_alive_and_busy_on_a_real_spawn_pool():
+    """二次探针读的 multiprocessing.pool.Pool 内部 (_state / _pool / _cache) 在本机 Python 上对得上 (真 spawn 池 2 个工作进程, 有界, 约 3–5s):
+    空闲 → os.getpid 毫秒级应答 = 活着; 两个工作进程各跑 1.5s 的任务 → 探针没轮上 (POOL_PING_SEC 缩到 0.3s) 但正忙 = 活着; terminate 之后 → 拒收 = 挂住。"""
+    import multiprocessing as mp
+    p = mp.get_context("spawn").Pool(processes=2)
+    ds = types.SimpleNamespace(_POOL=p)
+    saved = tc.POOL_PING_SEC
+    try:
+        p.apply_async(os.getpid).get(timeout=60)                     # 等工作进程起来
+        alive, why, rebuilding = tc._pool_alive(ds, "call")
+        assert alive and "应答" in why and not rebuilding, why
+        tc.POOL_PING_SEC = 0.3
+        busy = [p.apply_async(_REAL_SLEEP, (1.5,)) for _ in range(2)]
+        alive, why, rebuilding = tc._pool_alive(ds, "call")
+        assert alive and "正忙" in why and not rebuilding, why
+        for r in busy:
+            r.get(timeout=30)
+    finally:
+        tc.POOL_PING_SEC = saved
+        p.terminate()
+        p.join()
+    alive, why, _ = tc._pool_alive(ds, "call")
+    assert not alive and "未应答" in why, why
 
 
 def test_truncated_is_a_failure_for_every_production_caller(monkeypatch, tmp_path):
