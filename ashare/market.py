@@ -345,6 +345,33 @@ def fetch_universe_rows(list_status: str = "L,D,P") -> list:
     return sorted(rows)
 
 
+def fetch_namechange_rows():
+    """改名 / ST 点时史**全表** (Tushare namechange) -> [(code,name,start_date,end_date,ann_date,change_reason), ...]。
+
+    给 leftside_core.pricestore 的改名表月刷守卫用 (2026-10-24 卡 UNIVERSE-RULES-2, 老板「每月自动刷新」): `update` 收尾时
+    距上次拉取 (meta namechange_pulled_at) >= 30 天自动调一次, 核心只追加新行、不删不改。约定与按日钩子同形:
+    源不指向 Tushare / 无 token -> **None** (未启用, 核心静默跳过); 启用了但源返回空 -> [] (核心警告、不写拉取日, 明天再试);
+    取数抛错 -> 往外抛 (核心 catch 后记一行 warning, 非致命, 行情入库不受影响)。
+    1 次调用, 全表约 8,900 条 (含重复键, 主键 code+start_date+name 去重后约 4,320 行); 日期规整交核心的
+    normalize_namechange_rows, 北交所 / B 股由 keep_a_code 剔掉 (与 universe 同一把尺)。与 research/rebuild_a_pricestore_tushare.py
+    的 load_namechange 同一个端点同一组字段。"""
+    if not _tushare_on():
+        return None
+    from . import tushare_client as tsc
+    df = tsc.query("namechange", fields="ts_code,name,start_date,end_date,ann_date,change_reason")
+    if df is None or len(df) == 0:
+        return []
+    out = []
+    for t in df.itertuples(index=False):
+        code = keep_a_code(t.ts_code)
+        if not code:
+            continue
+        out.append((code, str(getattr(t, "name", "") or ""), getattr(t, "start_date", None),
+                    getattr(t, "end_date", None), getattr(t, "ann_date", None),
+                    str(getattr(t, "change_reason", "") or "")))
+    return out
+
+
 def fetch_bars_bulk_tushare(codes: list, start: str) -> dict:
     """逐股长历史 **前复权** 日线 (daily + adj_factor 各一次) -> {code: [(d,o,h,l,c,v),...]}。
 
@@ -723,5 +750,6 @@ MARKET = set_market(Market(
     fetch_bars_by_date=fetch_bars_by_date, fetch_adj_by_date=fetch_adj_by_date,
     trading_days=trading_days, fetch_universe_rows=fetch_universe_rows,
     fetch_index_by_date=fetch_index_by_date,     # 当日指数随个股同一步入库 (卡 DATA-DATE)
+    fetch_namechange_rows=fetch_namechange_rows, # 改名表月刷 (卡 UNIVERSE-RULES-2): update 收尾距上次拉取 >= 30 天自动拉
     log_prefix="ashare",
 ))
