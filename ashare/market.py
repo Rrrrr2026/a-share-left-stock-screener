@@ -7,6 +7,7 @@ A股 Market 适配器 — leftside_core 共用核心的全部市场差异都在�
 (腾讯前复权, 盘中丢弃未收盘bar)、基准指数 (沪深300)、个股新闻标题与风险关键词。
 """
 from __future__ import annotations
+import dataclasses
 import datetime as dt
 import logging
 
@@ -736,7 +737,32 @@ def universe_codes() -> list:
     return sorted(set(out))
 
 
-MARKET = set_market(Market(
+#: 核心 Market 上**可能还没有**的可选钩子: (字段名, 本仓实现)。不写进下面的构造关键字, 由 _attach_optional_hooks 按字段探测接上。
+#: 两仓分开发版 (服务器 run_a.sh 先 reset stock-core 再 reset a-share; PC 13:30 用 ../stock-core 共享树要 GM 手工 ff, 本仓在末尾才
+#: pull), 任一侧先上线 / 单独回滚都不能让 import 崩 —— 10-25 之前把 fetch_namechange_rows 当构造关键字传, 配旧核心 (Market 无此字段)
+#: 就 `TypeError: unexpected keyword argument`, 整条 A 股流水线 (update / ready / 跑批) 在 import 处挂 (校验员 verify:UNIVERSE-RULES-2
+#: MEDIUM 2)。新增可选钩子一律加到这张表, 别加进构造关键字。
+_OPTIONAL_HOOKS = (
+    ("fetch_namechange_rows", fetch_namechange_rows),   # 改名表月刷 (卡 UNIVERSE-RULES-2): update 收尾距上次拉取 >= 30 天自动拉
+)
+
+
+def _attach_optional_hooks(m):
+    """只接核心 `leftside_core.market.Market` **认识**的可选钩子 (dataclass 真有这个字段才 setattr; 已经有值的不覆盖)。
+    · 新 a-share + 旧核心 (无字段): 不接, 一行 info「核心比本仓老」, 对应功能 (改名表月刷) 不跑, 其余照旧;
+    · 旧 a-share + 新核心: 字段默认 None, 核心 `getattr(m, "fetch_namechange_rows", None)` 容错 -> 月刷跳过。
+    -> 同一个 m (原地改), 方便写成 _attach_optional_hooks(set_market(Market(...)))。"""
+    known = {f.name for f in dataclasses.fields(m)}
+    for key, fn in _OPTIONAL_HOOKS:
+        if key not in known:
+            log.info("leftside_core.Market 无字段 %s (核心比本仓老): 钩子不接, 对应功能 (改名表月刷) 本次不跑, 其余照旧", key)
+            continue
+        if getattr(m, key, None) is None:
+            setattr(m, key, fn)
+    return m
+
+
+MARKET = _attach_optional_hooks(set_market(Market(
     name="ashare",
     dashboard_dir=DASHBOARD_DIR, data_dir=DATA_DIR, db_path=DB_PATH,
     t_plus_one=True, limit_boards=True, cost_rt=0.003,
@@ -750,6 +776,6 @@ MARKET = set_market(Market(
     fetch_bars_by_date=fetch_bars_by_date, fetch_adj_by_date=fetch_adj_by_date,
     trading_days=trading_days, fetch_universe_rows=fetch_universe_rows,
     fetch_index_by_date=fetch_index_by_date,     # 当日指数随个股同一步入库 (卡 DATA-DATE)
-    fetch_namechange_rows=fetch_namechange_rows, # 改名表月刷 (卡 UNIVERSE-RULES-2): update 收尾距上次拉取 >= 30 天自动拉
+    # 可选钩子 (fetch_namechange_rows 等) 不在这里传: 见上面 _OPTIONAL_HOOKS / _attach_optional_hooks (旧核心兼容)
     log_prefix="ashare",
-))
+)))

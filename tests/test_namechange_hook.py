@@ -10,6 +10,8 @@
   · 钩子约定: 源不指向 Tushare -> None (未启用); 源返回空 -> []; 回包 -> 六元组 (北交所 / B 股由 keep_a_code 剔掉, 日期原样
     交核心 normalize_namechange_rows 规整); 调的是 namechange 端点 + 六个字段; 抛错往外抛 (核心兜)
   · MARKET 里接上了这个钩子 (`-m ashare.pricestore update` 跑的就是它)
+  · 跨仓兼容 (2026-10-25 卡 UNIVERSE-RULES-3, 校验员 MEDIUM「跨仓硬耦合」): 钩子不当构造关键字传, _attach_optional_hooks 只在核心
+    Market 真有字段时接 —— 旧核心 (无字段) 下 import 不崩、不接、info 一行, 核心 getattr 容错跳过; 已有值不覆盖; 缺了能补回
   · 端到端 (真 ashare Market 克隆到临时库 + 桩钩子): 拉取日 40 天前 -> `pricestore.update_daily()` 一跑就拉, 新行只追加,
     meta namechange_pulled_at = 今天, 不写 namechange_asof; 第二跑不到期不再调
   · 美股形态 (Market 无钩子) 不调不写
@@ -18,8 +20,11 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import inspect
+import logging
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import types
@@ -83,8 +88,49 @@ def test_hook_shape_and_filters(monkeypatch):
 
 
 def test_market_wired():
+    if "fetch_namechange_rows" not in {f.name for f in dataclasses.fields(lm.Market)}:
+        pytest.skip("旁边的核心 (leftside_core) 比本仓老, Market 无 fetch_namechange_rows 字段: 钩子按兼容约定不接")
     assert amkt.MARKET.fetch_namechange_rows is amkt.fetch_namechange_rows
     assert lm.current().fetch_namechange_rows is amkt.fetch_namechange_rows
+
+
+def test_hook_not_passed_as_constructor_kwarg():
+    """兼容的根: 钩子**不**当 Market(...) 的关键字传 (旧核心没这个字段会 TypeError), 走 _OPTIONAL_HOOKS 表。"""
+    src = inspect.getsource(amkt)
+    ctor = src[src.index("MARKET = "):]
+    assert "fetch_namechange_rows=" not in ctor
+    assert dict(amkt._OPTIONAL_HOOKS) == {"fetch_namechange_rows": amkt.fetch_namechange_rows}
+
+
+def test_attach_tolerates_old_core(caplog):
+    """旧核心形态: Market dataclass 没有 fetch_namechange_rows 字段 -> 不接、不崩、info 一行; 核心侧 getattr 容错 -> 月刷跳过。"""
+    @dataclasses.dataclass
+    class OldMarket:                      # 10-24 之前的 leftside_core.market.Market 形态 (只保留相关字段)
+        name: str
+        fetch_universe_rows: object = None
+        log_prefix: str = "leftside_core"
+
+    old = OldMarket(name="ashare")
+    with caplog.at_level(logging.INFO, logger="ashare.market"):
+        assert amkt._attach_optional_hooks(old) is old
+    assert not hasattr(old, "fetch_namechange_rows")
+    assert any("无字段 fetch_namechange_rows" in r.getMessage() for r in caplog.records)
+    conn = sqlite3.connect(":memory:")
+    ps._ensure_schema(conn)
+    assert ps._refresh_namechange_if_due(old, conn, today="2026-10-25") is None       # 核心: 无钩子 -> None, 一行不打
+    ps._after_universe_refresh(old, conn, today="2026-10-25")                           # 不抛
+    assert ps.NAMECHANGE_PULLED_KEY not in ps.meta_all(conn)
+    conn.close()
+
+
+def test_attach_fills_missing_and_keeps_existing():
+    m = dataclasses.replace(amkt.MARKET, fetch_namechange_rows=None)
+    assert amkt._attach_optional_hooks(m) is m
+    assert m.fetch_namechange_rows is amkt.fetch_namechange_rows
+    sentinel = lambda: []                                                               # noqa: E731
+    m2 = dataclasses.replace(amkt.MARKET, fetch_namechange_rows=sentinel)
+    amkt._attach_optional_hooks(m2)
+    assert m2.fetch_namechange_rows is sentinel                                         # 已有值不覆盖
 
 
 @pytest.fixture
