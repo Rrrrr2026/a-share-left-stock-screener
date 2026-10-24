@@ -10,8 +10,9 @@ index_daily 升序 / trade_cal 转 ISO / 硬期限走 datasource 的**进程级*
 硬期限超时单独计阈值 6 / HTTP 429 按超频退避不计 / 备用三连败试探主站回切 / 每 20 次调用或 10 分钟试探主站 /
 一次调用最多两轮 / 没配备用键分类顺序与异常类型同 7b92bb6 版 (逐字节钉住) / unknown_api·invalid_params 不重试 /
 镜像回显的 token 进不了日志 / --probe-backup 真验收; 基址由主进程选好传给 _post_json; 不写任何 token) /
-分页 (2026-10-24 卡 TS-PAGINATE: 恰满本站单页上限才带 offset 续页, has_more, 合并去重, 调用方自己翻页不插手, 镜像不认 offset 即停,
---probe-backup 的备用直调同样分页) / 进程池起不来或挂住 → 线程版硬期限一次即永久 (文末)。
+分页 (2026-10-24 卡 TS-PAGINATE: 恰满本站单页上限才带 offset 续页, has_more, 合并去重, 调用方自己翻页不插手, --probe-backup 的备用直调同样分页;
+10-25 卡 TS-PAGINATE-2: 所有页钉在第一页那个站、切换/回切只在 query() 之间生效、截断一律抛 TushareTruncated、页上限按 host 配 {host: n}) /
+进程池起不来或挂住 → 线程版硬期限一次即永久 (文末; 10-25 看门线程对未建成的池再给 datasource 自己的建池预算)。
 运行:  python tests/test_tushare_client.py    或    python -m pytest tests/test_tushare_client.py -q
 """
 from __future__ import annotations
@@ -1549,7 +1550,8 @@ def test_return_clears_timeouts_counter_even_without_a_primary_success(monkeypat
 
 # ---------------------------------------------------------------------------
 # 分页 (2026-10-24 卡 TS-PAGINATE): 备用站 datahubco 单页上限 5000 行 (全市场按 trade_date 的 daily / adj_factor / daily_basic 恰 5000 行,
-# offset=5000 再回 559; limit=6000 → 400); 主站 kaixin8 单页能回 5,2xx 行所以从未暴露 —— 切到备用后不分页就静默丢 ~560 只。不联网, 无真 token。
+# offset=5000 再回 559 = 5559; 同日主站 daily 5562 行; limit=6000 → 400); 主站 kaixin8 一页回全市场 5,56x–5,58x 行 (PC update.log 09-29..10-23) 所以从未暴露
+# —— 切到备用后不分页就静默丢 ~560 只。不联网, 无真 token。
 _PG_COLS = ["ts_code", "trade_date", "close"]
 
 
@@ -1649,36 +1651,86 @@ def test_caller_offset_or_limit_or_paginate_false_disables_auto_paging():
     assert len(tc.query("daily", trade_date="20260929", offset=0, paginate=True)) == 5000 and len(s.calls) == 1
 
 
-def test_stops_when_mirror_ignores_offset_or_rejects_it(caplog):
-    """镜像不认 offset (第二页原样回第一页) → 停, WARNING「镜像不认 offset」, 结果就是第一页 (去重后 5000 行), 不翻到 PAGE_MAX;
-    续页被拒参数 ([invalid_params]) → WARNING「不支持 offset 翻页」, 返回已拿到的页, 不抛; 续页传输失败重试耗尽 → 整次调用抛 (不返回被截断的表)。"""
+def test_truncation_always_raises_tushare_truncated(caplog):
+    """截断口径统一 (卡 TS-PAGINATE-2 ④; 以前「不认 / 拒 offset 返回截断表、续页传输失败才抛」两种口径): 镜像不认 offset (第二页原样回第一页) /
+    拒 offset ([invalid_params]) / 续页传输失败重试耗尽 → **一律抛 TushareTruncated** (TushareError 直接子类, 不是 Transport), 带 rows / pages / reason,
+    续页失败时 __cause__ 带原异常; 先打一行 WARNING「分页截断 … 已拿到 N 行 M 页」; 不返回第一页那 5000 行, 不打「分页」INFO 行, 不翻到 PAGE_MAX。"""
     s = _install([_pg_ok(5000), _pg_ok(5000)])
     with caplog.at_level(logging.INFO, logger="ashare.tushare"):
-        df = tc.query("daily", trade_date="20260929")
-    assert len(df) == 5000 and len(s.calls) == 2 and df.attrs["pages"] == 1
-    warn = [r for r in caplog.records if "镜像不认 offset" in r.getMessage()]
-    assert len(warn) == 1 and warn[0].levelno == logging.WARNING and "offset=5000" in warn[0].getMessage()
+        with pytest.raises(tc.TushareTruncated) as ei:
+            tc.query("daily", trade_date="20260929")
+    e = ei.value
+    assert isinstance(e, tc.TushareError) and not isinstance(e, tc.TushareTransport) and e.api == "daily"
+    assert e.rows == 5000 and e.pages == 1 and "镜像不认 offset" in e.reason and "offset=5000" in e.reason and e.__cause__ is None
+    assert len(s.calls) == 2 and TOKEN not in str(e) and not _page_lines(caplog)
+    warn = [r for r in caplog.records if "分页截断" in r.getMessage()]
+    assert len(warn) == 1 and warn[0].levelno == logging.WARNING
+    assert "已拿到 5000 行 1 页" in warn[0].getMessage() and "(example.invalid) trade_date=20260929" in warn[0].getMessage()
     caplog.clear()
     s = _install([_pg_ok(5000), _err("[invalid_params] 业务参数缺失或格式不合法", code=400)])
     with caplog.at_level(logging.INFO, logger="ashare.tushare"):
-        df = tc.query("daily", trade_date="20260929")
-    assert len(df) == 5000 and len(s.calls) == 2
-    assert any("不支持 offset 翻页" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+        with pytest.raises(tc.TushareTruncated) as ei:
+            tc.query("daily", trade_date="20260929")
+    assert "不支持 offset 翻页" in ei.value.reason and isinstance(ei.value.__cause__, tc.TushareBadParams) and len(s.calls) == 2
+    assert any("分页截断" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
     s = _install([_pg_ok(5000), FakeResp({}, status=502), FakeResp({}, status=502), FakeResp({}, status=502)])
-    _no_sleep()
-    with pytest.raises(tc.TushareTransport):
+    naps = _no_sleep()
+    with pytest.raises(tc.TushareTruncated) as ei:
         tc.query("daily", trade_date="20260929")
-    assert len(s.calls) == 4
+    assert isinstance(ei.value.__cause__, tc.TushareTransport) and "续页 offset=5000 失败" in ei.value.reason and ei.value.rows == 5000
+    assert len(s.calls) == 4 and naps == [tc.BACKOFF_SEC, tc.BACKOFF_SEC * 2]
+    # 跨进程 pickle 往返 (异常类约定): 属性保住
+    import pickle
+    e2 = pickle.loads(pickle.dumps(ei.value))
+    assert isinstance(e2, tc.TushareTruncated) and (e2.rows, e2.pages, e2.reason, e2.api) == (5000, 1, ei.value.reason, "daily")
+
+
+def test_exact_limit_then_zero_rows_is_not_logged_as_paging(caplog):
+    """恰 5000 行而站上确实只有 5000 (续页 0 行) → 返回 5000 行, 2 次 HTTP, **不打**「分页」INFO 行 (校验员 A3: 以前打「分页 1 页 5000 行」, 与 DEPLOY
+    「主站正常时不该出现分页行」冲突), 也无 WARNING; attrs["pages"] = 1。"""
+    s = _install([_pg_ok(5000), _pg_ok(0, 5000)])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df = tc.query("daily", trade_date="20260929")
+    assert len(df) == 5000 and len(s.calls) == 2 and df.attrs.get("pages") == 1
+    assert not _page_lines(caplog) and not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_unstable_order_mirror_stops_early_as_truncated(caplog):
+    """镜像不认 offset 但每次行序不同 (校验员 H1: 以前翻满 PAGE_MAX=40 页才停, 慢站 40 × 30–110s): 某一页去重后没有新主键就判「不认 offset (行序不稳)」
+    → TushareTruncated, 远在 PAGE_MAX 之前; 第二页有新行 (559 只) 照常并入。"""
+    first, again = _pg_rows(5000), _pg_rows(5000, 559)                      # 第二页 559..5558: 新 559 只; 第三页: 全是已有的 (换了顺序)
+    shuffled = list(reversed(first))
+    s = _install([FakeResp({"code": 0, "msg": "", "data": {"fields": _PG_COLS, "items": first}}),
+                  FakeResp({"code": 0, "msg": "", "data": {"fields": _PG_COLS, "items": again}}),
+                  FakeResp({"code": 0, "msg": "", "data": {"fields": _PG_COLS, "items": shuffled}})])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        with pytest.raises(tc.TushareTruncated) as ei:
+            tc.query("daily", trade_date="20260929")
+    assert len(s.calls) == 3 < tc.PAGE_MAX and ei.value.rows == 5559 and ei.value.pages == 2
+    assert "没有新行" in ei.value.reason and "行序不稳" in ei.value.reason and "offset=10000" in ei.value.reason
+
+
+def test_continuation_rows_above_limit_is_truncated_unless_server_says_has_more():
+    """续页行数 > 本站上限而服务端没给 has_more → 上限配置与本站不符 (或镜像不认 offset) → TushareTruncated (停止条件补「续页行数 > 上限」);
+    服务端给了 has_more 则以它为准 (官方站单页上限比配置大也能翻)。"""
+    s = _install([_pg_ok(5000), _pg_ok(5600, 5000)])
+    with pytest.raises(tc.TushareTruncated) as ei:
+        tc.query("daily", trade_date="20260929")
+    assert "> 本站单页上限 5000" in ei.value.reason and ei.value.rows == 5000 and len(s.calls) == 2
+    s = _install([_pg_ok(5000, has_more=True), _pg_ok(5600, 5000, has_more=False)])
+    df = tc.query("daily", trade_date="20260929")
+    assert len(df) == 10600 and len(s.calls) == 2 and df.attrs["pages"] == 2
 
 
 def test_page_max_truncates_runaway_paging(monkeypatch, caplog):
-    """每页都不同却永远满页 → PAGE_MAX 截断 + WARNING (兜底, 正常接口到不了)。"""
+    """每页都不同却永远满页 → PAGE_MAX 到顶 → TushareTruncated (兜底, 正常接口到不了; 以前返回 15000 行的截断表 + WARNING)。"""
     monkeypatch.setattr(tc, "PAGE_MAX", 3)
     s = _install([_pg_ok(5000, i * 5000) for i in range(4)])
     with caplog.at_level(logging.INFO, logger="ashare.tushare"):
-        df = tc.query("daily", trade_date="20260929")
-    assert len(df) == 15000 and len(s.calls) == 3 and df.attrs["pages"] == 3
-    assert any("翻到 3 页仍满页, 截断" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+        with pytest.raises(tc.TushareTruncated) as ei:
+            tc.query("daily", trade_date="20260929")
+    assert len(s.calls) == 3 and ei.value.rows == 15000 and ei.value.pages == 3 and "PAGE_MAX=3" in ei.value.reason
+    assert any("分页截断" in r.getMessage() and "翻到 3 页仍满页" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
 
 
 def test_page_limit_from_env_secrets_default_and_off(monkeypatch, caplog):
@@ -1716,9 +1768,10 @@ def test_page_limit_from_env_secrets_default_and_off(monkeypatch, caplog):
     assert tc.page_limit() == 4000
 
 
-def test_each_page_goes_through_failover_counting_and_deadline(monkeypatch):
-    """每页都是一次完整的 _query_page: 第二页主站 502×3 → 切备用 → 在备用拿到 559 行 → 合并 5559 (基址切换对调用方透明);
-    每页都带同一个 deadline_sec 进硬期限执行器; 切换计数照算。"""
+def test_pages_pinned_to_first_host_primary_second_page_fails_whole_query_raises(monkeypatch, caplog):
+    """一次 query() 的所有页钉在第一页那个站 (卡 TS-PAGINATE-2 ①, 校验员 MEDIUM): 第二页主站 502×3 → 切换计数记满、状态切到备用 (switches=1),
+    但续页**不**跟到备用去拼 (以前拼成 5559 当正确行为钉住) → 整次抛 TushareTruncated (rows=5000, __cause__ Transport), 本次没有一个请求打到备用;
+    每页都带同一个 deadline_sec 进硬期限执行器; 退避照旧; 下一次 query() 才从第一页起走备用。"""
     seen = []
     real_call = tc._deadline_call
 
@@ -1727,12 +1780,55 @@ def test_each_page_goes_through_failover_counting_and_deadline(monkeypatch):
         return real_call(fn, args, kwargs, dl)
 
     monkeypatch.setattr(tc, "_deadline_call", spy)
-    s, naps = _install_fo([_pg_ok(5000), FakeResp({}, status=502), FakeResp({}, status=503), FakeResp({}, status=502), _pg_ok(559, 5000)])
-    df = tc.query("daily", trade_date="20260929", deadline_sec=42)
-    assert len(df) == 5559 and _urls(s) == [PRIMARY] * 4 + [BACKUP]
-    assert seen == [(PRIMARY, None, 42), (PRIMARY, 5000, 42), (PRIMARY, 5000, 42), (PRIMARY, 5000, 42), (BACKUP, 5000, 42)]
-    assert tc.failover_state()["active"] is True and tc.failover_state()["switches"] == 1
+    s, naps = _install_fo([_pg_ok(5000), FakeResp({}, status=502), FakeResp({}, status=503), FakeResp({}, status=502)])
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        with pytest.raises(tc.TushareTruncated) as ei:
+            tc.query("daily", trade_date="20260929", deadline_sec=42)
+    assert _urls(s) == [PRIMARY] * 4 and seen == [(PRIMARY, None, 42)] + [(PRIMARY, 5000, 42)] * 3
+    assert ei.value.rows == 5000 and ei.value.pages == 1 and isinstance(ei.value.__cause__, tc.TushareTransport)
+    st = tc.failover_state()
+    assert st["active"] is True and st["switches"] == 1 and st["fails"] == tc.FAILOVER_AFTER and len(_switch_lines(caplog)) == 1
     assert naps == [tc.BACKOFF_SEC, tc.BACKOFF_SEC * 2]
+    assert any("不跨站续页" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+    s2 = _fo_session([_pg_ok(5000), _pg_ok(559, 5000)])                  # 下一次 query(): 第一页起就在备用, 两页都在备用
+    df = tc.query("daily", trade_date="20260929")
+    assert len(df) == 5559 and _urls(s2) == [BACKUP, BACKUP] and df.attrs["pages"] == 2
+
+
+def test_pages_pinned_on_backup_second_page_failures_probe_primary_but_never_stitch(caplog):
+    """备用上同理 (卡 TS-PAGINATE-2 ①): 第一页在备用, 第二页备用 502×3 → 备用失败计数照记 → 第 3 次试探主站 (单日 trade_cal) 成功 → 回切状态 (returns=1),
+    但续页不跟到主站去拼 → 整次抛 TushareTruncated; 主站在本次 query() 里只收到试探的 trade_cal, 没收到任何 daily 页; 下一次 query() 整段在主站重拉。"""
+    s, naps = _install_fo([_pg_ok(5000), FakeResp({}, status=502), FakeResp({}, status=502), FakeResp({}, status=502), _cal_ok()])
+    with tc._FO_LOCK:
+        tc._FO.update(active=True, reason="test", switched_at=tc.time.time(), last_probe_at=tc.time.monotonic())
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        with pytest.raises(tc.TushareTruncated) as ei:
+            tc.query("daily", trade_date="20260929")
+    assert _urls(s) == [BACKUP] * 4 + [PRIMARY] and _is_probe(s.calls[4])
+    assert not [c for c in s.calls if c["url"] == PRIMARY and c["json"]["api_name"] == "daily"]
+    st = tc.failover_state()
+    assert st["active"] is False and st["returns"] == 1 and len(_return_lines(caplog)) == 1 and ei.value.rows == 5000
+    s2 = _fo_session([_pg_ok(5559)])
+    assert len(tc.query("daily", trade_date="20260929")) == 5559 and _urls(s2) == [PRIMARY]
+
+
+def test_no_probe_between_pages_on_backup_probe_happens_at_next_query(caplog):
+    """校验员 E1/E2 (verify:TS-PAGINATE MEDIUM): 在备用上翻页, 两页之间恰到「每 20 次调用试探主站」的点 —— 以前续页回切后打到主站, 两站行集 / 行序不同就静默丢行
+    (E1 丢 3 只且日志看着正常; E2 降序回 → 去重后只剩 5000); 现在续页不试探、不换站: 两页都在备用, 5559 行齐, 没有回切行; 试探推到下一次 query() 的第一页之前,
+    那一次整段都在主站重拉。「每 20 次调用」按 query() 数, 不按页数。"""
+    s, naps = _install_fo([_pg_ok(5000), _pg_ok(559, 5000), _cal_ok(), _pg_ok(5559)])
+    with tc._FO_LOCK:
+        tc._FO.update(active=True, reason="test", switched_at=tc.time.time(), calls_on_backup=tc.PROBE_EVERY_CALLS - 2,
+                      last_probe_at=tc.time.monotonic())
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df = tc.query("daily", trade_date="20260929")
+    assert len(df) == 5559 and df["ts_code"].is_unique and df.attrs["pages"] == 2 and _urls(s) == [BACKUP, BACKUP]
+    st = tc.failover_state()
+    assert st["active"] is True and st["calls_on_backup"] == tc.PROBE_EVERY_CALLS - 1 and not _return_lines(caplog) and st["probes"] == 0
+    with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+        df2 = tc.query("daily", trade_date="20260929")                   # 第 20 次 query(): 第一页前试探 → 回切 → 整次在主站
+    assert len(df2) == 5559 and _urls(s)[2:] == [PRIMARY, PRIMARY] and _is_probe(s.calls[2]) and len(_return_lines(caplog)) == 1
+    assert tc.failover_state()["active"] is False
 
 
 def test_direct_query_paginates_for_probe_backup():
@@ -1769,6 +1865,70 @@ def test_probe_backup_passes_when_backup_needs_two_pages_per_day(monkeypatch):
               _ok(_DAILY_COLS, full_d[:5000]), _ok(_DAILY_COLS, []), _ok(_DAILY_COLS, full_p[:5000]), _ok(_DAILY_COLS, [])]
     s, naps, lines = _probe_setup(monkeypatch, script, page_limit=None)
     assert tc.probe_backup(out=lines.append, today=_TODAY) == 1 and f"daily {_D} 行数 5000 < 主站 5559 × 0.9" in "\n".join(lines)
+
+
+def test_page_limit_per_host_mapping(monkeypatch, caplog):
+    """页上限按 host 配置 (卡 TS-PAGINATE-2 ②): secrets 键 tushare_page_limit 可为整数 (全局) 或 {host: n} 映射 (键 = 基址的 netloc, 也认完整基址, "*" = 其余站,
+    没列的站缺省 5000); 环境变量 TUSHARE_PAGE_LIMIT 同形 (整数字串或 JSON 对象), 覆盖整个 secrets 配置; 映射里非整数的站按缺省并 WARNING; JSON 坏了按缺省并 WARNING;
+    分页用的上限按**第一页实际打到的站**取: 主站 6000 → 恰 6000 行翻页、恰 5000 行不翻; 切到备用 (5000) → 恰 5000 行翻页。"""
+    for k in ("TUSHARE_TOKEN", "TUSHARE_BASE_URL", "TUSHARE_BASE_URL_BACKUP", "TUSHARE_PAGE_LIMIT"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(tc, "_read_secrets", lambda: {"tushare_page_limit": {"primary.invalid": 6000, "backup.invalid": "5000", "x.invalid": "many"}})
+    tc._PAGE_LIMIT = None
+    with caplog.at_level(logging.WARNING, logger="ashare.tushare"):
+        assert tc.page_limit(PRIMARY) == 6000 and tc.page_limit(BACKUP) == 5000
+    assert tc.page_limit("https://other.invalid/x") == 5000 and tc.page_limit() == 5000 and tc.page_limit("https://x.invalid/api") == 5000
+    assert any("tushare_page_limit['x.invalid'] 不是整数" in r.getMessage() for r in caplog.records)
+    monkeypatch.setattr(tc, "_read_secrets", lambda: {"tushare_page_limit": {"*": 3000, BACKUP: 5000}})
+    tc._PAGE_LIMIT = None
+    assert tc.page_limit(PRIMARY) == 3000 and tc.page_limit(BACKUP) == 5000 and tc.page_limit() == 3000     # "*" 兜其余站; 完整基址也认
+    monkeypatch.setenv("TUSHARE_PAGE_LIMIT", '{"PRIMARY.invalid": 7000}')
+    tc._PAGE_LIMIT = None
+    assert tc.page_limit(PRIMARY) == 7000 and tc.page_limit(BACKUP) == 5000                               # 环境变量覆盖整个映射 (host 不分大小写), 没列的站缺省
+    monkeypatch.setenv("TUSHARE_PAGE_LIMIT", "4500")
+    tc._PAGE_LIMIT = None
+    assert tc.page_limit(PRIMARY) == 4500 and tc.page_limit(BACKUP) == 4500
+    caplog.clear()
+    monkeypatch.setenv("TUSHARE_PAGE_LIMIT", "{bad json")
+    tc._PAGE_LIMIT = None
+    with caplog.at_level(logging.WARNING, logger="ashare.tushare"):
+        assert tc.page_limit(PRIMARY) == 5000
+    assert any("不是整数也不是 {host: n} 映射" in r.getMessage() for r in caplog.records)
+    monkeypatch.delenv("TUSHARE_PAGE_LIMIT")
+    per_host = {"primary.invalid": 6000, "backup.invalid": 5000}
+    s, _ = _install_fo([_pg_ok(6000), _pg_ok(10, 6000)])
+    tc._PAGE_LIMIT = per_host
+    assert len(tc.query("daily", trade_date="20260929")) == 6010 and _urls(s) == [PRIMARY, PRIMARY]
+    assert s.calls[1]["json"]["params"] == {"trade_date": "20260929", "offset": 6000}
+    s, _ = _install_fo([_pg_ok(5000)])
+    tc._PAGE_LIMIT = per_host
+    assert len(tc.query("daily", trade_date="20260929")) == 5000 and len(s.calls) == 1                     # 主站上限 6000: 5000 行不是满页
+    s, _ = _install_fo([_pg_ok(5000), _pg_ok(559, 5000)])
+    tc._PAGE_LIMIT = per_host
+    with tc._FO_LOCK:
+        tc._FO.update(active=True, reason="test", switched_at=tc.time.time(), last_probe_at=tc.time.monotonic())
+    assert len(tc.query("daily", trade_date="20260929")) == 5559 and _urls(s) == [BACKUP, BACKUP]
+    s, _ = _install_fo([_pg_ok(5000), _pg_ok(559, 5000)])
+    tc._PAGE_LIMIT = per_host
+    assert len(tc._direct_query(BACKUP, TOKEN, "daily", "", {"trade_date": "20260929"})) == 5559 and len(s.calls) == 2   # 直调按给定基址取上限
+    s, _ = _install_fo([_pg_ok(5000)])
+    tc._PAGE_LIMIT = per_host
+    assert len(tc._direct_query(PRIMARY, TOKEN, "daily", "", {"trade_date": "20260929"})) == 5000 and len(s.calls) == 1
+
+
+def test_probe_backup_truncated_backup_page_is_a_failure(monkeypatch):
+    """--probe-backup: 备用第二页失败 (直调不重试) → _direct_query 抛 TushareTruncated → 该日「打不通」→ rc 1 (以前续页传输失败也抛, 现在类名与行数进输出);
+    另一天两页正常仍标「[分页 2 页]」。"""
+    full_d, full_p = _daily_rows(5559, "20261013"), _daily_rows(5559, "20260928")
+    script = [_CAL_SPEC, _ok(_DAILY_COLS, full_d), _ok(_DAILY_COLS, full_p), _ok(["cal_date", "is_open"], _CAL),
+              _ok(_DAILY_COLS, full_d[:5000]), FakeResp({}, status=502),
+              _ok(_DAILY_COLS, full_p[:5000]), _ok(_DAILY_COLS, full_p[5000:])]
+    s, naps, lines = _probe_setup(monkeypatch, script, page_limit=None)
+    rc = tc.probe_backup(out=lines.append, today=_TODAY)
+    text = "\n".join(lines)
+    assert rc == 1 and len(s.calls) == 8 and naps == []
+    assert f"备用 daily {_D} 失败: TushareTruncated" in text and "已拿到 5000 行 1 页" in text and f"daily {_D} 打不通或不认这把 key" in text
+    assert text.count("[分页 2 页]") == 1 and f"备用 daily {_P2}: 5559 行 (100% of 主站)" in text and TOKEN not in text
 
 
 # ---------------------------------------------------------------------------
@@ -1951,3 +2111,127 @@ def test_probe_backup_warms_the_pool_first_and_reports_fallback(monkeypatch):
         tc.USE_PROCESS_DEADLINE = False
     text = "\n".join(lines)
     assert rc == 0 and "硬期限执行器: 进程池硬期限就绪 (本进程)" in text and tc.pool_state()["disabled"] is False
+
+
+def test_watchdog_gives_an_unbuilt_pool_the_datasource_build_budget(monkeypatch, caplog):
+    """看门线程宽限不再写死 30s (卡 TS-PAGINATE-2 ③, 校验员 D3): 过了 deadline + POOL_GRACE_SEC 还没回来时, datasource 的池**还没建成** (_POOL is None)
+    就再给它自己的建池预算 (_POOL_DOA_WAIT_SEC + _POOL_PROBE_SEC, 从 datasource 常量读; 生产 2 + 90 = 92s) —— 建得慢但健康的池不回退、不重发请求、
+    不碰 ds._POOL_DISABLED; 池**已建成** (_POOL 不是 None) 却不回来 = 池机制挂住, 只等宽限就回退 (reason 不提建池预算); 建池预算也用完 = 挂住, reason 写明三段时间。"""
+    import threading
+    from ashare import datasource as real_ds
+    assert tc._pool_build_budget(real_ds) == real_ds._POOL_DOA_WAIT_SEC + real_ds._POOL_PROBE_SEC == 92.0
+    monkeypatch.setattr(tc, "POOL_GRACE_SEC", 0.05)
+
+    def slow_but_healthy(fn, args, kwargs, dl):
+        threading.Event().wait(0.3)                          # 建池慢 (仍在 datasource 自己的预算内; 这里预算缩成 0.1 + 0.5)
+        return fn(*args, **kwargs)
+
+    stub = _stub_datasource(monkeypatch, slow_but_healthy, _POOL_DOA_WAIT_SEC=0.1, _POOL_PROBE_SEC=0.5, _POOL=None)
+    s = _install([_ok(["a"], [[1]])])
+    tc.USE_PROCESS_DEADLINE = True
+    try:
+        with caplog.at_level(logging.INFO, logger="ashare.tushare"):
+            df = tc.query("daily", deadline_sec=0.05)
+    finally:
+        tc.USE_PROCESS_DEADLINE = False
+    assert len(df) == 1 and len(s.calls) == 1 and tc.pool_state()["disabled"] is False and stub._POOL_DISABLED is False
+    assert any("再等建池预算" in r.getMessage() and r.levelno == logging.INFO for r in caplog.records) and not _pool_lines(caplog)
+    # 池已建成却不回来: 只等宽限 (deadline 0.05 + 0.05), 不加建池预算 (这里故意给 5s, 等了它就超 dt < 2)
+    gate = threading.Event()
+    stub = _stub_datasource(monkeypatch, lambda fn, a, k, dl: gate.wait(5), _POOL_DOA_WAIT_SEC=0.1, _POOL_PROBE_SEC=5.0, _POOL=object())
+    s = _install([_ok(["a"], [[1]])])
+    tc.USE_PROCESS_DEADLINE = True
+    try:
+        t0 = tc.time.monotonic()
+        df = tc.query("daily", deadline_sec=0.05)
+        dt = tc.time.monotonic() - t0
+    finally:
+        gate.set()
+        tc.USE_PROCESS_DEADLINE = False
+    st = tc.pool_state()
+    assert len(df) == 1 and dt < 2 and st["disabled"] is True and stub._POOL_DISABLED is True
+    assert "宽限 0.05s" in st["reason"] and "建池预算" not in st["reason"] and "仍未从进程池机制返回" in st["reason"]
+    # 池没建成且建池预算也用完: 回退, reason 写明 期限 + 宽限 + 建池预算
+    tc._pool_fallback_reset()
+    gate2 = threading.Event()
+    stub = _stub_datasource(monkeypatch, lambda fn, a, k, dl: gate2.wait(5), _POOL_DOA_WAIT_SEC=0.5, _POOL_PROBE_SEC=0.5, _POOL=None)
+    s = _install([_ok(["a"], [[1]])])
+    tc.USE_PROCESS_DEADLINE = True
+    try:
+        t0 = tc.time.monotonic()
+        df = tc.query("daily", deadline_sec=0.05)
+        dt = tc.time.monotonic() - t0
+    finally:
+        gate2.set()
+        tc.USE_PROCESS_DEADLINE = False
+    st = tc.pool_state()
+    assert len(df) == 1 and 1.0 <= dt < 4 and st["disabled"] is True and stub._POOL_DISABLED is True
+    assert "+ 建池预算 1s" in st["reason"] and "仍未从进程池机制返回" in st["reason"]
+
+
+def test_truncated_is_a_failure_for_every_production_caller(monkeypatch, tmp_path):
+    """TushareTruncated 走调用方**现有**的异常路径, 没有一条把它当成功 (卡 TS-PAGINATE-2 ④ 核过): market.fetch_bars_by_date 原样抛 (不吞);
+    datasource.fetch_daily_basic_tushare → None (不缓存、不记「当日未出」); market.fetch_bars_bulk_tushare → 该股跳过;
+    leftside_core.pricestore 按日增量: 抛出的那天不写、meta.max_trade_date 不推、之前那天已提交 (异常原样抛到调用方, 与传输失败同路 —— run_a.sh 那行
+    `|| echo warn` 接住, 就绪闸门按库判)。研究湖 lake.pull_daily_basic 的 `except Exception → failed` 在 stock-core, 本仓不测 (代码核过)。"""
+    import sqlite3
+    import ashare.market as mk
+    from ashare import datasource as ds
+    from leftside_core import pricestore as ps
+    from leftside_core import market as lm
+    err = tc.TushareTruncated("daily: 分页截断 (x) — 续页失败; 已拿到 5000 行 1 页", "daily", rows=5000, pages=1, reason="续页失败")
+
+    def boom(api, **kw):
+        raise err
+
+    monkeypatch.setattr(mk, "_tushare_on", lambda: True)
+    monkeypatch.setattr(tc, "query", boom)
+    with pytest.raises(tc.TushareTruncated):
+        mk.fetch_bars_by_date("2026-09-29")
+    assert mk.fetch_bars_bulk_tushare(["000001"], "2026-01-01") == {}
+    monkeypatch.setattr(ds, "_ts_query", boom)
+    monkeypatch.setattr(ds, "_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(ds, "_ts_daily_basic_short", {})
+    saved_keys = []
+    monkeypatch.setattr(ds, "_cache_save", lambda key, obj: saved_keys.append(key))
+    monkeypatch.setattr(ds, "_cache_load", lambda key, max_age_h=None: None)
+    assert ds.fetch_daily_basic_tushare("20260929") is None and saved_keys == [] and ds._ts_daily_basic_short == {}
+    # pricestore 按日增量: 第二天抛 → 第一天已写并提交, 第二天不写, meta 不推
+    days = ["2026-09-03", "2026-09-04", "2026-09-07"]
+    bars = {dd: {"000001": (10.0 + i, 11.0 + i, 9.0 + i, 10.5 + i, 100.0, 1000.0),
+                 "000002": (20.0 + i, 21.0 + i, 19.0 + i, 20.5 + i, 200.0, 2000.0)} for i, dd in enumerate(days)}
+    facs = {dd: {"000001": 3.0, "000002": 1.0} for dd in days}
+    uni = [("000001", "甲", "2020-01-01", "", "L"), ("000002", "乙", "2020-01-01", "", "L")]
+    asked = []
+
+    def by_date(dd):
+        asked.append(dd)
+        if dd == days[2]:
+            raise err
+        return bars[dd]
+
+    d = str(tmp_path / "store")
+    os.makedirs(d)
+    saved_market = lm._CURRENT
+    lm.set_market(lm.Market(name="ashare", dashboard_dir=d, data_dir=d, db_path=os.path.join(d, "x.db"),
+                            fetch_bars_bulk=lambda codes, start: {}, fetch_index_bars=lambda s: [],
+                            fetch_bars_by_date=by_date, fetch_adj_by_date=lambda dd: facs[dd],
+                            trading_days=lambda a, b: [x for x in days if a <= x <= b], fetch_universe_rows=lambda: uni))
+    try:
+        conn = ps._conn()
+        conn.executemany("INSERT OR REPLACE INTO bars_raw VALUES(?,?,?,?,?,?,?,?)", [(c, days[0], *v) for c, v in bars[days[0]].items()])
+        conn.executemany("INSERT OR REPLACE INTO adj VALUES(?,?,?)", [(c, days[0], f) for c, f in facs[days[0]].items()])
+        conn.executemany("INSERT OR REPLACE INTO universe(code,name,list_date,delist_date,status) VALUES(?,?,?,?,?)", uni)
+        conn.commit()
+        ps.materialize(None, conn)
+        conn.close()
+        with pytest.raises(tc.TushareTruncated):
+            ps.update_daily()
+        conn = sqlite3.connect(os.path.join(d, "pricestore.db"))
+        got = dict(conn.execute("SELECT d, COUNT(*) FROM bars_raw GROUP BY d").fetchall())
+        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        conn.close()
+    finally:
+        lm._CURRENT = saved_market
+    assert asked == [days[1], days[2]] and got == {days[0]: 2, days[1]: 2}
+    assert meta.get("max_trade_date") != days[2] and meta.get("max_trade_date") != days[1]     # 异常路径不推 meta (第二天已在 bars_raw, 下次 MAX(d) 自然续)

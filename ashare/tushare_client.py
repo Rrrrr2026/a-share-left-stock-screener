@@ -39,7 +39,10 @@ TUSHARE_BASE_URL_BACKUP 可覆盖) 配第二个站 (同一 key; 老板给的 dat
     及含「未开放」「参数缺失」的文案一次就抛 (NoPermission / BadParams), 不再白重试 3 次 —— 这两个子串比 kaixin8 实测的两种形态宽,
     是有意的 (都是永久性条件)。
   · **最坏墙钟**: 没备用 3×120 + 退避 2+4 ≈ 366s; 配了备用, 一次调用最多两轮 + 最多两次主站试探 (各 ≤ 30s):
-    2×366 + 2×30 ≈ 792s ≈ 13 分钟 —— 有 TimeoutStartSec 的调用方按这个数收紧 retries / deadline_sec (见 trade_cal)。
+    2×366 + 2×30 ≈ 792s ≈ 13 分钟 —— 有 TimeoutStartSec 的调用方按这个数收紧 retries / deadline_sec (见 trade_cal)。**分页的调用按页放大**
+    (10-25 补): 每页都是一次完整调用, 一次 query() 的总墙钟上限 = 首页最坏 + (页数 − 1) × 单页最坏 (续页钉在同一站: 单页 = retries × deadline_sec + 退避,
+    不再有第二轮与试探), 页数 ≤ PAGE_MAX=40; 全市场按日端点在备用上 2 页: 没备用机制 2×366 ≈ 732s, 配了备用 792 + 366 ≈ 1158s ≈ 19 分钟。
+    按剩余预算算 deadline_sec 的调用方 (tools/tushare_ready_probe.py 一类) 要按「可能 2 页」留预算, 或传 paginate=False 只拿第一页。
   · **真验收**: `python -X utf8 -m ashare.tushare_client --probe-backup` (6 次调用: 主站 trade_cal + 两个开市日的 daily 走生产路径,
     备用站同三项直调绕开切换状态; 备用回包的 trade_date 必须**全部等于所问日** —— 生产按所问日期写价格库、不看回包日期, 无视或
     错配 trade_date 的备用站切过去就会静默写错 K 线和复权因子, 光数行数拦不住 (10-17 校验员实证); 第二个日子是已知的过去开市日,
@@ -48,27 +51,35 @@ TUSHARE_BASE_URL_BACKUP 可覆盖) 配第二个站 (同一 key; 老板给的 dat
     什么都验不出 (10-12 校验员实证)。
   进程池里跑的 `_post_json` 只拿主进程选好的基址当参数, 切换状态只在主进程 (加锁) 判定。
 
-分页 (2026-10-24 卡 TS-PAGINATE): 备用站 datahubco **单页最多回 5000 行** (GM 10-24 用候选 secrets 跑 compat: 全市场按 trade_date 的 daily /
-adj_factor / daily_basic 都恰 5000 行; 加测 daily offset=5000 → 559 行 (合计 5559 = 全市场), limit=6000 → 400「query limit exceeds the maximum」,
-daily_basic offset=5000 → 559 行); 主站 kaixin8 单页能回 5,2xx 行所以从未暴露 —— 一旦切到备用, 不分页就静默丢 ~560 只。`query()` 对回包行数
-**恰等于本站单页上限** (`page_limit()`: secrets 键 `tushare_page_limit` / 环境变量 TUSHARE_PAGE_LIMIT / 缺省 PAGE_LIMIT_DEFAULT=5000; ≤ 0 关掉)
-的调用自动带 offset 续拉, 直到不足一页 / 0 行 / 服务端 has_more=False (回包里有这个字段就听它的), 各页合并后按该接口主键去重 (PAGE_KEYS; 没登记
-的接口有 ts_code+trade_date 就按它, 否则整行去重); 每一页都是一次完整的 `_query_page` (限频桶 / 硬期限 / 重试 / 切换计数一样算), 多于一页时多打
-一行 INFO「tushare <api>: 分页 N 页 M 行 (<host>)」。行数 < 上限不翻页 —— 对本来就 ≤ 5000 行的接口零改动 (第一页的请求体与以前逐字节相同,
-不带 offset / limit)。调用方自己翻页的 (传了 offset / limit, 如 stock-core research/lake.py 的 `_pages`) 不自动翻; `paginate=False` 强关,
-`paginate=True` 带 limit 也按本站上限翻。镜像不认 offset (原样回上一页) → 停, WARNING 一行; 续页被拒参数 (BadParams) → WARNING 并返回已拿到
-的页。`--probe-backup` 的备用直调 (`_direct_query`) 同样分页, 否则备用 5000/5559 = 89.9% 永远过不了 ≥ 90% 的门。
+分页 (2026-10-24 卡 TS-PAGINATE; 10-25 卡 TS-PAGINATE-2 按校验改口径): 备用站 datahubco **单页最多回 5000 行** (GM 10-24 用候选 secrets 跑 compat: 全市场按
+trade_date 的 daily / adj_factor / daily_basic 都恰 5000 行; 加测 daily offset=5000 → 559 行 (合计 5559; 同日 09-29 主站 daily 回 5562 行 —— 两站行集差几行),
+limit=6000 → 400「query limit exceeds the maximum」, daily_basic offset=5000 → 559 行); 主站 kaixin8 一页回全市场 5,56x–5,58x 行 (PC data/update.log
+09-29..10-23: daily 5,561–5,572 / adj_factor 5,571–5,580 / daily_basic 5,559–5,572; 5,2xx 是 keep_a_code 剔北交所 / B 股后的 pricestore 行数) 所以从未暴露
+—— 一旦切到备用, 不分页就静默丢 ~560 只。`query()` 对回包行数**恰等于本站单页上限** (`page_limit(base)`: secrets 键 `tushare_page_limit` / 环境变量
+TUSHARE_PAGE_LIMIT, 整数 = 全局一个数, `{host: n}` 映射 = **按站配** (键是基址的 host, "*" = 其余站); 缺省 PAGE_LIMIT_DEFAULT=5000; ≤ 0 关掉) 的调用自动带
+offset 续拉, 直到不足一页 / 0 行 / 服务端 has_more=False (回包里有这个字段就听它的), 各页合并后按该接口主键去重 (PAGE_KEYS; 没登记的接口有 ts_code+trade_date
+就按它, 否则整行去重); 每一页都是一次完整的 `_query_page` (限频桶 / 硬期限 / 重试一样算), 多于一页时多打一行 INFO「tushare <api>: 分页 N 页 M 行 (<host>)」
+(恰满一页而续页 0 行的不打)。行数 < 上限不翻页 —— 对本来就 ≤ 上限的接口零改动 (第一页的请求体与以前逐字节相同, 不带 offset / limit); 行数 > 上限也不翻
+(本站上限其实更高, 回的已是全部)。调用方自己翻页的 (传了 offset / limit, 如 stock-core research/lake.py 的 `_pages`) 不自动翻; `paginate=False` 强关,
+`paginate=True` 带 limit 也按本站上限翻。**一次 query() 的所有页钉在同一个站**: 第一页经切换机制选站, 续页只打第一页那个站 (不试探主站、不跟着切换 / 回切
+过去 —— 两站行集与行序不同, 跨站按 offset 拼页会静默丢行, 校验员 10-24 E1/E2 实证), 失败计数照记, 切换 / 回切只在 query() 之间生效 (「每 20 次调用试探」
+按 query() 数)。**截断一律抛 `TushareTruncated`** (带已拿到行数 / 页数 / 原因, 先打一行 WARNING「分页截断」), 不拼不同站的页也不返回截断表: 续页在钉住的站
+失败耗尽 (或该站被判切换) / 镜像拒 offset (BadParams) / 镜像不认 offset (原样回上一页, 或续页去重后没有新行 —— 行序不稳的镜像) / 续页行数 > 上限
+(上限配置与本站不符) / PAGE_MAX 到顶; 调用方 (pricestore update / datasource daily_basic / 湖 pull_daily_basic / bulk) 都把异常当失败, 当天不写、下次再补。
+`--probe-backup` 的备用直调 (`_direct_query`) 同样分页, 否则备用 5000/5559 = 89.9% 永远过不了 ≥ 90% 的门。
 
-进程池回退 (同卡): `_deadline_call` 把 datasource 的进程级硬期限跑在一个看门线程里, 最多等 deadline_sec + POOL_GRACE_SEC —— 池机制自己挂住
-(10-24 GM 在非交互 Bash 里跑 --probe-backup: spawn 报 PermissionError [WinError 5] 后 Pool.terminate 不回来, 挂到外层 300s 超时) 或从池机制
-抛出基础设施异常 (PermissionError / BrokenPipeError / EOFError / BrokenProcessPool / datasource._PoolUnavailable; 工作进程里 fn 自己抛的异常带
-RemoteTraceback, 不算) → WARNING 一行, 本进程余下 Tushare 调用永久改走线程版硬期限 (`_thread_call`, 期限仍生效), 并把 datasource._POOL_DISABLED
-置 True (与 09-05 datasource「基础设施异常一次即永久回退线程版」同口径, 让 akshare 那侧也别再碰可能已挂住的池)。`--probe-backup` 开头先用一次
-`_pool_ping` (POOL_WARMUP_SEC) 把这条路走通, 池坏了在那里就回退, 后面 6 次不再各等一轮。
+进程池回退 (同卡; 10-25 TS-PAGINATE-2 改宽限): `_deadline_call` 把 datasource 的进程级硬期限跑在一个看门线程里, 先等 deadline_sec + POOL_GRACE_SEC (30s,
+给提交 / 排队 / terminate); 到点没回来而 datasource 的池**还没建成** (`_POOL is None`: 首次调用或上次超时 terminate 之后) → 再给它自己的建池预算
+(`_POOL_DOA_WAIT_SEC + _POOL_PROBE_SEC` = 2 + 90s, 从 datasource 常量读, 不写死) —— 池建得慢 ≠ 池机制挂住 (校验员 10-24 D3: 30s 宽限小于建池预算, 慢但健康的
+池会被误判); 池已建成却不回来、或建池预算也用完 = 池机制挂住 (10-24 GM 在非交互 Bash 里跑 --probe-backup: spawn 报 PermissionError [WinError 5] 后
+Pool.terminate 不回来, 挂到外层 300s 超时), 或从池机制抛出基础设施异常 (PermissionError / BrokenPipeError / EOFError / BrokenProcessPool /
+datasource._PoolUnavailable; 工作进程里 fn 自己抛的异常带 RemoteTraceback, 不算) → WARNING 一行, 本进程余下 Tushare 调用永久改走线程版硬期限
+(`_thread_call`, 期限仍生效), 并把 datasource._POOL_DISABLED 置 True (与 09-05 datasource「基础设施异常一次即永久回退线程版」同口径, 让 akshare 那侧也别再碰
+可能已挂住的池)。`--probe-backup` 开头先用一次 `_pool_ping` (POOL_WARMUP_SEC) 把这条路走通, 池坏了在那里就回退 (最坏 20 + 30 + 92 ≈ 142s), 后面 6 次不再各等一轮。
 
 本模块提供:
     available()                      -> 是否配了 token
-    page_limit()                     -> 本站单页上限 (自动分页阈值: secrets tushare_page_limit / 环境变量 / 缺省 5000)
+    page_limit(base=None)            -> 该站单页上限 (自动分页阈值: secrets tushare_page_limit 整数或 {host: n} / 环境变量同形 / 缺省 5000)
     credentials()                    -> (token, base_url, backup_base_url); 没配备用则第三项为 ""
     failover_state() / failover_reset() -> 备用基址切换状态 (诊断 / 用例用)
     probe_backup()                   -> 备用站真验收 (命令行 --probe-backup), 退出码 0/1/2
@@ -119,8 +130,9 @@ PROBE_DEADLINE_SEC = 30     # 试探那次的墙钟 (线程版 _probe_call: 到�
 PROBE_SECOND_DAY_BACK = 5   # --probe-backup 的第二个核对日: 最近开市日再往前这么多个开市日 (已知的过去开市日, 抓「一律回最新一天」的镜像)
 MAX_ROUNDS_PER_CALL = 2     # 一次 query() 最多在两个基址上各来一轮 (切换/回切后重来一轮; 再切就不重来, 防两站都抖时乒乓)
 TOKEN_ERROR_CODES = (2002, 40101)   # token 过期/无效类错误码 → 立即切备用 (10-08 旧镜像就是 code=2002 token已过期)
-PAGE_LIMIT_DEFAULT = 5000   # 「本站单页上限」缺省 (备用站 datahubco 10-24 实测; 主站 kaixin8 单页能回 5,2xx 行, 恰 5000 行那天多打一页 0 行也无害);
-                            # secrets 键 tushare_page_limit / 环境变量 TUSHARE_PAGE_LIMIT 可改, ≤ 0 = 关掉自动分页 (见 page_limit)
+PAGE_LIMIT_DEFAULT = 5000   # 「本站单页上限」缺省 (备用站 datahubco 10-24 实测; 主站 kaixin8 一页回全市场 5,56x–5,58x 行, 恰 5000 行那天多打一页 0 行也无害);
+                            # secrets 键 tushare_page_limit / 环境变量 TUSHARE_PAGE_LIMIT 可改: 整数 = 全局, {host: n} = 按站 (见 page_limit); ≤ 0 = 关掉自动分页
+PAGE_LIMIT_ANY = "*"        # {host: n} 映射里「其余站」的键
 PAGE_MAX = 40               # 自动分页最多翻这么多页 (40 × 5000 = 20 万行; 全市场按日端点 ≤ 6 千行, 单股全史 ≤ 6 千行), 防镜像每页都不同却翻不完
 PAGE_KEYS = {               # 合并去重的主键 (列齐才用); 没登记的接口: 有 ts_code + trade_date 就按它, 否则整行去重
     "daily": ("ts_code", "trade_date"), "adj_factor": ("ts_code", "trade_date"), "daily_basic": ("ts_code", "trade_date"),
@@ -128,8 +140,9 @@ PAGE_KEYS = {               # 合并去重的主键 (列齐才用); 没登记的
     "ths_daily": ("ts_code", "trade_date"), "index_daily": ("ts_code", "trade_date"), "sw_daily": ("ts_code", "trade_date"),
     "stock_basic": ("ts_code",), "trade_cal": ("exchange", "cal_date"),
 }
-POOL_GRACE_SEC = 30         # 进程级硬期限之外再给池机制这么久 (建池 / 就绪探针 / terminate): 还没回来就判「池机制挂死」, 回退线程版 (10-24 非交互 Bash 的 WinError 5 形态)
-POOL_WARMUP_SEC = 20        # --probe-backup 开头的进程池热身 (_pool_ping) 期限: 健康的 spawn 池 5–8s 就绪 (2s DOA 等待 + 起解释器 + 导入); 超过它 + POOL_GRACE_SEC 即回退线程版
+POOL_GRACE_SEC = 30         # 进程级硬期限之外再给池机制这么久 (提交 / 排队 / terminate); 池还没建成时另加 datasource 自己的建池预算 (_pool_build_budget: DOA 2s +
+                            # 就绪探针 90s, 从 datasource 常量读) —— 都用完还没回来才判「池机制挂死」, 回退线程版 (10-24 非交互 Bash 的 WinError 5 形态)
+POOL_WARMUP_SEC = 20        # --probe-backup 开头的进程池热身 (_pool_ping) 期限: 健康的 spawn 池 5–8s 就绪 (2s DOA 等待 + 起解释器 + 导入); 超过它 + 宽限 (+ 建池预算) 即回退线程版
 
 #: 测试用: 置 False 后在本进程内直调 (进程池里 mock 的 session 不生效)。生产恒为 True。
 USE_PROCESS_DEADLINE = True
@@ -170,6 +183,21 @@ class TushareNoPermission(TushareError):
 
 class TushareBadParams(TushareError):
     """必填参数缺失/参数错误 (镜像对 forecast/express 要求带 ts_code) —— 不重试。"""
+
+
+class TushareTruncated(TushareError):
+    """分页截断 (2026-10-25 卡 TS-PAGINATE-2): 第一页恰满本站单页上限, 续页却拿不全 —— 续页在钉住的站失败耗尽 (或该站被判切换) / 镜像拒 offset /
+    镜像不认 offset (原样回上一页, 或续页去重后没有新行) / 续页行数 > 上限 / PAGE_MAX 到顶。**不返回截断表** (全市场按日端点少 ~560 只会被 pricestore 的
+    90% 守卫放过去写死进库), 整次 query() 抛这个 (TushareError 的直接子类, 不是 Transport: 不该被当成「可重试的传输抖动」原地重试);
+    rows / pages = 已拿到的行数 / 页数, reason = 原因 (都不含 token); 续页失败时 __cause__ 带原始异常。调用方 (pricestore update / datasource
+    daily_basic / 湖 pull_daily_basic / bulk) 走各自现有的异常路径把它当失败: 当天不写、下次再补。"""
+
+    def __init__(self, message: str, api: str = "", code=None, rows: int = 0, pages: int = 0, reason: str = ""):
+        super().__init__(message, api, code)
+        self.rows, self.pages, self.reason = int(rows), int(pages), str(reason)
+
+    def __reduce__(self):
+        return (type(self), (str(self), self.api, self.code, self.rows, self.pages, self.reason))
 
 
 _RATE_HINTS = ("每分钟最多访问", "每小时最多访问", "抽取失败", "频率", "too many", "rate limit")
@@ -267,25 +295,64 @@ def available() -> bool:
         return False
 
 
-_PAGE_LIMIT = None          # page_limit() 的缓存 (环境变量 / secrets / 缺省); credentials(refresh=True) 清掉重读
+_PAGE_LIMIT = None          # page_limit() 的缓存: int (全局一个数) 或 {host: int} (按站; 环境变量 / secrets / 缺省); credentials(refresh=True) 清掉重读
 
 
-def page_limit() -> int:
-    """本站单页上限 (行): 环境变量 TUSHARE_PAGE_LIMIT > secrets 键 tushare_page_limit > PAGE_LIMIT_DEFAULT; ≤ 0 = 关掉自动分页。
-    回包行数**恰等于**它才续页 (见 _page_more) —— 所以这个数必须是**本站真实的**单页上限: 写大了 (站只给 5000 你写 6000) 等于关掉分页, 静默少拉;
-    写小了 (站能给 5,2xx 你写 5000) 只是恰好 5000 行那天多打一页 0 行。主备两站共用一个数 (两站上限不同时按较小的写: 主站多打一页无害)。"""
+def _parse_page_limit(raw):
+    """secrets 键 tushare_page_limit / 环境变量 TUSHARE_PAGE_LIMIT 的值 -> int (全局一个数) 或 {host: int} (按站)。
+    整数或整数字串 = 全局; dict (secrets 里的 JSON 对象) 或以 "{" 开头的 JSON 字串 (环境变量) = 按站, 键是基址的 host (urlsplit 的 netloc, 如
+    "datahubco.com"; 也认完整基址; "*" = 其余站), 值是该站的单页上限; 看不懂的按缺省 PAGE_LIMIT_DEFAULT 并 WARNING (映射里某一站看不懂只丢那一站)。"""
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        return PAGE_LIMIT_DEFAULT
+    if isinstance(raw, str) and raw.strip().startswith("{"):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            log.warning("tushare_page_limit 不是整数也不是 {host: n} 映射 (%r), 按缺省 %d", raw[:80], PAGE_LIMIT_DEFAULT)
+            return PAGE_LIMIT_DEFAULT
+    if isinstance(raw, dict):
+        out = {}
+        for k, v in raw.items():
+            try:
+                out[str(k).strip().lower()] = int(str(v).strip())
+            except (TypeError, ValueError):
+                log.warning("tushare_page_limit[%r] 不是整数 (%r), 该站按缺省 %d", k, v, PAGE_LIMIT_DEFAULT)
+        return out
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning("tushare_page_limit 不是整数 (%r), 按缺省 %d", raw, PAGE_LIMIT_DEFAULT)
+        return PAGE_LIMIT_DEFAULT
+
+
+def _page_limit_config():
+    """缓存的上限配置 (int 或 {host: int}): 环境变量 TUSHARE_PAGE_LIMIT > secrets 键 tushare_page_limit > 缺省。"""
     global _PAGE_LIMIT
     if _PAGE_LIMIT is None:
         raw = os.environ.get("TUSHARE_PAGE_LIMIT")
         if raw is None or str(raw).strip() == "":
             raw = _read_secrets().get("tushare_page_limit")
-        try:
-            v = PAGE_LIMIT_DEFAULT if raw is None or str(raw).strip() == "" else int(str(raw).strip())
-        except (TypeError, ValueError):
-            log.warning("tushare_page_limit 不是整数 (%r), 按缺省 %d", raw, PAGE_LIMIT_DEFAULT)
-            v = PAGE_LIMIT_DEFAULT
-        _PAGE_LIMIT = v
+        _PAGE_LIMIT = _parse_page_limit(raw)
     return _PAGE_LIMIT
+
+
+def page_limit(base=None) -> int:
+    """`base` 这个站 (主站或备用的基址; 不传 = 不分站) 的单页上限 (行): 环境变量 TUSHARE_PAGE_LIMIT > secrets 键 tushare_page_limit > PAGE_LIMIT_DEFAULT;
+    值是整数就全站一个数, 是 {host: n} 映射就按 `base` 的 host 取 (没列的站用 "*", 再没有用缺省); ≤ 0 = 该站关掉自动分页。
+    回包行数**恰等于**它才续页 (见 _page_more) —— 所以这个数必须是**该站真实的**单页上限: 写大了 (站只给 5000 你写 6000) 等于关掉分页, 静默少拉;
+    写小了 (站能给 5,5xx 你写 5000) 只是恰好 5000 行那天多打一页 0 行。两站上限不同就按站各写 (2026-10-25 卡 TS-PAGINATE-2; 以前只有一个全局数,
+    主站真实上限 ≠ 全局数时主站被它自己的上限截断查不出来)。分页用的上限按**第一页实际打到的站**取 (_paginate)。"""
+    cfg = _page_limit_config()
+    if isinstance(cfg, dict):
+        b = str(base or "").strip()
+        for key in (b.lower(), _host(b).lower(), PAGE_LIMIT_ANY):
+            if key and key in cfg:
+                return cfg[key]
+        return PAGE_LIMIT_DEFAULT
+    try:
+        return int(cfg)
+    except (TypeError, ValueError):
+        return PAGE_LIMIT_DEFAULT
 
 
 # ---------------------------------------------------------------- 备用基址切换 (状态只在主进程, 加锁)
@@ -680,14 +747,30 @@ def _disable_pool_side(ds, reason: str) -> None:
         pass
 
 
+def _pool_build_budget(ds) -> float:
+    """datasource 自己给建池的预算 (秒) = _POOL_DOA_WAIT_SEC + _POOL_PROBE_SEC (生产 2 + 90; 从 datasource 常量读, 不写死); 读不到按 0。"""
+    try:
+        return float(getattr(ds, "_POOL_DOA_WAIT_SEC", 0) or 0) + float(getattr(ds, "_POOL_PROBE_SEC", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _pool_not_built(ds) -> bool:
+    """datasource 的池还没建成 (首次调用 / 上一次硬期限超时 terminate 之后): `_POOL is None`。这时「还没回来」可能只是建池慢 (spawn 起解释器 + 导入 +
+    就绪探针), 看门线程再给它建池预算; 池已建成却不回来才是池机制挂住。"""
+    return getattr(ds, "_POOL", None) is None
+
+
 def _deadline_call(fn, args, kwargs, deadline_sec):
-    """把一次调用交给 `ashare.datasource` 的**进程级**墙钟期限跑, 外面再套一层看门线程 (2026-10-24 卡 TS-PAGINATE)。
+    """把一次调用交给 `ashare.datasource` 的**进程级**墙钟期限跑, 外面再套一层看门线程 (2026-10-24 卡 TS-PAGINATE; 10-25 TS-PAGINATE-2 改宽限)。
 
     懒导入是为了避开 datasource -> market -> tushare_client 的循环导入; 脱离仓库单跑 (或 datasource 导不进来) 时退化为直调, 不让基础设施问题
     变成功能缺失。优先用 `_call_with_deadline` 而不是公开的 `call_with_retry`: 后者在超时路径上会顺手把**东财**标记为不可用 —— Tushare 挂了
     不该冤枉东财 (它还是兜底源)。
-    看门线程: datasource 的执行器在自己的线程里跑, 本线程最多等 deadline_sec + POOL_GRACE_SEC —— 正常情况它在 deadline_sec 内要么返回要么抛
-    TimeoutError (硬期限), 多等的 30s 只给池机制 (建池 / 就绪探针 / terminate); 到点还没回来 = 池机制挂死 (10-24 非交互 Bash: spawn 子进程
+    看门线程: datasource 的执行器在自己的线程里跑, 本线程先等 deadline_sec + POOL_GRACE_SEC —— 正常情况它在 deadline_sec 内要么返回要么抛
+    TimeoutError (硬期限), 多等的 30s 给池机制的提交 / 排队 / terminate; 到点还没回来时看 datasource 的池建成没有: **还没建成** (`_pool_not_built`) 就再等
+    它自己的建池预算 (`_pool_build_budget` = DOA 2s + 就绪探针 90s, 从 datasource 常量读) —— 池建得慢 ≠ 池机制挂住 (以前只给 30s, 比建池预算 2 + 90s 短,
+    慢但健康的池会被误判挂死、永久回退并重发请求: 校验员 10-24 D3); 池已建成却不回来、或建池预算也用完 = 池机制挂死 (10-24 非交互 Bash: spawn 子进程
     PermissionError [WinError 5] 后 Pool.terminate 等一个死掉的 handler 线程, 永不返回), 或它抛出池机制自己的异常 (_is_pool_infra_error) →
     `_disable_pool_side` 一次, 本次与余下调用改走 `_thread_call` (期限仍是 deadline_sec)。fn 自己的异常与硬期限 TimeoutError 原样抛。"""
     if not USE_PROCESS_DEADLINE:
@@ -715,11 +798,24 @@ def _deadline_call(fn, args, kwargs, deadline_sec):
             box.put((False, e))
     threading.Thread(target=_run, daemon=True, name=f"tushare-pool-{name}").start()
     tok = args[1].get("token", "") if len(args) > 1 and isinstance(args[1], dict) else ""
+    grace = POOL_GRACE_SEC
     try:
-        ok, val = box.get(timeout=float(deadline_sec) + POOL_GRACE_SEC)
+        ok, val = box.get(timeout=float(deadline_sec) + grace)
     except _q.Empty:
-        _disable_pool_side(ds, f"{name} 超过硬期限 {deadline_sec}s + {POOL_GRACE_SEC}s 仍未从进程池机制返回 (建池 / 就绪探针 / terminate 挂住)")
-        return _thread_call(fn, args, kwargs, deadline_sec, thread_msg)
+        build = _pool_build_budget(ds) if _pool_not_built(ds) else 0.0
+        got = False
+        if build > 0:
+            log.info("tushare %s 超过硬期限 %ss + 宽限 %ss 仍未返回, 但 datasource 的池尚未建成 —— 再等建池预算 %.0fs (池建得慢 ≠ 池机制挂住)",
+                     name, deadline_sec, grace, build)
+            try:
+                ok, val = box.get(timeout=build)
+                got = True
+            except _q.Empty:
+                pass
+        if not got:
+            _disable_pool_side(ds, f"{name} 超过硬期限 {deadline_sec}s + 宽限 {grace}s" + (f" + 建池预算 {build:.0f}s" if build > 0 else "")
+                               + " 仍未从进程池机制返回 (建池 / 就绪探针 / terminate 挂住)")
+            return _thread_call(fn, args, kwargs, deadline_sec, thread_msg)
     if ok:
         return val
     if _is_pool_infra_error(val):
@@ -768,44 +864,66 @@ def _dedupe(api: str, df: pd.DataFrame) -> tuple:
     return out, len(df) - len(out)
 
 
-def _paginate(api: str, p: dict, fetch, limit: int) -> pd.DataFrame:
-    """通用分页: fetch(params) -> (df, has_more, host) 打一页。第一页按原参数 (不带 offset / limit —— 对 ≤ 上限的接口零改动), 之后每页只多
-    一个 offset = 已拿到的行数, 直到 _page_more 说停 / 0 行 / 镜像不认 offset (原样回上一页) / PAGE_MAX; 合并去重, 结果 .attrs["pages"] = 页数,
-    多于一页时打一行 INFO「tushare <api>: 分页 N 页 M 行 (<host>)」。续页被拒参数 (BadParams: 镜像不支持 offset) → WARNING 并返回已拿到的页;
-    续页传输失败重试耗尽 → 整次调用抛 (宁可失败也不返回被截断的全市场表)。"""
-    df, more, host = fetch(dict(p))
+def _paginate(api: str, p: dict, fetch, limit_of) -> pd.DataFrame:
+    """通用分页 (2026-10-24 卡 TS-PAGINATE; 10-25 TS-PAGINATE-2 改口径): fetch(params, pin) -> (df, has_more, base_url, role) 打一页。
+    第一页按原参数 (不带 offset / limit —— 对 ≤ 上限的接口零改动), pin=None (经切换机制选站); 本站单页上限 = limit_of(第一页实际打到的基址)
+    (按站配, 见 page_limit); 之后每页只多一个 offset = 已拿到的行数, **钉在第一页的那个站** (pin=(base, role)): 两站行集不同 (10-24 主站 daily 5562 行 /
+    备用 5559 行, 行序也未必一致), 第一页在 A 站、续页在 B 站按 B 站的「第 5000 行之后」拼出来的表会静默丢行 (校验员 E1/E2) —— 所以切换 / 回切只在
+    query() 之间生效, 续页在钉住的站上失败耗尽就整次抛, 不跨站拼页也不返回截断表。
+    停止: _page_more 说停 (不足一页 / has_more=False) 或续页 0 行 → 正常返回 (合并去重; 结果 .attrs["pages"] = 页数; 多于一页才打一行 INFO
+    「tushare <api>: 分页 N 页 M 行 (<host>)」, 恰满一页而续页 0 行的不打)。**截断一律抛 TushareTruncated** (带已拿到行数 / 页数 / 原因, 先打一行 WARNING
+    「分页截断」): 续页失败 (重试耗尽 / 本站被判切换) / 镜像拒 offset (BadParams) / 镜像不认 offset (原样回上一页, 或续页去重后没有新行 —— 行序不稳的镜像以前
+    会翻满 PAGE_MAX=40 页) / 续页行数 > 上限而服务端没给 has_more (上限配置与本站不符) / PAGE_MAX 到顶。"""
+    df, more, base, role = fetch(dict(p), None)
+    limit = limit_of(base)
     if not _page_more(len(df), more, limit):
         return df
-    pages, offset, stop = [df], len(df), ""
+    host, pin = _host(base), (base, role)
+    tail = "" if not p else " " + ",".join(f"{k}={v}" for k, v in p.items())[:80]
+    merged, _ = _dedupe(api, df)
+    pages, offset = [df], len(df)
+
+    def truncated(reason: str, cause=None):
+        n_rows, n_pages = len(merged), len(pages)
+        log.warning("tushare %s: 分页截断 — %s; 已拿到 %d 行 %d 页, 不返回截断表, 整次按失败处理 (%s)%s", api, reason, n_rows, n_pages, host, tail)
+        err = TushareTruncated(f"{api}: 分页截断 ({host}) — {reason}; 已拿到 {n_rows} 行 {n_pages} 页, 不返回截断表", api,
+                               rows=n_rows, pages=n_pages, reason=reason)
+        if cause is not None:
+            raise err from cause
+        raise err
+
     while True:
         try:
-            d2, more2, host = fetch(dict(p, offset=offset))
+            d2, more2, _b, _r = fetch(dict(p, offset=offset), pin)
         except TushareBadParams as e:
-            stop = f"offset={offset} 被拒 ({str(e)[:80]}), 镜像不支持 offset 翻页, 已拿到的 {offset} 行可能不是全部"
-            break
+            truncated(f"offset={offset} 被拒 ({str(e)[:80]}), 镜像不支持 offset 翻页", e)
+        except TushareError as e:
+            truncated(f"续页 offset={offset} 失败 ({type(e).__name__}: {str(e)[:80]})", e)
         k = len(d2)
         if k == 0:
             break
+        if more2 is None and k > limit:
+            truncated(f"续页 offset={offset} 回 {k} 行 > 本站单页上限 {limit} (上限配置与本站不符, 或镜像不认 offset)")
         if k == len(pages[-1]) and d2.equals(pages[-1]):
-            stop = f"offset={offset} 回包与上一页相同的 {k} 行, 镜像不认 offset"
-            break
+            truncated(f"offset={offset} 回包与上一页相同的 {k} 行, 镜像不认 offset")
+        merged2, _ = _dedupe(api, pd.concat([merged, d2], ignore_index=True))
+        if len(merged2) == len(merged):
+            truncated(f"续页 offset={offset} 的 {k} 行去重后没有新行, 镜像不认 offset (行序不稳)")
         pages.append(d2)
+        merged = merged2
         offset += k
         if not _page_more(k, more2, limit):
             break
         if len(pages) >= PAGE_MAX:
-            stop = f"翻到 {len(pages)} 页仍满页, 截断"
-            break
-    out = pd.concat(pages, ignore_index=True)
-    out, dropped = _dedupe(api, out)
+            truncated(f"翻到 {len(pages)} 页仍满页, 超过 PAGE_MAX={PAGE_MAX}")
+    out = merged
+    dropped = sum(len(x) for x in pages) - len(out)
     try:
         out.attrs["pages"] = len(pages)
     except Exception:           # noqa: BLE001
         pass
-    tail = "" if not p else " " + ",".join(f"{k}={v}" for k, v in p.items())[:80]
-    if stop:
-        log.warning("tushare %s: %s, 停止翻页 (%s)%s", api, stop, host, tail)
-    log.info("tushare %s: 分页 %d 页 %d 行 (%s)%s%s", api, len(pages), len(out), host, f", 去重 {dropped} 行" if dropped else "", tail)
+    if len(pages) > 1:
+        log.info("tushare %s: 分页 %d 页 %d 行 (%s)%s%s", api, len(pages), len(out), host, f", 去重 {dropped} 行" if dropped else "", tail)
     return out
 
 
@@ -815,47 +933,55 @@ def query(api: str, fields: str = "", retries: int = MAX_RETRIES,
 
     params 里值为 None 的键会被丢掉 (方便可选参数直接传)。
     抛 TushareUnavailable (没 token) / TushareNoPermission / TushareBadParams (都不重试) /
-    TushareRateLimited (含网关 HTTP 429; 线性退避后仍超频) / TushareTransport (重试耗尽)。
+    TushareRateLimited (含网关 HTTP 429; 线性退避后仍超频) / TushareTransport (重试耗尽) /
+    TushareTruncated (分页截断: 续页拿不全, 不返回截断表, 见 `_paginate`)。
     每一页经 `_query_page` (限频 / 硬期限 / 重试 / 备用基址切换, 见其 docstring); 分页规则见模块 docstring「分页」:
     paginate=None (缺省) = 调用方没传 offset / limit 才自动翻 (研究湖 lake._pages 自己按 limit/offset 翻, 这里不插手); False = 不翻;
-    True = 带 limit 也按本站上限 (`page_limit()`) 翻 (传了 offset 仍不翻)。行数 < 上限 (或 page_limit() ≤ 0) 时返回的就是那一页, 与以前完全一样。
+    True = 带 limit 也按本站上限 (`page_limit(base)`, 按第一页实际打到的站) 翻 (传了 offset 仍不翻)。行数 < 上限 (或该站 page_limit ≤ 0)
+    时返回的就是那一页, 与以前完全一样。**所有页钉在第一页那个站**; 切换 / 回切只在两次 query() 之间生效。
+    **墙钟**: 每页都是一次完整调用 (retries × deadline_sec + 退避), 一次 query() 最坏 = 首页最坏 + (页数 − 1) × 单页最坏, 页数 ≤ PAGE_MAX
+    (全市场按日端点在备用上是 2 页 → 约翻倍; 见模块 docstring「最坏墙钟」); 按剩余预算算 deadline_sec 的调用方要按可能 2 页留预算, 或 paginate=False。
     """
     token, base, backup = credentials()
     if not token:
         raise TushareUnavailable(f"{api}: 未配置 tushare_token (data/secrets.json)", api)
     p = {k: v for k, v in params.items() if v is not None}
     auto = paginate is not False and "offset" not in p and (paginate is True or "limit" not in p)
-    limit = page_limit() if auto else 0
 
-    def fetch(q):
-        return _query_page(api, fields, retries, deadline_sec, q)
-    if limit <= 0:
+    def fetch(q, pin=None):
+        return _query_page(api, fields, retries, deadline_sec, q, pin)
+    if not auto:
         return fetch(p)[0]
-    return _paginate(api, p, fetch, limit)
+    return _paginate(api, p, fetch, page_limit)
 
 
-def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dict) -> tuple:
-    """一页 (一次逻辑调用, 含重试与切换) -> (DataFrame, has_more, host)。query() 的每一页都走这里; p 已去掉 None 值。
+def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dict, pin=None) -> tuple:
+    """一页 (一次逻辑调用, 含重试与切换) -> (DataFrame, has_more, 实际打到的基址, role)。query() 的每一页都走这里; p 已去掉 None 值。
     配了备用基址时 (模块 docstring「备用基址」): 开头先看要不要试探主站 (在备用上每 20 次调用 / 10 分钟一次); 每次请求前由
     主进程按切换状态选基址 (`_active_base`); 主站连续 FAILOVER_AFTER 次传输层失败 / FAILOVER_AFTER_TIMEOUTS 次硬期限超时 /
     token 失效类错误 → 切备用; 备用连续 FAILBACK_AFTER 次失败 (传输层 / 不认 key / 无权限) 或 FAILBACK_AFTER_TIMEOUTS 次硬期限超时
     且主站试探成功 → 回主站; 切换或回切后**本次调用在新基址上重新来一轮** (完整 retries 预算, 切换瞬间不退避), 但一次调用最多
     MAX_ROUNDS_PER_CALL=2 轮。没配备用键时与 7b92bb6 版一样 (除 429 与 unknown_api / invalid_params 两处刻意改动, 见模块 docstring)。
-    """
+    **pin=(base_url, role) = 续页** (2026-10-25 卡 TS-PAGINATE-2): 不试探主站, 每次都打钉住的那个站; 失败计数照记 (主站 3 连败照样切换状态、
+    备用 3 连败照样试探主站并可能回切), 但状态改了也**不在本页跟过去重来** —— 一旦切换 / 回切发生就停止本页 (break), 整次 query() 由 _paginate
+    抛 TushareTruncated, 新基址从下一次 query() 起生效 (不拼不同站的页)。"""
     token, base, backup = credentials()
     if not token:
         raise TushareUnavailable(f"{api}: 未配置 tushare_token (data/secrets.json)", api)
     payload = {"api_name": api, "token": token, "params": p, "fields": fields or ""}
     with_backup = _has_backup(base, backup)
-    if with_backup:
-        _maybe_probe_primary(token, base, backup)       # 在备用上: 到点就试探主站, 成功即回切
+    if with_backup and pin is None:
+        _maybe_probe_primary(token, base, backup)       # 在备用上: 到点就试探主站, 成功即回切 (只在第一页; 续页钉站不试探)
     last: Exception | None = None
     budget = max(1, retries)
     attempt = 0
     rounds = 1
     while attempt < budget:
         attempt += 1
-        use_base, role = _active_base(base, backup)     # 主进程判定; 工作进程只拿结果当参数
+        if pin is not None:
+            use_base, role = pin                        # 续页: 钉在第一页那个站
+        else:
+            use_base, role = _active_base(base, backup)     # 主进程判定; 工作进程只拿结果当参数
         waited = _BUCKET.acquire()
         if waited > 1.0:
             log.debug("tushare 限频等待 %.1fs (%s)", waited, api)
@@ -894,7 +1020,7 @@ def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dic
                 df = pd.DataFrame(items, columns=cols or None)
                 log.info("tushare %s: %d 行 %.1fs%s", api, len(df), time.time() - t0,
                          "" if not p else " " + ",".join(f"{k}={v}" for k, v in p.items())[:80])
-                return df, _has_more(d), _host(use_base)
+                return df, _has_more(d), use_base, role
             err = _classify(api, code, _redact(j.get("msg"), token), with_backup=with_backup)
             if role == "backup" and not isinstance(err, (TushareBadToken, TushareNoPermission)):
                 _note_backup_ok()           # 备用答了 JSON (参数错 / 超频 / 其它业务错误码也算) → 备用两个连续计数清零;
@@ -919,6 +1045,10 @@ def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dic
                     elif role == "backup":
                         restart = _note_backup_failure(token, base, backup, f"{api} code={code} (备用不认这把 key)")
         if restart:
+            if pin is not None:
+                log.warning("tushare %s 续页 (offset=%s) 钉在 %s: 基址状态已改 (下一次 query() 起生效), 本次不跨站续页, 整次按失败处理",
+                            api, p.get("offset"), _host(use_base))
+                break                   # 续页不跟着切换 / 回切过去 (不拼不同站的页); _paginate 抛 TushareTruncated
             if rounds < MAX_ROUNDS_PER_CALL:
                 rounds += 1
                 attempt = 0             # 刚切换/回切: 本次调用在新基址上重新来一轮, 不退避
@@ -1015,9 +1145,9 @@ PROBE_DAILY_MIN_RATIO = 0.9     # 备用 daily 行数与「与主站重合的代
 
 def _direct_query(url: str, token: str, api: str, fields: str, params: dict) -> pd.DataFrame:
     """绕开切换状态, 对指定基址打 (每页单次, 不重试; 走同一个进程级硬期限) -> DataFrame。业务错误按 _classify 抛。
-    与 query() 一样按本站单页上限自动分页 (调用方传了 offset / limit 则不翻): 备用 datahubco 单页 5000 行, 不分页的话 --probe-backup 的
-    「备用行数 ≥ 主站 × 0.9」永远过不了 (5000/5559 = 89.9%)。"""
-    def fetch(q):
+    与 query() 一样按该站单页上限 (`page_limit(url)`) 自动分页 (调用方传了 offset / limit 则不翻): 备用 datahubco 单页 5000 行, 不分页的话 --probe-backup 的
+    「备用行数 ≥ 主站 × 0.9」永远过不了 (5000/5559 = 89.9%); 续页失败 / 镜像不认 offset → TushareTruncated (--probe-backup 把该日记成「打不通」→ rc 1)。"""
+    def fetch(q, pin=None):
         payload = {"api_name": api, "token": token, "params": dict(q), "fields": fields}
         j = _deadline_call(_post_json, (url, payload, TIMEOUT_SEC), {}, DEADLINE_SEC)
         code = j.get("code") if isinstance(j, dict) else None
@@ -1025,12 +1155,11 @@ def _direct_query(url: str, token: str, api: str, fields: str, params: dict) -> 
             raise _classify(api, code, _redact(j.get("msg") if isinstance(j, dict) else j, token))
         d = j.get("data") or {}
         cols = list(d.get("fields") or [])
-        return pd.DataFrame(d.get("items") or [], columns=cols or None), _has_more(d), _host(url)
+        return pd.DataFrame(d.get("items") or [], columns=cols or None), _has_more(d), url, None
     p = dict(params)
-    limit = page_limit() if "offset" not in p and "limit" not in p else 0
-    if limit <= 0:
+    if "offset" in p or "limit" in p:
         return fetch(p)[0]
-    return _paginate(api, p, fetch, limit)
+    return _paginate(api, p, fetch, page_limit)
 
 
 def _daily_dates_match(df, day) -> tuple:
@@ -1062,7 +1191,7 @@ def _pages_note(df) -> str:
 def _warm_pool() -> str:
     """--probe-backup 开头: 先拿最便宜的 _pool_ping 把进程级硬期限这条路走通一次 -> 一句说明 (走的是进程池还是线程版)。池机制挂住 / 起不来
     (10-24 非交互 Bash 的 WinError 5 形态) 时在这里就按 _deadline_call 的规则回退线程版, 后面 6 次调用不再各等一轮 (最坏 POOL_WARMUP_SEC +
-    POOL_GRACE_SEC = 50s 而不是挂死)。不打 token。"""
+    POOL_GRACE_SEC + datasource 建池预算 (池还没建成时) = 20 + 30 + 92 ≈ 142s 而不是挂死)。不打 token。"""
     if not USE_PROCESS_DEADLINE:
         return "直调 (USE_PROCESS_DEADLINE=False)"
     t0 = time.time()
@@ -1079,7 +1208,8 @@ def _warm_pool() -> str:
 
 def probe_backup(out=print, today=None) -> int:
     """`python -X utf8 -m ashare.tushare_client --probe-backup`: 备用站**真验收**, 共 6 次调用 (备用按本站单页上限分页时 HTTP 次数多于 6,
-    备用 daily 行标「[分页 N 页]」; 开头另有一次不联网的进程池热身 `_warm_pool`, 池坏了在那里就回退线程版) ——
+    备用 daily 行标「[分页 N 页]」, 备用续页失败 / 镜像不认 offset → TushareTruncated → 该日「打不通」→ rc 1; 开头另有一次不联网的进程池热身
+    `_warm_pool`, 池坏了在那里就回退线程版) ——
     ① 主站 trade_cal (近 3 周 + 后 1 周) 与两个开市日的 daily (窗口内最近一个开市日 D, 以及 D 往前 PROBE_SECOND_DAY_BACK 个开市日
     的 P) 走生产路径 query() (经切换机制, 每步核 failover_state()['active'] 必须是 False = 主站正常时没切);
     ② 备用站同三项**直调** (绕开切换状态, 不重试) —— 主站健康时生产请求永远到不了备用, 所以备用地址写错 / 不认这把 key 只有直调
