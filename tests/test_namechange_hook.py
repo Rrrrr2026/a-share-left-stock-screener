@@ -15,6 +15,9 @@
   · 端到端 (真 ashare Market 克隆到临时库 + 桩钩子): 拉取日 40 天前 -> `pricestore.update_daily()` 一跑就拉, 新行只追加,
     meta namechange_pulled_at = 今天, 不写 namechange_asof; 第二跑不到期不再调
   · 美股形态 (Market 无钩子) 不调不写
+  · 旧核心旁 (2026-10-25 卡 UNIVERSE-RULES-4, 校验员 verify:UNIVERSE-RULES-3 LOW 2c): 依赖新核心 (Market 有 fetch_namechange_rows 字段 /
+    pricestore 有月刷) 的用例一律按 NEW_CORE 探测 skip 并说明, 只核钩子本身的用例照跑 —— DEPLOY 回滚 ① 只退 stock-core 时 PC 任务会把
+    旧核心 robocopy 进 vendor, 干净导出树里这份用例不能红
 """
 from __future__ import annotations
 
@@ -39,6 +42,14 @@ import leftside_core.market as lm                               # noqa: E402
 from leftside_core import pricestore as ps                      # noqa: E402
 
 FIELDS = "ts_code,name,start_date,end_date,ann_date,change_reason"
+#: 旁边的核心是不是带改名表月刷的新核心 (2026-10-24 卡 UNIVERSE-RULES-2 起): Market 有 fetch_namechange_rows 字段且 pricestore 有月刷。
+#: 旧核心旁 (ashare/config.py 查找顺序 STOCK_CORE_DIR -> ../stock-core -> vendor/; PC 共享树没 ff 就是这形态) 钩子按兼容约定不接,
+#: 下面依赖新核心的用例 skip 并说明, 不红 (校验员 verify:UNIVERSE-RULES-3 LOW 2c: 原版在旧核心旁 3 failed / 2 errors)。
+NEW_CORE = ("fetch_namechange_rows" in {f.name for f in dataclasses.fields(lm.Market)}
+            and hasattr(ps, "_refresh_namechange_if_due") and hasattr(ps, "normalize_namechange_rows"))
+needs_new_core = pytest.mark.skipif(
+    not NEW_CORE, reason="旁边的核心 (leftside_core) 比本仓老: Market 无 fetch_namechange_rows 字段 / pricestore 无改名表月刷 —— "
+                         "兼容约定下钩子不接, 这条用例只在新核心旁有意义 (ashare/config.py: STOCK_CORE_DIR -> ../stock-core -> vendor/)")
 
 
 def _df(rows):
@@ -72,9 +83,10 @@ def test_hook_shape_and_filters(monkeypatch):
     assert (seen["api"], seen["fields"], seen["params"]) == ("namechange", FIELDS, {})
     assert rows == [("000929", "*ST兰黄", "20250430", None, "20250429", "*ST"),
                     ("600439", "ST瑞贝卡", "20260901", "", "20260831", "ST")]
-    # 核心规整后可直接落表
-    assert ps.normalize_namechange_rows(rows) == [("000929", "*ST兰黄", "2025-04-30", "", "2025-04-29", "*ST"),
-                                                  ("600439", "ST瑞贝卡", "2026-09-01", "", "2026-08-31", "ST")]
+    # 核心规整后可直接落表 (规整函数是新核心才有的, 旧核心旁只核钩子本身)
+    if NEW_CORE:
+        assert ps.normalize_namechange_rows(rows) == [("000929", "*ST兰黄", "2025-04-30", "", "2025-04-29", "*ST"),
+                                                      ("600439", "ST瑞贝卡", "2026-09-01", "", "2026-08-31", "ST")]
     monkeypatch.setattr(tsc, "query", lambda *a, **k: _df([]))
     assert amkt.fetch_namechange_rows() == []
     monkeypatch.setattr(tsc, "query", lambda *a, **k: None)
@@ -87,9 +99,8 @@ def test_hook_shape_and_filters(monkeypatch):
         amkt.fetch_namechange_rows()
 
 
+@needs_new_core
 def test_market_wired():
-    if "fetch_namechange_rows" not in {f.name for f in dataclasses.fields(lm.Market)}:
-        pytest.skip("旁边的核心 (leftside_core) 比本仓老, Market 无 fetch_namechange_rows 字段: 钩子按兼容约定不接")
     assert amkt.MARKET.fetch_namechange_rows is amkt.fetch_namechange_rows
     assert lm.current().fetch_namechange_rows is amkt.fetch_namechange_rows
 
@@ -115,6 +126,8 @@ def test_attach_tolerates_old_core(caplog):
         assert amkt._attach_optional_hooks(old) is old
     assert not hasattr(old, "fetch_namechange_rows")
     assert any("无字段 fetch_namechange_rows" in r.getMessage() for r in caplog.records)
+    if not NEW_CORE:                          # 旧核心旁: 核心侧没有月刷可核, 到这里已经证明 import / 接钩子不崩
+        return
     conn = sqlite3.connect(":memory:")
     ps._ensure_schema(conn)
     assert ps._refresh_namechange_if_due(old, conn, today="2026-10-25") is None       # 核心: 无钩子 -> None, 一行不打
@@ -123,6 +136,7 @@ def test_attach_tolerates_old_core(caplog):
     conn.close()
 
 
+@needs_new_core
 def test_attach_fills_missing_and_keeps_existing():
     m = dataclasses.replace(amkt.MARKET, fetch_namechange_rows=None)
     assert amkt._attach_optional_hooks(m) is m
@@ -163,6 +177,7 @@ def tmp_market(monkeypatch):
     shutil.rmtree(tmp, True)
 
 
+@needs_new_core
 def test_update_pulls_namechange_when_due(tmp_market):
     conn = ps._conn()
     ps.meta_set({ps.NAMECHANGE_PULLED_KEY: (dt.date.today() - dt.timedelta(days=40)).isoformat()}, conn)
@@ -181,6 +196,7 @@ def test_update_pulls_namechange_when_due(tmp_market):
     assert tmp_market.calls == [1]
 
 
+@needs_new_core
 def test_update_without_hook_does_not_pull(tmp_market):
     m = dataclasses.replace(tmp_market.market, fetch_namechange_rows=None)     # 美股形态
     lm.set_market(m)
