@@ -70,8 +70,8 @@ def test_hook_shape_and_filters(monkeypatch):
     import ashare.tushare_client as tsc
     seen = {}
 
-    def fake_query(api, fields="", **params):
-        seen["api"], seen["fields"], seen["params"] = api, fields, params
+    def fake_query(api, fields="", failover_once=False, **params):
+        seen["api"], seen["fields"], seen["params"], seen["failover_once"] = api, fields, params, failover_once
         return _df([
             ("000929.SZ", "*ST兰黄", "20250430", None, "20250429", "*ST"),
             ("600439.SH", "ST瑞贝卡", "20260901", "", "20260831", "ST"),
@@ -81,6 +81,7 @@ def test_hook_shape_and_filters(monkeypatch):
     monkeypatch.setattr(tsc, "query", fake_query)
     rows = amkt.fetch_namechange_rows()
     assert (seen["api"], seen["fields"], seen["params"]) == ("namechange", FIELDS, {})
+    assert seen["failover_once"] is True        # 单次调用备用站重试 (卡 FAILOVER-1): 一次 update 只打这一次, 全局 3 连败永远凑不齐
     assert rows == [("000929", "*ST兰黄", "20250430", None, "20250429", "*ST"),
                     ("600439", "ST瑞贝卡", "20260901", "", "20260831", "ST")]
     # 核心规整后可直接落表 (规整函数是新核心才有的, 旧核心旁只核钩子本身)

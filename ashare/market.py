@@ -355,11 +355,16 @@ def fetch_namechange_rows():
     取数抛错 -> 往外抛 (核心 catch 后记一行 warning, 非致命, 行情入库不受影响)。
     1 次调用, 全表约 8,900 条 (含重复键, 主键 code+start_date+name 去重后约 4,320 行); 日期规整交核心的
     normalize_namechange_rows, 北交所 / B 股由 keep_a_code 剔掉 (与 universe 同一把尺)。与 research/rebuild_a_pricestore_tushare.py
-    的 load_namechange 同一个端点同一组字段。"""
+    的 load_namechange 同一个端点同一组字段。
+    **failover_once=True** (2026-10-27 卡 FAILOVER-1): 一次 update 只有这一次调用, 客户端的全局切换 (主站连续 3 次传输层失败 / 6 次硬期限
+    超时才切) 永远凑不齐 —— 10-26 / 10-27 服务器 kaixin8 回 JSON code=503 [upstream_pool_exhausted]、PC 3 次 120s 硬期限超时, 三天都没碰过
+    已配好的备用站。开了之后当前站一轮失败 (传输层 / 硬期限 / 5xx 类瞬时业务错误码) 立即把同一调用在另一站整体重来一次 (全部页钉在那一站,
+    不动全局切换状态); 成功 journal 一行 INFO「tushare 单次调用备用站重试: namechange 主站 <host> 失败 (…) → 备用 <host> 成功 N 行」,
+    两站都败 WARNING 一行并按原错误抛 (核心记「namechange 月刷: 拉取失败」, 明天再试)。没配备用键一切照旧。"""
     if not _tushare_on():
         return None
     from . import tushare_client as tsc
-    df = tsc.query("namechange", fields="ts_code,name,start_date,end_date,ann_date,change_reason")
+    df = tsc.query("namechange", fields="ts_code,name,start_date,end_date,ann_date,change_reason", failover_once=True)
     if df is None or len(df) == 0:
         return []
     out = []

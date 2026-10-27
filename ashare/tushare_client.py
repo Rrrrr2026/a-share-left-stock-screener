@@ -49,6 +49,17 @@ TUSHARE_BASE_URL_BACKUP 可覆盖) 配第二个站 (同一 key; 老板给的 dat
     专抓「一律回最新一天」的镜像; 两天的代码集与主站重合 ≥ 90% 且行数 ≥ 主站 × 0.9), 退出码 0 可用 / 1 不可用 / 2 判不了;
     加键之前用环境变量 TUSHARE_BASE_URL_BACKUP 临时给备用地址先验 —— 主站健康时请求永远到不了备用站, 光跑 `pricestore ready`
     什么都验不出 (10-12 校验员实证)。
+  · **单次调用备用站重试** (2026-10-27 卡 FAILOVER-1; 调用方 opt-in `query(..., failover_once=True)`): 上面的全局切换只在主站**连续** 3 次传输层失败 /
+    6 次硬期限超时 / token 失效时才切, 一次 update 只打一次 Tushare 的阶段 (改名表月刷 namechange) 永远凑不齐 —— 10-26 / 10-27 服务器上 kaixin8 回
+    JSON code=503 [upstream_pool_exhausted] (答了 JSON = 传输层正常, 计数反而清零), PC 上 3 次 120s 硬期限超时 (< 6), 三天都没碰过已配好的备用站。
+    开了 failover_once 的调用: 在当前站 (按全局状态选的主站或备用) 照常跑完一轮 (retries × 重试 / 退避, 分页规则不变); 抛出的是 TushareTransport
+    (传输层失败 / 硬期限超时 / _classify 落到 Transport 的瞬时业务错误码: 5xx 类、[upstream_pool_exhausted]、[minute_upstream_busy] 一类) 且**不是**
+    TushareBadToken → 立即把**同一调用在另一站整体重来一次** (在主站就去备用, 在备用就去主站; 所有页钉在那一站, `_query_page` 的 pin=(站, None) 路径:
+    不试探、不计数、不切换 —— 全局计数与当前站仍只由上面的规则管, 不双记也不翻转), 成功打一行 INFO「tushare 单次调用备用站重试: <api> 主站 <host> 失败
+    (<原因>) → 备用 <host> 成功 N 行 (X.Xs)」; 两站都败打一行 WARNING (同前缀, 「也失败」) 并按**原错误类型**抛出, 消息带两站。**不触发**: 没配备用键
+    (与今天完全一样, 连 try 都不进); 2002 / 40101 (TushareBadToken: 全局机制自己立即切); 429 / 超频 (只按现有退避等); 无权限 / 参数错 (永久性);
+    TushareTruncated (分页截断不是传输抖动, 语义不变); 本次调用已经由全局切换在两站各来过一轮 (再重来只是第三轮, 直接按原错误抛)。
+    墙钟: 最坏再加一轮 (retries × deadline_sec + 退避; 备用上分页再按页放大), namechange 全表在备用 2 页: 366 + 2×366 ≈ 1098s。
   进程池里跑的 `_post_json` 只拿主进程选好的基址当参数, 切换状态只在主进程 (加锁) 判定。
 
 分页 (2026-10-24 卡 TS-PAGINATE; 10-25 卡 TS-PAGINATE-2 按校验改口径): 备用站 datahubco **单页最多回 5000 行** (GM 10-24 用候选 secrets 跑 compat: 全市场按
@@ -94,7 +105,7 @@ deadline_sec + 30s; 探针把挂住误看成「活着」时再多一轮。`--pro
     failover_state() / failover_reset() -> 备用基址切换状态 (诊断 / 用例用)
     probe_backup()                   -> 备用站真验收 (命令行 --probe-backup), 退出码 0/1/2
     pool_state()                     -> 进程池回退状态 (诊断 / 用例用)
-    query(api, **params)             -> pandas DataFrame (空结果也带列名; 恰满一页自动分页, 见「分页」)
+    query(api, **params)             -> pandas DataFrame (空结果也带列名; 恰满一页自动分页, 见「分页」; failover_once=True 见「单次调用备用站重试」)
     index_daily(ts_code, start, end) -> 指数日线 DataFrame (升序)
     trade_cal(start, end)            -> 开市日列表 ["YYYY-MM-DD", ...]
     to_ts_code("sh000300")           -> "000300.SH"
@@ -1037,7 +1048,7 @@ def _paginate(api: str, p: dict, fetch, limit_of) -> pd.DataFrame:
 
 
 def query(api: str, fields: str = "", retries: int = MAX_RETRIES,
-          deadline_sec: float = DEADLINE_SEC, paginate=None, **params) -> pd.DataFrame:
+          deadline_sec: float = DEADLINE_SEC, paginate=None, failover_once: bool = False, **params) -> pd.DataFrame:
     """调用一个 Tushare 端点 -> DataFrame (无数据时返回带列名的空表)。
 
     params 里值为 None 的键会被丢掉 (方便可选参数直接传)。
@@ -1048,8 +1059,14 @@ def query(api: str, fields: str = "", retries: int = MAX_RETRIES,
     paginate=None (缺省) = 调用方没传 offset / limit 才自动翻 (研究湖 lake._pages 自己按 limit/offset 翻, 这里不插手); False = 不翻;
     True = 带 limit 也按本站上限 (`page_limit(base)`, 按第一页实际打到的站) 翻 (传了 offset 仍不翻)。行数 < 上限 (或该站 page_limit ≤ 0)
     时返回的就是那一页, 与以前完全一样。**所有页钉在第一页那个站**; 切换 / 回切只在两次 query() 之间生效。
+    **failover_once=True** (2026-10-27 卡 FAILOVER-1, 模块 docstring「单次调用备用站重试」): 配了备用基址时, 本次调用在当前站跑完一轮
+    (retries / 退避 / 分页规则都不变) 仍抛 TushareTransport (非 TushareBadToken) → 立即把同一调用在另一站整体重来一次 (所有页钉在那一站,
+    不计数、不切换、不试探; 全局切换状态只由原规则管), 成功 INFO 一行「tushare 单次调用备用站重试」, 两站都败 WARNING 一行并按原错误类型抛出
+    (消息带两站)。没配备用键 / 缺省 False 时与以前逐字节相同。给一次 update 只打一次 Tushare 的阶段 (改名表月刷 namechange) 用;
+    成批调用 (按日 daily / adj_factor / daily_basic 等) **不要开** —— 它们靠全局连续计数切换, 一开就每次调用都可能多一轮。
     **墙钟**: 每页都是一次完整调用 (retries × deadline_sec + 退避), 一次 query() 最坏 = 首页最坏 + (页数 − 1) × 单页最坏, 页数 ≤ PAGE_MAX
     (全市场按日端点在备用上是 2 页 → 约翻倍; 见模块 docstring「最坏墙钟」); 按剩余预算算 deadline_sec 的调用方要按可能 2 页留预算, 或 paginate=False。
+    failover_once 最坏再加一轮 (另一站的 首页最坏 + 续页)。
     """
     token, base, backup = credentials()
     if not token:
@@ -1057,14 +1074,79 @@ def query(api: str, fields: str = "", retries: int = MAX_RETRIES,
     p = {k: v for k, v in params.items() if v is not None}
     auto = paginate is not False and "offset" not in p and (paginate is True or "limit" not in p)
 
-    def fetch(q, pin=None):
-        return _query_page(api, fields, retries, deadline_sec, q, pin)
-    if not auto:
-        return fetch(p)[0]
-    return _paginate(api, p, fetch, page_limit)
+    def run(forced_pin=None, used=None):
+        """一次完整的逻辑调用 (单页或分页)。forced_pin=(站, None) = 单次调用备用站重试那一轮: 第一页也钉在那个站 (role None 不计数不切换),
+        续页由 _paginate 按第一页实际打到的站 (= 同一站) 自己钉。"""
+        def fetch(q, pin=None):
+            return _query_page(api, fields, retries, deadline_sec, q, pin if pin is not None else forced_pin, used=used)
+        if not auto:
+            return fetch(p)[0]
+        return _paginate(api, p, fetch, page_limit)
+
+    if not (failover_once and _has_backup(base, backup)):
+        return run()                            # 缺省 / 没配备用键: 与以前完全一样 (连 try 都不进)
+    return _run_failover_once(api, base, backup, token, run)
 
 
-def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dict, pin=None) -> tuple:
+def _failover_once_eligible(e: BaseException) -> bool:
+    """单次调用备用站重试 (卡 FAILOVER-1) 认哪些失败: 重试耗尽后抛出的 TushareTransport —— 传输层 (HTTP 非 200 非 429 / 非 JSON / 连接错 /
+    socket 超时)、进程级硬期限超时、以及 `_classify` 落到 Transport 的瞬时业务错误码 (5xx 类 / [upstream_pool_exhausted] / [minute_upstream_busy]
+    一类: 它们是 JSON 应答, 全局切换机制刻意不计 —— 主站答了 JSON 就清零, 这正是 namechange 月刷三天没切过去的原因)。
+    **不认**: TushareBadToken (2002 / 40101 或 token+无效/过期文案: 全局机制自己立即切, 不重复处理) / TushareRateLimited (429 / 超频: 只按现有
+    退避等) / TushareNoPermission / TushareBadParams (永久性, 换站也一样) / TushareTruncated (分页截断不是传输抖动, 语义不变) / 其它异常。"""
+    return isinstance(e, TushareTransport) and not isinstance(e, TushareBadToken)
+
+
+def _site_label(base: str, url: str) -> str:
+    return "主站" if url == base else "备用"
+
+
+def _strip_api_prefix(text: str, api: str) -> str:
+    """异常文本一律以「<api>: 」开头 (_classify / _query_page), 拼进「主站: … / 备用: …」时去掉, 免得一行里 api 名出现三次。"""
+    s = str(text or "")
+    head = f"{api}: "
+    return s[len(head):] if s.startswith(head) else s
+
+
+def _run_failover_once(api: str, base: str, backup: str, token: str, run) -> pd.DataFrame:
+    """query(failover_once=True) 且配了备用时的外壳 (2026-10-27 卡 FAILOVER-1): 先按原规则跑一轮 run(); 抛的是 `_failover_once_eligible` 认的失败
+    → 立即在另一站 (本轮最后打到的站是主站就去备用, 是备用就去主站) 以 pin=(站, None) 整体重来一次 —— 不计数、不切换、不试探, 全局状态只由原规则管
+    (本轮里原规则记的计数照记, 重试那一轮不再记: 不双记、不翻转)。本轮已经由全局切换在两站各来过一轮 (used 里两站都有) 就不再重来 (那只是第三轮),
+    WARNING 一行后按原错误抛。成功 INFO 一行 (GM grep「单次调用备用站重试」); 两站都败 WARNING 一行, 抛**原错误类型** (type(first)), 消息带两站与
+    各自原因, __cause__ = 另一站的异常。原因文本已抹过 token (_query_page / _classify), 这里再抹一次兜底。"""
+    used: list = []
+    t0 = time.time()
+    try:
+        return run(None, used)
+    except TushareError as e:
+        if not _failover_once_eligible(e):
+            raise
+        first = e
+    failed_on = used[-1] if used else _active_base(base, backup)[0]
+    other = backup if failed_on == base else base
+    f_label, o_label = _site_label(base, failed_on), _site_label(base, other)
+    reason = _redact(_strip_api_prefix(str(first), api), token)[:120]
+    if other in used:
+        log.warning("tushare 单次调用备用站重试: %s 本次调用已经由全局切换在 %s %s 与 %s %s 各来过一轮都失败, 不再重来 (第三轮无意义), 按原错误抛出: %s",
+                    api, o_label, _host(other), f_label, _host(failed_on), reason)
+        raise first
+    t1 = time.time()
+    try:
+        df = run((other, None), [])
+    except TushareError as e2:
+        reason2 = _redact(_strip_api_prefix(str(e2), api), token)[:120]
+        log.warning("tushare 单次调用备用站重试: %s %s %s 失败 (%s) → %s %s 也失败 (%s: %s); 两站都失败, 按原错误类型 %s 抛出 (共 %.1fs)",
+                    api, f_label, _host(failed_on), reason, o_label, _host(other), type(e2).__name__, reason2,
+                    type(first).__name__, time.time() - t0)
+        err = type(first)(f"{api}: {f_label} {_host(failed_on)} 与 {o_label} {_host(other)} 都失败 — {f_label}: {reason}; "
+                          f"{o_label}: {type(e2).__name__} {reason2}", api, first.code)
+        raise err from e2
+    log.info("tushare 单次调用备用站重试: %s %s %s 失败 (%s) → %s %s 成功 %d 行 (%.1fs; 本次调用共 %.1fs)",
+             api, f_label, _host(failed_on), reason, o_label, _host(other), len(df), time.time() - t1, time.time() - t0)
+    return df
+
+
+def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dict, pin=None, used=None) -> tuple:
     """一页 (一次逻辑调用, 含重试与切换) -> (DataFrame, has_more, 实际打到的基址, role)。query() 的每一页都走这里; p 已去掉 None 值。
     配了备用基址时 (模块 docstring「备用基址」): 开头先看要不要试探主站 (在备用上每 20 次调用 / 10 分钟一次); 每次请求前由
     主进程按切换状态选基址 (`_active_base`); 主站连续 FAILOVER_AFTER 次传输层失败 / FAILOVER_AFTER_TIMEOUTS 次硬期限超时 /
@@ -1073,7 +1155,9 @@ def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dic
     MAX_ROUNDS_PER_CALL=2 轮。没配备用键时与 7b92bb6 版一样 (除 429 与 unknown_api / invalid_params 两处刻意改动, 见模块 docstring)。
     **pin=(base_url, role) = 续页** (2026-10-25 卡 TS-PAGINATE-2): 不试探主站, 每次都打钉住的那个站; 失败计数照记 (主站 3 连败照样切换状态、
     备用 3 连败照样试探主站并可能回切), 但状态改了也**不在本页跟过去重来** —— 一旦切换 / 回切发生就停止本页 (break), 整次 query() 由 _paginate
-    抛 TushareTruncated, 新基址从下一次 query() 起生效 (不拼不同站的页)。"""
+    抛 TushareTruncated, 新基址从下一次 query() 起生效 (不拼不同站的页)。**pin=(base_url, None) = 单次调用备用站重试那一轮** (2026-10-27 卡
+    FAILOVER-1, `_run_failover_once`): 同样钉站不试探, 且 role None → 什么都不计、不切换 (全局状态只由原规则管)。`used` (list) 给了就把每次尝试
+    实际打到的基址依次 append 进去 (外壳据此判断本轮最后打到的是哪个站、两站是否都来过)。"""
     token, base, backup = credentials()
     if not token:
         raise TushareUnavailable(f"{api}: 未配置 tushare_token (data/secrets.json)", api)
@@ -1088,9 +1172,11 @@ def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dic
     while attempt < budget:
         attempt += 1
         if pin is not None:
-            use_base, role = pin                        # 续页: 钉在第一页那个站
+            use_base, role = pin                        # 续页: 钉在第一页那个站 (或单次调用备用站重试: 钉在另一站, role None)
         else:
             use_base, role = _active_base(base, backup)     # 主进程判定; 工作进程只拿结果当参数
+        if used is not None:
+            used.append(use_base)
         waited = _BUCKET.acquire()
         if waited > 1.0:
             log.debug("tushare 限频等待 %.1fs (%s)", waited, api)
