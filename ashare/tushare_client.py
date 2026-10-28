@@ -20,6 +20,8 @@ TUSHARE_BASE_URL_BACKUP 可覆盖) 配第二个站 (同一 key; 老板给的 dat
   · **切过去**: 主站连续 FAILOVER_AFTER=3 次传输层失败 (HTTP 非 200 且非 429 非 403 / 非 JSON / 连接错或 socket 超时; 跨调用、
     跨线程累计, 主站任何一次 JSON 应答即清零) 或连续 FAILOVER_AFTER_TIMEOUTS=6 次**进程级硬期限超时** (单独计, 阈值
     更高: 共享进程池被别的调用的超时 terminate 时, 在途的主站请求会一起被记成超时, 一次池重置顶多几条, 不够 6)
+    或连续 FAILOVER_AFTER_FORBIDDEN=6 次网关 HTTP 403 **且覆盖 ≥ FAILOVER_FORBIDDEN_MIN_APIS=2 个不同接口** (单独计, 2026-10-28 卡 FAILOVER-2
+    返工 1, 见下面「HTTP 403」一条: 同一接口 403 多少次都不切, 站级封禁才切)
     或返回 token 失效类错误 (code 2002 / 40101, 或文案 token+无效/过期) → 切到备用, 触发切换的那次调用在备用上重新
     来一轮完整重试; journal 一行 INFO「tushare 基址切换: 主站 <host> → 备用 <host> (原因: …)」(只打 host)。
   · **切回来**: 在备用上每 PROBE_EVERY_CALLS=20 次调用或 PROBE_EVERY_SEC=600 秒 (先到先试) 对主站打一次轻量 trade_cal
@@ -31,23 +33,33 @@ TUSHARE_BASE_URL_BACKUP 可覆盖) 配第二个站 (同一 key; 老板给的 dat
     TS-FALLBACK-3: 走池的试探撞 30s 期限会 terminate 整池, 连带在途的备用请求与 akshare 请求; 池被慢请求占满时试探还会在队列里
     等到超时而主站根本没收到请求 —— 校验员真进程池复现); 试探里抛了什么都只算「试探失败」, probing 位子在 finally 里释放。
   · **不计入切换的**: 业务错误 (无权限 40203 / unknown_api / 参数 / 超频) —— 它们是 JSON 应答, 反而清零主站计数; 网关 HTTP 429
-    限流 —— 按超频线性退避重试, 不计也不清零。15000 档把权限错误当故障会循环切换, 所以主站只有传输层才算 (备用上的无权限只触发
-    「试探主站」, 不触发切换; 主站回不来照旧把 NoPermission 抛给调用方)。
+    限流 —— 按超频线性退避重试, 不计也不清零; 网关 HTTP 403 —— 不进传输层计数, 单独计 (下一条)。15000 档把权限错误当故障会循环切换,
+    所以主站只有传输层才算 (备用上的无权限只触发「试探主站」, 不触发切换; 主站回不来照旧把 NoPermission 抛给调用方)。
   · **HTTP 403 = 该站该接口无权限, 不是站级传输故障** (2026-10-28 卡 FAILOVER-2; 当天 13:30 跑批 update.log 实录: 13:33 主站 3 次 daily Read timed out
     切到备用, 备用正常服务 daily / adj_factor / stock_basic, 13:37 却对 namechange 连回 3 次 HTTP 403 → 旧口径当传输层失败白重试 3 次 (2s/4s 退避) 并计满
     「备用连续 3 次失败」把全局状态踢回正在退化的主站, namechange 在主站又 3 次 Read timed out 才再切回备用, 月刷失败, 13:43 daily_basic 又在主站多烧
     3 次超时): `_post_json` 对 HTTP 403 抛 TushareNoPermission (消息「HTTP 403 (该站不提供此接口或无权限)」, api="http", code=403; 构造签名同
     TushareRateLimited, 能从 spawn 工作进程 pickle 回主进程, 线程回退路径同样成立); `_query_page` 把它接进与 JSON 业务码 NoPermission **完全相同**的
-    分支 (`_permanent_failure`): 一次就抛、不进 3 次重试; 主站上**不计传输层失败也不清零** (答了 HTTP 403 不算「答了 JSON」, 主站连续失败计数原样保留,
-    不切换); 备用上按卡 TS-FALLBACK-3 记一次备用失败, 满 3 次才试探主站, 主站回来了本次在主站重来, 否则把 NoPermission 抛给调用方。日志一行 WARNING
-    「tushare <api> 该站无权限 (HTTP 403, <host>), 不重试」(GM 按它 grep)。权限是**按站不同的** (主站能服务 namechange 而备用不能, 反过来主站缺
-    income_vip), 所以「单次调用备用站重试」的可换站类型也把 TushareNoPermission (HTTP 403 或 JSON 无权限) 纳入 (见该条)。`--probe-backup` 另加 1 次
-    信息性 namechange 备用直调 (403 → 打印「备用不提供 namechange (HTTP 403) — 月刷只能靠主站」, 成功 → 打印行数; 不改退出码)。
+    分支 (`_permanent_failure`): 一次就抛、不进 3 次重试; 主站上**不计传输层失败也不清零** (答了 HTTP 403 不算「答了 JSON」, 主站连续传输层失败 /
+    硬期限两个计数原样保留), 但进一个**独立的连续计数** `forbidden` (同日返工 1, 校验员: 站级 403 —— CDN/WAF 封 IP、网关按 key 封禁、镜像整站下线回 403 ——
+    以前 3 次就切备用, 一刀切成「不计」会让成批调用 (daily / adj_factor / daily_basic 都不开 failover_once) 在主站被封时整轮全败而备用明明健康; 事实依据只有
+    备用站对单一接口的一次观测, 不足以证明主站 403 也一定是按接口的): 连续满 FAILOVER_AFTER_FORBIDDEN=6 次 (与硬期限同阈值) **且这一串 403 覆盖 ≥
+    FAILOVER_FORBIDDEN_MIN_APIS=2 个不同 api_name** 才切到备用并把本次调用在备用重来 (`_note_primary_forbidden`; 按接口的无权限只会卡在同一个接口上 ——
+    同一接口 403 多少次都不切, 切过去另一站多半也没有、还会跟备用的 3 连败试探乒乓; 站级封禁会连着打到 daily / adj_factor / daily_basic), 主站任何 JSON
+    应答照旧清零它 (`_note_primary_ok`), 回切也清, 切换时与别的计数一样不清; 切换行「tushare 基址切换: … (原因: 主站连续 N 次 HTTP 403 覆盖 K 个接口 (a, b),
+    最后一次: <api> HTTP 403)」, 触发切换的那次调用打 WARNING「tushare <api> 在主站 HTTP 403 (<host>), 主站连续 403 已覆盖多个接口 = 站级封禁, 已切到备用,
+    本次在备用重来」而不打「不重试」行; 备用上按卡 TS-FALLBACK-3 记一次备用失败 (不碰 forbidden), 满 3 次才试探主站, 主站回来了本次在主站重来, 否则把
+    NoPermission 抛给调用方。日志一行 WARNING「tushare <api> 该站无权限 (HTTP 403, <host>), 不重试」(GM 按它 grep)。权限是**按站不同的** (主站能服务
+    namechange 而备用不能, 反过来主站缺 income_vip), 所以「单次调用备用站重试」的可换站类型也把 TushareNoPermission (HTTP 403 或 JSON 无权限) 纳入 (见该条;
+    那一轮 role None 不计 forbidden)。`--probe-backup` 另加 1 次信息性 namechange 备用直调 (403 → 打印「备用不提供 namechange (HTTP 403) — 月刷只能靠主站」,
+    成功 → 打印行数; 不改退出码)。**没配备用键也一样**一次就抛 TushareNoPermission (不计数、不切换; 用例 test_primary_http403_without_backup_raises_once)
+    —— 这是「有无备用都生效的三处刻意改动」的第三处 (下一条)。
   · **没配备用键**: 不计数、不切换、不试探, 错误分类顺序 (超频 → 参数 → 权限 → 传输) 与异常类型同 7b92bb6 版 (用例逐字节钉住);
-    token 失效文案只在配了备用时才单独分出来 (TushareBadToken) 用于立即切换。**有无备用都生效的两处刻意改动** (2026-10-12):
-    网关 HTTP 429 从「传输错误 2s/4s 退避抛 Transport」改成「超频 12s/24s 退避抛 RateLimited」; 「[unknown_api]」「[invalid_params]」
+    token 失效文案只在配了备用时才单独分出来 (TushareBadToken) 用于立即切换。**有无备用都生效的三处刻意改动** (前两处 2026-10-12, 第三处
+    2026-10-28 卡 FAILOVER-2): 网关 HTTP 429 从「传输错误 2s/4s 退避抛 Transport」改成「超频 12s/24s 退避抛 RateLimited」; 「[unknown_api]」「[invalid_params]」
     及含「未开放」「参数缺失」的文案一次就抛 (NoPermission / BadParams), 不再白重试 3 次 —— 这两个子串比 kaixin8 实测的两种形态宽,
-    是有意的 (都是永久性条件)。
+    是有意的 (都是永久性条件); 网关 HTTP 403 从「传输错误 2s/4s 退避重试 3 次抛 Transport」改成「一次就抛 TushareNoPermission」(见上面「HTTP 403」
+    一条; 没配备用键时只是不重试, 不计数也不切换)。
   · **最坏墙钟**: 没备用 3×120 + 退避 2+4 ≈ 366s; 配了备用, 一次调用最多两轮 + 最多两次主站试探 (各 ≤ 30s):
     2×366 + 2×30 ≈ 792s ≈ 13 分钟 —— 有 TimeoutStartSec 的调用方按这个数收紧 retries / deadline_sec (见 trade_cal)。**分页的调用按页放大**
     (10-25 补): 每页都是一次完整调用, 一次 query() 的总墙钟上限 = 首页最坏 + (页数 − 1) × 单页最坏 (续页钉在同一站: 单页 = retries × deadline_sec + 退避,
@@ -155,8 +167,11 @@ DEADLINE_SEC = 120          # 进程级墙钟硬期限 (fina_indicator_vip 实�
 MAX_RETRIES = 3
 BACKOFF_SEC = 2.0           # 瞬时错误退避基数 (指数退避)
 BACKOFF_RATE_SEC = 12.0     # 超频退避基数 (线性退避)
-FAILOVER_AFTER = 3          # 主站连续这么多次传输层失败 (HTTP 非 200 非 429 非 403 / 非 JSON / 连接错) → 切到备用基址 (配了备用才计; 403 = 该站该接口无权限, 不计, 卡 FAILOVER-2)
+FAILOVER_AFTER = 3          # 主站连续这么多次传输层失败 (HTTP 非 200 非 429 非 403 / 非 JSON / 连接错) → 切到备用基址 (配了备用才计; 403 单独计, 见下面两行, 卡 FAILOVER-2)
 FAILOVER_AFTER_TIMEOUTS = 6 # 主站连续这么多次进程级硬期限超时才切 (单独计, 阈值更高: 共享进程池被别人的超时重置会连带在途请求)
+FAILOVER_AFTER_FORBIDDEN = 6    # 主站连续这么多次网关 HTTP 403 (单独计, 与硬期限同阈值) **且** 这一串 403 覆盖 ≥ FAILOVER_FORBIDDEN_MIN_APIS 个不同接口才切
+                                # (2026-10-28 卡 FAILOVER-2 返工 1: 站级封禁 —— CDN/WAF 封 IP / 网关按 key 封 / 整站下线回 403 —— 会连着打到 daily / adj_factor / daily_basic)
+FAILOVER_FORBIDDEN_MIN_APIS = 2 # 按接口的无权限 (10-28 实录 datahubco 对 namechange) 只会卡在同一个接口上: 同一接口 403 多少次都不切 (切过去另一站多半也没有, 还会乒乓)
 FAILBACK_AFTER = 3          # 备用连续这么多次失败 (传输层 / 不认 key / 无权限) → 试探主站一次, 成功即回切 (坏备用不把主站一次抖动放大成整轮停摆)
 FAILBACK_AFTER_TIMEOUTS = 6 # 备用连续这么多次进程级硬期限超时才试探 (单独计, 与主站同口径: 共享进程池被别人的超时重置会连带在途的备用请求)
 PROBE_EVERY_CALLS = 20      # 在备用上每这么多次调用试探主站一次 (轻量 trade_cal)
@@ -219,7 +234,8 @@ class TushareNoPermission(TushareError):
     """积分/权限不足 —— 重试无意义, 直接抛给调用方去回退。JSON 业务码 (_classify) 与网关 **HTTP 403** (_post_json; 2026-10-28 卡 FAILOVER-2:
     备用站 datahubco 对 namechange 回 403 而主站能服务 —— 该站该接口的确定性无权限, 不是站级传输故障) 都是它; 构造签名 (message, api, code)
     不变, 403 那种 api="http", code=403, 能从 spawn 工作进程 pickle 回主进程 (与 TushareRateLimited 同)。权限按站不同, 所以 failover_once
-    把它也纳入可换站类型 (_failover_once_eligible)。"""
+    把它也纳入可换站类型 (_failover_once_eligible)。主站上的 HTTP 403 另进独立的连续计数 (同日返工 1: 连续 6 次且覆盖 ≥ 2 个不同接口 = 站级封禁才切备用,
+    见 _note_primary_forbidden)。"""
 
 
 class TushareBadParams(TushareError):
@@ -401,10 +417,12 @@ def page_limit(base=None) -> int:
 _FO_LOCK = threading.Lock()
 #: 初始状态 (failover_reset 回到这里; 用例也拿它比):
 #:   active 在备用上 / fails 主站连续传输层失败 / timeouts 主站连续硬期限超时 (单独计) / reason+switched_at 上次切换
+#:   forbidden 主站连续网关 HTTP 403 (单独计, 卡 FAILOVER-2 返工 1) / forbidden_apis 这一串 403 打到过的接口名 (排好序的 tuple —— 不可变, 复制状态时不共享;
+#:     连续满 FAILOVER_AFTER_FORBIDDEN 次且 len ≥ FAILOVER_FORBIDDEN_MIN_APIS 才切) /
 #:   backup_fails 备用连续失败 (传输层 / 不认 key / 无权限) / backup_timeouts 备用连续硬期限超时 (单独计) /
 #:   calls_on_backup 切换 (或上次试探) 以来在备用上的调用数 / last_probe_at 上次试探 (monotonic)
 #:   probing 有线程正在试探 / probes·switches·returns 累计次数 (诊断)
-_FO_INITIAL = {"active": False, "fails": 0, "timeouts": 0, "reason": "", "switched_at": None,
+_FO_INITIAL = {"active": False, "fails": 0, "timeouts": 0, "forbidden": 0, "forbidden_apis": (), "reason": "", "switched_at": None,
                "backup_fails": 0, "backup_timeouts": 0, "calls_on_backup": 0, "last_probe_at": None, "probing": False,
                "probes": 0, "switches": 0, "returns": 0}
 _FO = dict(_FO_INITIAL)
@@ -447,8 +465,8 @@ def _return_locked(base: str, backup: str, reason: str) -> None:
     """调用方持 _FO_LOCK。回到主站: 两边计数全部清零 (主站从头算), 打一行 INFO。"""
     on_backup = time.time() - (_FO["switched_at"] or time.time())
     n = _FO["calls_on_backup"]
-    _FO.update(active=False, reason="", switched_at=None, fails=0, timeouts=0, backup_fails=0, backup_timeouts=0,
-               calls_on_backup=0, last_probe_at=None)
+    _FO.update(active=False, reason="", switched_at=None, fails=0, timeouts=0, forbidden=0, forbidden_apis=(),
+               backup_fails=0, backup_timeouts=0, calls_on_backup=0, last_probe_at=None)
     _FO["returns"] += 1
     log.info("tushare 基址回切: 备用 %s → 主站 %s (原因: %s; 在备用 %d 次调用 / %.0f 秒)",
              _host(backup), _host(base), reason, n, on_backup)
@@ -481,6 +499,26 @@ def _note_primary_timeout(base: str, backup: str, reason: str) -> bool:
         return True
 
 
+def _note_primary_forbidden(api: str, base: str, backup: str, reason: str) -> bool:
+    """主站一次网关 HTTP 403 (2026-10-28 卡 FAILOVER-2 返工 1)。**单独计** (forbidden; 不碰传输层 / 硬期限两个计数, 也不清零它们), 阈值
+    FAILOVER_AFTER_FORBIDDEN=6 (与硬期限同口径), 且这一串连续 403 要**覆盖 ≥ FAILOVER_FORBIDDEN_MIN_APIS=2 个不同 api_name** 才切: 按接口的无权限
+    (10-28 实录 datahubco 对 namechange) 只会卡在同一个接口上 —— 同一接口 403 多少次都不切 (切过去另一站多半也没有, 还会跟备用的 3 连败试探乒乓);
+    站级封禁 (CDN/WAF 封 IP、网关按 key 封禁、镜像整站下线回 403) 会连着打到 daily / adj_factor / daily_basic —— 校验员: 以前 3 次 403 就切备用,
+    一刀切成「不计」会让成批调用在主站被封时整轮全败而备用明明健康。主站任何 JSON 应答清零 (_note_primary_ok), 回切也清, 切换时与别的计数一样不清。
+    满了 → 切换并返回 True (本次调用随即在备用上重来一轮); 已经切过 (本线程或别的线程) → False, 不计。api 名进日志没问题 (不是凭据)。"""
+    with _FO_LOCK:
+        if _FO["active"]:
+            return False
+        _FO["forbidden"] += 1
+        apis = tuple(sorted(set(_FO["forbidden_apis"]) | {str(api)}))
+        _FO["forbidden_apis"] = apis
+        if _FO["forbidden"] < FAILOVER_AFTER_FORBIDDEN or len(apis) < FAILOVER_FORBIDDEN_MIN_APIS:
+            return False
+        shown = ", ".join(apis[:6]) + (" …" if len(apis) > 6 else "")
+        _switch_locked(base, backup, f"主站连续 {_FO['forbidden']} 次 HTTP 403 覆盖 {len(apis)} 个接口 ({shown}), 最后一次: {reason}")
+        return True
+
+
 def _note_primary_token_error(base: str, backup: str, reason: str) -> bool:
     """主站返回 token 失效类错误 → 立即切换 (同一 key 在备用站可能仍有效: 各镜像各自校验)。"""
     with _FO_LOCK:
@@ -491,10 +529,12 @@ def _note_primary_token_error(base: str, backup: str, reason: str) -> bool:
 
 
 def _note_primary_ok() -> None:
-    """主站答了 JSON (code 0 或业务错误码都算): 传输层正常, 两个连续计数都清零。"""
+    """主站答了 JSON (code 0 或业务错误码都算): 传输层正常, 三个连续计数 (传输层 / 硬期限 / HTTP 403) 都清零。"""
     with _FO_LOCK:
         _FO["fails"] = 0
         _FO["timeouts"] = 0
+        _FO["forbidden"] = 0
+        _FO["forbidden_apis"] = ()
 
 
 def _note_backup_ok() -> None:
@@ -1169,15 +1209,23 @@ def _run_failover_once(api: str, base: str, backup: str, token: str, run) -> pd.
     return df
 
 
-def _permanent_failure(api: str, err: TushareError, role, use_base: str, token: str, base: str, backup: str, reason: str, how: str) -> bool:
+def _permanent_failure(api: str, err: TushareError, role, use_base: str, token: str, base: str, backup: str, reason: str, how: str,
+                       forbidden: bool = False) -> bool:
     """NoPermission / BadParams 的共同出口 —— JSON 业务码路径与网关 HTTP 403 路径走**同一个分支** (2026-10-28 卡 FAILOVER-2): 永久性, 一次就抛, 不进重试。
     备用上的 NoPermission 记一次备用失败 (卡 TS-FALLBACK-3: 15000 档缺的接口): 连续满 FAILBACK_AFTER 次就试探主站, 主站回来了返回 True (调用方随即
     在主站重来本次调用); 其余 (主站 / 没配备用 / 单次换站那轮的 role None / 备用上的 BadParams / 主站没回来) 打一行 WARNING 后把 err 抛出去。
     `how` 是日志里对这次失败的称呼: JSON 业务码「永久性失败」(与以前一字不差), 网关 403「该站无权限 (HTTP 403, <host>)」(GM 按它 grep)。
-    主站计数在这里**什么都不碰**: JSON 应答的清零由调用方在进来之前做 (答了 JSON 才算), HTTP 403 不清零也不计 (答了 403 不算答了 JSON)。"""
+    `forbidden=True` = 网关 HTTP 403 路径 (同日返工 1): 主站上进独立的连续计数 (`_note_primary_forbidden`; 传输层 / 硬期限两个计数不碰也不清零 ——
+    答了 403 不算答了 JSON), 连续满 FAILOVER_AFTER_FORBIDDEN 次且覆盖 ≥ FAILOVER_FORBIDDEN_MIN_APIS 个不同接口 (站级封禁) → 切到备用, 返回 True
+    (调用方随即在备用重来本次调用), 这次不打「不重试」行; JSON 业务码路径 forbidden=False: 主站计数什么都不碰 (JSON 应答的清零由调用方在进来之前做)。"""
     if role == "backup" and isinstance(err, TushareNoPermission):
         if _note_backup_failure(token, base, backup, reason):
             log.warning("tushare %s 在备用无权限 (%s), 主站已回来, 本次在主站重来: %s", api, _host(use_base), err)
+            return True
+    elif role == "primary" and forbidden:
+        if _note_primary_forbidden(api, base, backup, reason):
+            log.warning("tushare %s 在主站 HTTP 403 (%s), 主站连续 403 已覆盖多个接口 = 站级封禁, 已切到备用, 本次在备用重来: %s",
+                        api, _host(use_base), err)
             return True
     log.warning("tushare %s %s, 不重试: %s", api, how, err)
     raise err
@@ -1186,12 +1234,14 @@ def _permanent_failure(api: str, err: TushareError, role, use_base: str, token: 
 def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dict, pin=None, used=None) -> tuple:
     """一页 (一次逻辑调用, 含重试与切换) -> (DataFrame, has_more, 实际打到的基址, role)。query() 的每一页都走这里; p 已去掉 None 值。
     网关 HTTP 403 (2026-10-28 卡 FAILOVER-2) 从 _post_json 以 TushareNoPermission 抛上来, 在下面显式接住 (它不是 TushareTransport 的子类, 不接住
-    会从循环里直接漏出去: 主站上碰巧像「一次就抛」, 备用上却记不到那一次备用失败也没有日志行) 并走与 JSON 无权限完全相同的 `_permanent_failure`。
+    会从循环里直接漏出去: 主站上碰巧像「一次就抛」, 备用上却记不到那一次备用失败也没有日志行) 并走与 JSON 无权限完全相同的 `_permanent_failure`
+    (forbidden=True: 主站上进独立的 forbidden 连续计数, 同日返工 1)。
     配了备用基址时 (模块 docstring「备用基址」): 开头先看要不要试探主站 (在备用上每 20 次调用 / 10 分钟一次); 每次请求前由
-    主进程按切换状态选基址 (`_active_base`); 主站连续 FAILOVER_AFTER 次传输层失败 / FAILOVER_AFTER_TIMEOUTS 次硬期限超时 /
-    token 失效类错误 → 切备用; 备用连续 FAILBACK_AFTER 次失败 (传输层 / 不认 key / 无权限) 或 FAILBACK_AFTER_TIMEOUTS 次硬期限超时
-    且主站试探成功 → 回主站; 切换或回切后**本次调用在新基址上重新来一轮** (完整 retries 预算, 切换瞬间不退避), 但一次调用最多
-    MAX_ROUNDS_PER_CALL=2 轮。没配备用键时与 7b92bb6 版一样 (除 429 与 unknown_api / invalid_params 两处刻意改动, 见模块 docstring)。
+    主进程按切换状态选基址 (`_active_base`); 主站连续 FAILOVER_AFTER 次传输层失败 / FAILOVER_AFTER_TIMEOUTS 次硬期限超时 / FAILOVER_AFTER_FORBIDDEN 次
+    网关 HTTP 403 且覆盖 ≥ FAILOVER_FORBIDDEN_MIN_APIS 个不同接口 / token 失效类错误 → 切备用; 备用连续 FAILBACK_AFTER 次失败 (传输层 / 不认 key / 无权限)
+    或 FAILBACK_AFTER_TIMEOUTS 次硬期限超时且主站试探成功 → 回主站; 切换或回切后**本次调用在新基址上重新来一轮** (完整 retries 预算, 切换瞬间不退避),
+    但一次调用最多 MAX_ROUNDS_PER_CALL=2 轮。没配备用键时与 7b92bb6 版一样 (除 429、unknown_api / invalid_params 与网关 HTTP 403 三处刻意改动, 见模块
+    docstring)。
     **pin=(base_url, role) = 续页** (2026-10-25 卡 TS-PAGINATE-2): 不试探主站, 每次都打钉住的那个站; 失败计数照记 (主站 3 连败照样切换状态、
     备用 3 连败照样试探主站并可能回切), 但状态改了也**不在本页跟过去重来** —— 一旦切换 / 回切发生就停止本页 (break), 整次 query() 由 _paginate
     抛 TushareTruncated, 新基址从下一次 query() 起生效 (不拼不同站的页)。**pin=(base_url, None) = 单次调用备用站重试那一轮** (2026-10-27 卡
@@ -1233,10 +1283,12 @@ def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dic
         except TushareRateLimited as e:                 # 网关 HTTP 429: 限流不是故障, 线性退避重试; 不计入切换、不清零
             last = TushareRateLimited(f"{api}: {e}", api, 429)
             log.warning("tushare %s 限流 %d/%d (%s): %s", api, attempt, budget, _host(use_base), str(e)[:120])
-        except TushareNoPermission as e:                # 网关 HTTP 403 (卡 FAILOVER-2): 该站该接口无权限, 不是站级传输故障 —— 与 JSON 无权限同一分支:
-            last = TushareNoPermission(f"{api}: {_redact(str(e), token)}", api, e.code)      # 一次就抛不重试; 主站不计传输层失败也不清零; 备用记一次备用失败
-            restart = _permanent_failure(api, last, role, use_base, token, base, backup, f"{api} HTTP {e.code} (备用无权限或没这个接口)",
-                                         f"该站无权限 (HTTP {e.code}, {_host(use_base)})")
+        except TushareNoPermission as e:                # 网关 HTTP 403 (卡 FAILOVER-2): 该站该接口无权限 —— 与 JSON 无权限同一分支 (_permanent_failure):
+            last = TushareNoPermission(f"{api}: {_redact(str(e), token)}", api, e.code)      # 一次就抛不重试; 主站不计传输层失败也不清零, 只进独立的 forbidden
+            why = (f"{api} HTTP {e.code} (备用无权限或没这个接口)" if role == "backup"      # 计数 (返工 1: 连续 6 次且覆盖 ≥ 2 个接口 = 站级封禁才切);
+                   else f"{api} HTTP {e.code}")                                                # 备用记一次备用失败
+            restart = _permanent_failure(api, last, role, use_base, token, base, backup, why,
+                                         f"该站无权限 (HTTP {e.code}, {_host(use_base)})", forbidden=True)
         except (TushareTransport, OSError, ValueError) as e:   # requests 异常 (含 socket 超时) 继承 OSError
             text = _redact(str(e), token)
             last = e if isinstance(e, TushareError) else TushareTransport(f"{api}: {text}", api)
