@@ -33,8 +33,9 @@ TUSHARE_BASE_URL_BACKUP 可覆盖) 配第二个站 (同一 key; 老板给的 dat
     TS-FALLBACK-3: 走池的试探撞 30s 期限会 terminate 整池, 连带在途的备用请求与 akshare 请求; 池被慢请求占满时试探还会在队列里
     等到超时而主站根本没收到请求 —— 校验员真进程池复现); 试探里抛了什么都只算「试探失败」, probing 位子在 finally 里释放。
   · **不计入切换的**: 业务错误 (无权限 40203 / unknown_api / 参数 / 超频) —— 它们是 JSON 应答, 反而清零主站计数; 网关 HTTP 429
-    限流 —— 按超频线性退避重试, 不计也不清零; 网关 HTTP 403 —— 不进传输层计数, 单独计 (下一条)。15000 档把权限错误当故障会循环切换,
-    所以主站只有传输层才算 (备用上的无权限只触发「试探主站」, 不触发切换; 主站回不来照旧把 NoPermission 抛给调用方)。
+    限流 —— 按超频线性退避重试, 不计也不清零; 网关 HTTP 403 —— 不进传输层计数, 单独计 (下一条)。15000 档把 JSON 权限错误当故障会循环切换,
+    所以主站的 JSON 无权限不算、只有传输层才算; 主站的网关 HTTP 403 是唯一例外, 走下一条的独立计数 (连续 6 次且覆盖 ≥ 2 个接口才切)
+    (备用上的无权限只触发「试探主站」, 不触发切换; 主站回不来照旧把 NoPermission 抛给调用方)。
   · **HTTP 403 = 该站该接口无权限, 不是站级传输故障** (2026-10-28 卡 FAILOVER-2; 当天 13:30 跑批 update.log 实录: 13:33 主站 3 次 daily Read timed out
     切到备用, 备用正常服务 daily / adj_factor / stock_basic, 13:37 却对 namechange 连回 3 次 HTTP 403 → 旧口径当传输层失败白重试 3 次 (2s/4s 退避) 并计满
     「备用连续 3 次失败」把全局状态踢回正在退化的主站, namechange 在主站又 3 次 Read timed out 才再切回备用, 月刷失败, 13:43 daily_basic 又在主站多烧
@@ -1210,22 +1211,24 @@ def _run_failover_once(api: str, base: str, backup: str, token: str, run) -> pd.
 
 
 def _permanent_failure(api: str, err: TushareError, role, use_base: str, token: str, base: str, backup: str, reason: str, how: str,
-                       forbidden: bool = False) -> bool:
+                       forbidden: bool = False, pinned: bool = False) -> bool:
     """NoPermission / BadParams 的共同出口 —— JSON 业务码路径与网关 HTTP 403 路径走**同一个分支** (2026-10-28 卡 FAILOVER-2): 永久性, 一次就抛, 不进重试。
     备用上的 NoPermission 记一次备用失败 (卡 TS-FALLBACK-3: 15000 档缺的接口): 连续满 FAILBACK_AFTER 次就试探主站, 主站回来了返回 True (调用方随即
     在主站重来本次调用); 其余 (主站 / 没配备用 / 单次换站那轮的 role None / 备用上的 BadParams / 主站没回来) 打一行 WARNING 后把 err 抛出去。
     `how` 是日志里对这次失败的称呼: JSON 业务码「永久性失败」(与以前一字不差), 网关 403「该站无权限 (HTTP 403, <host>)」(GM 按它 grep)。
     `forbidden=True` = 网关 HTTP 403 路径 (同日返工 1): 主站上进独立的连续计数 (`_note_primary_forbidden`; 传输层 / 硬期限两个计数不碰也不清零 ——
     答了 403 不算答了 JSON), 连续满 FAILOVER_AFTER_FORBIDDEN 次且覆盖 ≥ FAILOVER_FORBIDDEN_MIN_APIS 个不同接口 (站级封禁) → 切到备用, 返回 True
-    (调用方随即在备用重来本次调用), 这次不打「不重试」行; JSON 业务码路径 forbidden=False: 主站计数什么都不碰 (JSON 应答的清零由调用方在进来之前做)。"""
+    (调用方随即在备用重来本次调用), 这次不打「不重试」行; JSON 业务码路径 forbidden=False: 主站计数什么都不碰 (JSON 应答的清零由调用方在进来之前做)。
+    `pinned=True` = 续页 (pin 非 None): 计数照记, 但状态改了本页也不跟过去 (调用方 break → _paginate 抛 TushareTruncated), 两行「重来」日志的措辞随之改成「本页钉站不跟过去」。"""
     if role == "backup" and isinstance(err, TushareNoPermission):
         if _note_backup_failure(token, base, backup, reason):
-            log.warning("tushare %s 在备用无权限 (%s), 主站已回来, 本次在主站重来: %s", api, _host(use_base), err)
+            log.warning("tushare %s 在备用无权限 (%s), 主站已回来, %s: %s", api, _host(use_base),
+                        "本页钉站不跟过去, 整次按截断处理 (续页)" if pinned else "本次在主站重来", err)
             return True
     elif role == "primary" and forbidden:
         if _note_primary_forbidden(api, base, backup, reason):
-            log.warning("tushare %s 在主站 HTTP 403 (%s), 主站连续 403 已覆盖多个接口 = 站级封禁, 已切到备用, 本次在备用重来: %s",
-                        api, _host(use_base), err)
+            log.warning("tushare %s 在主站 HTTP 403 (%s), 主站连续 403 已覆盖多个接口 = 站级封禁, 已切到备用, %s: %s",
+                        api, _host(use_base), "本页钉站不跟过去, 整次按截断处理 (续页)" if pinned else "本次在备用重来", err)
             return True
     log.warning("tushare %s %s, 不重试: %s", api, how, err)
     raise err
@@ -1288,7 +1291,7 @@ def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dic
             why = (f"{api} HTTP {e.code} (备用无权限或没这个接口)" if role == "backup"      # 计数 (返工 1: 连续 6 次且覆盖 ≥ 2 个接口 = 站级封禁才切);
                    else f"{api} HTTP {e.code}")                                                # 备用记一次备用失败
             restart = _permanent_failure(api, last, role, use_base, token, base, backup, why,
-                                         f"该站无权限 (HTTP {e.code}, {_host(use_base)})", forbidden=True)
+                                         f"该站无权限 (HTTP {e.code}, {_host(use_base)})", forbidden=True, pinned=pin is not None)
         except (TushareTransport, OSError, ValueError) as e:   # requests 异常 (含 socket 超时) 继承 OSError
             text = _redact(str(e), token)
             last = e if isinstance(e, TushareError) else TushareTransport(f"{api}: {text}", api)
@@ -1319,7 +1322,7 @@ def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dic
                 # 永久性, 一次就抛 (与网关 HTTP 403 同一个出口 _permanent_failure, 卡 FAILOVER-2): 备用无权限 / 没这个接口 (15000 档比主站少) 在备用上
                 # 重试没用, 但算一次备用失败 —— 连续满 3 次就试探主站, 主站回来了本次调用就在主站重来 (主站有权限); 回不来才抛给调用方 (卡 TS-FALLBACK-3)
                 last = err
-                restart = _permanent_failure(api, err, role, use_base, token, base, backup, f"{api} code={code} (备用无权限或没这个接口)", "永久性失败")
+                restart = _permanent_failure(api, err, role, use_base, token, base, backup, f"{api} code={code} (备用无权限或没这个接口)", "永久性失败", pinned=pin is not None)
             else:
                 last = err
                 log.warning("tushare %s 失败 %d/%d (%s): %s", api, attempt, budget, _host(use_base), err)
