@@ -15,7 +15,8 @@
   · 没配备用键 (或备用 = 主站) → 与以前一样: 错误原样抛, 只打当前站, 不打任何重试行; retries=1 恰一次 HTTP
   · 两站都败 → 抛**原错误类型** (TushareTransport), 消息带两站各自原因, __cause__ 是另一站的异常; WARNING 一行; 全局状态不变 (备用上那轮不计 backup_fails)
     —— 备用无权限 (15000 档没这个接口) 也一样按原类型抛
-  · 2002 / 40101 → 不走单次重试 (全局机制自己立即切, 行为与以前一样); 429 / 无权限 / 参数错 / 分页截断 → 不触发
+  · 2002 / 40101 → 不走单次重试 (全局机制自己立即切, 行为与以前一样); 429 / 参数错 / 分页截断 → 不触发
+    (无权限自 2026-10-28 卡 FAILOVER-2 起**也换站**: 权限按站不同 —— 主站能服务 namechange 而备用 datahubco 回 HTTP 403; 见 tests/test_http403_nopermission.py)
   · 没开 opt-in 的成批调用 → 行为逐字节不变
   · 重试那一站也按本站单页上限分页, 续页钉在**同一站** (offset=5000 的第二页仍打备用)
   · 已切到备用时在备用失败 → 去主站重来一次, 不翻转全局状态 (active 仍 True), 不触发回切
@@ -318,10 +319,8 @@ def test_rate_limit_and_permanent_errors_are_not_failed_over(caplog):
     with pytest.raises(tc.TushareRateLimited):
         tc.query("namechange", fields=FIELDS, failover_once=True)
     assert _urls(s) == [PRIMARY] * 3
-    s, naps = _install([_err("抱歉，您没有接口访问权限", 40203)])
-    with pytest.raises(tc.TushareNoPermission):
-        tc.query("namechange", fields=FIELDS, failover_once=True)
-    assert _urls(s) == [PRIMARY] and naps == []
+    # 无权限自 2026-10-28 卡 FAILOVER-2 起纳入可换站类型 (权限按站不同: 主站能服务 namechange 而备用 datahubco 回 HTTP 403),
+    # 主站无权限 + opt-in → 单次去备用, 见 tests/test_http403_nopermission.py ⑤
     s, naps = _install([_err("[invalid_params] 业务参数缺失或格式不合法", 400)])
     with pytest.raises(tc.TushareBadParams):
         tc.query("namechange", fields=FIELDS, failover_once=True)
@@ -358,7 +357,9 @@ def test_eligibility_helper():
     assert ok(tc._classify("x", 503, "[minute_upstream_busy] …"))
     assert not ok(tc._classify("x", 2002, "token已过期", with_backup=True))          # TushareBadToken
     assert not ok(tc.TushareRateLimited("x: 超频", "x"))
-    assert not ok(tc.TushareNoPermission("x: 无权限", "x"))
+    assert ok(tc.TushareNoPermission("x: 无权限", "x"))                     # 2026-10-28 卡 FAILOVER-2: 权限按站不同, 无权限也换站
+    assert ok(tc.TushareNoPermission("HTTP 403 (该站不提供此接口或无权限)", "http", 403))
+    assert ok(tc._classify("x", 404, "[unknown_api] 接口不存在或未开放"))
     assert not ok(tc.TushareBadParams("x: 参数", "x"))
     assert not ok(tc.TushareTruncated("x: 分页截断", "x"))
     assert not ok(tc.TushareUnavailable("x: 没 token", "x"))

@@ -17,7 +17,7 @@ api.tushare.pro。镜像站的基址是**完整 POST 地址** (2026-10-10 起 tl
 
 备用基址 (2026-10-12 卡 TS-FALLBACK, 同日第二轮 TS-FALLBACK-2 加回切): 可选键 `tushare_base_url_backup` (环境变量
 TUSHARE_BASE_URL_BACKUP 可覆盖) 配第二个站 (同一 key; 老板给的 datahubco 只有 15000 积分档, 权限可能少于主站)。
-  · **切过去**: 主站连续 FAILOVER_AFTER=3 次传输层失败 (HTTP 非 200 且非 429 / 非 JSON / 连接错或 socket 超时; 跨调用、
+  · **切过去**: 主站连续 FAILOVER_AFTER=3 次传输层失败 (HTTP 非 200 且非 429 非 403 / 非 JSON / 连接错或 socket 超时; 跨调用、
     跨线程累计, 主站任何一次 JSON 应答即清零) 或连续 FAILOVER_AFTER_TIMEOUTS=6 次**进程级硬期限超时** (单独计, 阈值
     更高: 共享进程池被别的调用的超时 terminate 时, 在途的主站请求会一起被记成超时, 一次池重置顶多几条, 不够 6)
     或返回 token 失效类错误 (code 2002 / 40101, 或文案 token+无效/过期) → 切到备用, 触发切换的那次调用在备用上重新
@@ -33,6 +33,16 @@ TUSHARE_BASE_URL_BACKUP 可覆盖) 配第二个站 (同一 key; 老板给的 dat
   · **不计入切换的**: 业务错误 (无权限 40203 / unknown_api / 参数 / 超频) —— 它们是 JSON 应答, 反而清零主站计数; 网关 HTTP 429
     限流 —— 按超频线性退避重试, 不计也不清零。15000 档把权限错误当故障会循环切换, 所以主站只有传输层才算 (备用上的无权限只触发
     「试探主站」, 不触发切换; 主站回不来照旧把 NoPermission 抛给调用方)。
+  · **HTTP 403 = 该站该接口无权限, 不是站级传输故障** (2026-10-28 卡 FAILOVER-2; 当天 13:30 跑批 update.log 实录: 13:33 主站 3 次 daily Read timed out
+    切到备用, 备用正常服务 daily / adj_factor / stock_basic, 13:37 却对 namechange 连回 3 次 HTTP 403 → 旧口径当传输层失败白重试 3 次 (2s/4s 退避) 并计满
+    「备用连续 3 次失败」把全局状态踢回正在退化的主站, namechange 在主站又 3 次 Read timed out 才再切回备用, 月刷失败, 13:43 daily_basic 又在主站多烧
+    3 次超时): `_post_json` 对 HTTP 403 抛 TushareNoPermission (消息「HTTP 403 (该站不提供此接口或无权限)」, api="http", code=403; 构造签名同
+    TushareRateLimited, 能从 spawn 工作进程 pickle 回主进程, 线程回退路径同样成立); `_query_page` 把它接进与 JSON 业务码 NoPermission **完全相同**的
+    分支 (`_permanent_failure`): 一次就抛、不进 3 次重试; 主站上**不计传输层失败也不清零** (答了 HTTP 403 不算「答了 JSON」, 主站连续失败计数原样保留,
+    不切换); 备用上按卡 TS-FALLBACK-3 记一次备用失败, 满 3 次才试探主站, 主站回来了本次在主站重来, 否则把 NoPermission 抛给调用方。日志一行 WARNING
+    「tushare <api> 该站无权限 (HTTP 403, <host>), 不重试」(GM 按它 grep)。权限是**按站不同的** (主站能服务 namechange 而备用不能, 反过来主站缺
+    income_vip), 所以「单次调用备用站重试」的可换站类型也把 TushareNoPermission (HTTP 403 或 JSON 无权限) 纳入 (见该条)。`--probe-backup` 另加 1 次
+    信息性 namechange 备用直调 (403 → 打印「备用不提供 namechange (HTTP 403) — 月刷只能靠主站」, 成功 → 打印行数; 不改退出码)。
   · **没配备用键**: 不计数、不切换、不试探, 错误分类顺序 (超频 → 参数 → 权限 → 传输) 与异常类型同 7b92bb6 版 (用例逐字节钉住);
     token 失效文案只在配了备用时才单独分出来 (TushareBadToken) 用于立即切换。**有无备用都生效的两处刻意改动** (2026-10-12):
     网关 HTTP 429 从「传输错误 2s/4s 退避抛 Transport」改成「超频 12s/24s 退避抛 RateLimited」; 「[unknown_api]」「[invalid_params]」
@@ -46,7 +56,8 @@ TUSHARE_BASE_URL_BACKUP 可覆盖) 配第二个站 (同一 key; 老板给的 dat
   · **真验收**: `python -X utf8 -m ashare.tushare_client --probe-backup` (6 次调用: 主站 trade_cal + 两个开市日的 daily 走生产路径,
     备用站同三项直调绕开切换状态; 备用回包的 trade_date 必须**全部等于所问日** —— 生产按所问日期写价格库、不看回包日期, 无视或
     错配 trade_date 的备用站切过去就会静默写错 K 线和复权因子, 光数行数拦不住 (10-17 校验员实证); 第二个日子是已知的过去开市日,
-    专抓「一律回最新一天」的镜像; 两天的代码集与主站重合 ≥ 90% 且行数 ≥ 主站 × 0.9), 退出码 0 可用 / 1 不可用 / 2 判不了;
+    专抓「一律回最新一天」的镜像; 两天的代码集与主站重合 ≥ 90% 且行数 ≥ 主站 × 0.9), 退出码 0 可用 / 1 不可用 / 2 判不了 (另加 1 次**信息性**
+    namechange 备用直调, 10-28 卡 FAILOVER-2: 只看备用有没有这个接口, 不改退出码);
     加键之前用环境变量 TUSHARE_BASE_URL_BACKUP 临时给备用地址先验 —— 主站健康时请求永远到不了备用站, 光跑 `pricestore ready`
     什么都验不出 (10-12 校验员实证)。
   · **单次调用备用站重试** (2026-10-27 卡 FAILOVER-1; 调用方 opt-in `query(..., failover_once=True)`): 上面的全局切换只在主站**连续** 3 次传输层失败 /
@@ -57,8 +68,12 @@ TUSHARE_BASE_URL_BACKUP 可覆盖) 配第二个站 (同一 key; 老板给的 dat
     TushareBadToken → 立即把**同一调用在另一站整体重来一次** (在主站就去备用, 在备用就去主站; 所有页钉在那一站, `_query_page` 的 pin=(站, None) 路径:
     不试探、不计数、不切换 —— 全局计数与当前站仍只由上面的规则管, 不双记也不翻转), 成功打一行 INFO「tushare 单次调用备用站重试: <api> 主站 <host> 失败
     (<原因>) → 备用 <host> 成功 N 行 (X.Xs)」; 两站都败打一行 WARNING (同前缀, 「也失败」) 并按**原错误类型**抛出, 消息带两站。**不触发**: 没配备用键
-    (与今天完全一样, 连 try 都不进); 2002 / 40101 (TushareBadToken: 全局机制自己立即切); 429 / 超频 (只按现有退避等); 无权限 / 参数错 (永久性);
+    (与今天完全一样, 连 try 都不进); 2002 / 40101 (TushareBadToken: 全局机制自己立即切); 429 / 超频 (只按现有退避等); 参数错 (永久性, 换站也一样);
     TushareTruncated (分页截断不是传输抖动, 语义不变); 本次调用已经由全局切换在两站各来过一轮 (再重来只是第三轮, 直接按原错误抛)。
+    **无权限也换站** (2026-10-28 卡 FAILOVER-2, 见上面「HTTP 403」一条): TushareNoPermission (传输层 HTTP 403 或 JSON 无权限) 是**该站该接口**的永久性
+    条件, 另一站未必 (10-28 实录主站能服务 namechange 而备用不能), 所以也纳入可换站类型, 两个方向对称 (在备用 → 单次去主站, 在主站 → 单次去备用),
+    同样不改全局状态、不计数、不试探, 仍遵守「两站各来过一轮就不做第三轮」; 两站都失败按原错误类 (TushareNoPermission) 抛, 消息点名两站。非 opt-in 的
+    调用行为不变 (主站 403 一次就抛; 备用 403 记一次备用失败后抛)。
     墙钟: 最坏再加一轮 (retries × deadline_sec + 退避; 备用上分页再按页放大), namechange 全表在备用 2 页: 366 + 2×366 ≈ 1098s。
   进程池里跑的 `_post_json` 只拿主进程选好的基址当参数, 切换状态只在主进程 (加锁) 判定。
 
@@ -140,7 +155,7 @@ DEADLINE_SEC = 120          # 进程级墙钟硬期限 (fina_indicator_vip 实�
 MAX_RETRIES = 3
 BACKOFF_SEC = 2.0           # 瞬时错误退避基数 (指数退避)
 BACKOFF_RATE_SEC = 12.0     # 超频退避基数 (线性退避)
-FAILOVER_AFTER = 3          # 主站连续这么多次传输层失败 (HTTP 非 200 非 429 / 非 JSON / 连接错) → 切到备用基址 (配了备用才计)
+FAILOVER_AFTER = 3          # 主站连续这么多次传输层失败 (HTTP 非 200 非 429 非 403 / 非 JSON / 连接错) → 切到备用基址 (配了备用才计; 403 = 该站该接口无权限, 不计, 卡 FAILOVER-2)
 FAILOVER_AFTER_TIMEOUTS = 6 # 主站连续这么多次进程级硬期限超时才切 (单独计, 阈值更高: 共享进程池被别人的超时重置会连带在途请求)
 FAILBACK_AFTER = 3          # 备用连续这么多次失败 (传输层 / 不认 key / 无权限) → 试探主站一次, 成功即回切 (坏备用不把主站一次抖动放大成整轮停摆)
 FAILBACK_AFTER_TIMEOUTS = 6 # 备用连续这么多次进程级硬期限超时才试探 (单独计, 与主站同口径: 共享进程池被别人的超时重置会连带在途的备用请求)
@@ -201,7 +216,10 @@ class TushareRateLimited(TushareError):
 
 
 class TushareNoPermission(TushareError):
-    """积分/权限不足 —— 重试无意义, 直接抛给调用方去回退。"""
+    """积分/权限不足 —— 重试无意义, 直接抛给调用方去回退。JSON 业务码 (_classify) 与网关 **HTTP 403** (_post_json; 2026-10-28 卡 FAILOVER-2:
+    备用站 datahubco 对 namechange 回 403 而主站能服务 —— 该站该接口的确定性无权限, 不是站级传输故障) 都是它; 构造签名 (message, api, code)
+    不变, 403 那种 api="http", code=403, 能从 spawn 工作进程 pickle 回主进程 (与 TushareRateLimited 同)。权限按站不同, 所以 failover_once
+    把它也纳入可换站类型 (_failover_once_eligible)。"""
 
 
 class TushareBadParams(TushareError):
@@ -586,7 +604,7 @@ def _run_probe(token: str, base: str, backup: str, why: str, level: int = loggin
 def _note_backup_failure(token: str, base: str, backup: str, reason: str, timeout: bool = False) -> bool:
     """备用上一次失败。两个连续计数**各算各的** (与主站同口径): timeout=True 是进程级硬期限超时 (backup_timeouts, 阈值
     FAILBACK_AFTER_TIMEOUTS=6 —— 共享进程池被别的调用的超时 terminate 时, 在途的备用请求也会被记成超时, 备用其实没坏);
-    其余 (传输层 / 备用不认这把 key 的 2002·40101 / 备用无权限或没这个接口) 计 backup_fails, 阈值 FAILBACK_AFTER=3。
+    其余 (传输层 / 备用不认这把 key 的 2002·40101 / 备用无权限或没这个接口 —— JSON 业务码或网关 HTTP 403 同口径) 计 backup_fails, 阈值 FAILBACK_AFTER=3。
     满了就立即试探主站一次: 成功即回切并返回 True (本次调用随即在主站重来一轮 —— 坏备用不把主站的一次抖动放大成整轮停摆,
     备用缺的接口也能在主站补上); 失败 = 两站都不可用, 留在备用 (再满再试)。"""
     with _FO_LOCK:
@@ -691,6 +709,8 @@ def _post_json(base: str, payload: dict, timeout: float) -> dict:
     r = _session().post(base, json=payload, timeout=timeout)
     if r.status_code == 429:    # 网关限流: 不是故障 —— 主进程按超频线性退避重试, 不计入备用基址切换
         raise TushareRateLimited("HTTP 429 限流", "http", 429)
+    if r.status_code == 403:    # 该站该接口无权限 (卡 FAILOVER-2, 10-28 实录: datahubco 对 namechange 回 403 而主站能服务): 不是站级传输故障 ——
+        raise TushareNoPermission("HTTP 403 (该站不提供此接口或无权限)", "http", 403)   # 主进程走 JSON 无权限的同一分支: 不重试、不计站级故障
     if r.status_code != 200:
         raise TushareTransport(f"HTTP {r.status_code}", "http", r.status_code)
     try:
@@ -1060,7 +1080,8 @@ def query(api: str, fields: str = "", retries: int = MAX_RETRIES,
     True = 带 limit 也按本站上限 (`page_limit(base)`, 按第一页实际打到的站) 翻 (传了 offset 仍不翻)。行数 < 上限 (或该站 page_limit ≤ 0)
     时返回的就是那一页, 与以前完全一样。**所有页钉在第一页那个站**; 切换 / 回切只在两次 query() 之间生效。
     **failover_once=True** (2026-10-27 卡 FAILOVER-1, 模块 docstring「单次调用备用站重试」): 配了备用基址时, 本次调用在当前站跑完一轮
-    (retries / 退避 / 分页规则都不变) 仍抛 TushareTransport (非 TushareBadToken) → 立即把同一调用在另一站整体重来一次 (所有页钉在那一站,
+    (retries / 退避 / 分页规则都不变) 仍抛 TushareTransport (非 TushareBadToken) 或 TushareNoPermission (网关 HTTP 403 / JSON 无权限; 2026-10-28 卡
+    FAILOVER-2: 权限按站不同, 两个方向对称) → 立即把同一调用在另一站整体重来一次 (所有页钉在那一站,
     不计数、不切换、不试探; 全局切换状态只由原规则管), 成功 INFO 一行「tushare 单次调用备用站重试」, 两站都败 WARNING 一行并按原错误类型抛出
     (消息带两站)。没配备用键 / 缺省 False 时与以前逐字节相同。给一次 update 只打一次 Tushare 的阶段 (改名表月刷 namechange) 用;
     成批调用 (按日 daily / adj_factor / daily_basic 等) **不要开** —— 它们靠全局连续计数切换, 一开就每次调用都可能多一轮。
@@ -1092,9 +1113,11 @@ def _failover_once_eligible(e: BaseException) -> bool:
     """单次调用备用站重试 (卡 FAILOVER-1) 认哪些失败: 重试耗尽后抛出的 TushareTransport —— 传输层 (HTTP 非 200 非 429 / 非 JSON / 连接错 /
     socket 超时)、进程级硬期限超时、以及 `_classify` 落到 Transport 的瞬时业务错误码 (5xx 类 / [upstream_pool_exhausted] / [minute_upstream_busy]
     一类: 它们是 JSON 应答, 全局切换机制刻意不计 —— 主站答了 JSON 就清零, 这正是 namechange 月刷三天没切过去的原因)。
+    **也认** TushareNoPermission (2026-10-28 卡 FAILOVER-2): 网关 HTTP 403 (_post_json) 或 JSON 无权限 (_classify) —— 是**该站该接口**的永久性条件,
+    另一站未必 (10-28 实录: 主站能服务 namechange 而备用 datahubco 回 403; 反过来主站缺 income_vip), 两个方向对称。
     **不认**: TushareBadToken (2002 / 40101 或 token+无效/过期文案: 全局机制自己立即切, 不重复处理) / TushareRateLimited (429 / 超频: 只按现有
-    退避等) / TushareNoPermission / TushareBadParams (永久性, 换站也一样) / TushareTruncated (分页截断不是传输抖动, 语义不变) / 其它异常。"""
-    return isinstance(e, TushareTransport) and not isinstance(e, TushareBadToken)
+    退避等) / TushareBadParams (参数错换站也一样) / TushareTruncated (分页截断不是传输抖动, 语义不变) / 其它异常。"""
+    return isinstance(e, (TushareTransport, TushareNoPermission)) and not isinstance(e, TushareBadToken)
 
 
 def _site_label(base: str, url: str) -> str:
@@ -1146,8 +1169,24 @@ def _run_failover_once(api: str, base: str, backup: str, token: str, run) -> pd.
     return df
 
 
+def _permanent_failure(api: str, err: TushareError, role, use_base: str, token: str, base: str, backup: str, reason: str, how: str) -> bool:
+    """NoPermission / BadParams 的共同出口 —— JSON 业务码路径与网关 HTTP 403 路径走**同一个分支** (2026-10-28 卡 FAILOVER-2): 永久性, 一次就抛, 不进重试。
+    备用上的 NoPermission 记一次备用失败 (卡 TS-FALLBACK-3: 15000 档缺的接口): 连续满 FAILBACK_AFTER 次就试探主站, 主站回来了返回 True (调用方随即
+    在主站重来本次调用); 其余 (主站 / 没配备用 / 单次换站那轮的 role None / 备用上的 BadParams / 主站没回来) 打一行 WARNING 后把 err 抛出去。
+    `how` 是日志里对这次失败的称呼: JSON 业务码「永久性失败」(与以前一字不差), 网关 403「该站无权限 (HTTP 403, <host>)」(GM 按它 grep)。
+    主站计数在这里**什么都不碰**: JSON 应答的清零由调用方在进来之前做 (答了 JSON 才算), HTTP 403 不清零也不计 (答了 403 不算答了 JSON)。"""
+    if role == "backup" and isinstance(err, TushareNoPermission):
+        if _note_backup_failure(token, base, backup, reason):
+            log.warning("tushare %s 在备用无权限 (%s), 主站已回来, 本次在主站重来: %s", api, _host(use_base), err)
+            return True
+    log.warning("tushare %s %s, 不重试: %s", api, how, err)
+    raise err
+
+
 def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dict, pin=None, used=None) -> tuple:
     """一页 (一次逻辑调用, 含重试与切换) -> (DataFrame, has_more, 实际打到的基址, role)。query() 的每一页都走这里; p 已去掉 None 值。
+    网关 HTTP 403 (2026-10-28 卡 FAILOVER-2) 从 _post_json 以 TushareNoPermission 抛上来, 在下面显式接住 (它不是 TushareTransport 的子类, 不接住
+    会从循环里直接漏出去: 主站上碰巧像「一次就抛」, 备用上却记不到那一次备用失败也没有日志行) 并走与 JSON 无权限完全相同的 `_permanent_failure`。
     配了备用基址时 (模块 docstring「备用基址」): 开头先看要不要试探主站 (在备用上每 20 次调用 / 10 分钟一次); 每次请求前由
     主进程按切换状态选基址 (`_active_base`); 主站连续 FAILOVER_AFTER 次传输层失败 / FAILOVER_AFTER_TIMEOUTS 次硬期限超时 /
     token 失效类错误 → 切备用; 备用连续 FAILBACK_AFTER 次失败 (传输层 / 不认 key / 无权限) 或 FAILBACK_AFTER_TIMEOUTS 次硬期限超时
@@ -1194,6 +1233,10 @@ def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dic
         except TushareRateLimited as e:                 # 网关 HTTP 429: 限流不是故障, 线性退避重试; 不计入切换、不清零
             last = TushareRateLimited(f"{api}: {e}", api, 429)
             log.warning("tushare %s 限流 %d/%d (%s): %s", api, attempt, budget, _host(use_base), str(e)[:120])
+        except TushareNoPermission as e:                # 网关 HTTP 403 (卡 FAILOVER-2): 该站该接口无权限, 不是站级传输故障 —— 与 JSON 无权限同一分支:
+            last = TushareNoPermission(f"{api}: {_redact(str(e), token)}", api, e.code)      # 一次就抛不重试; 主站不计传输层失败也不清零; 备用记一次备用失败
+            restart = _permanent_failure(api, last, role, use_base, token, base, backup, f"{api} HTTP {e.code} (备用无权限或没这个接口)",
+                                         f"该站无权限 (HTTP {e.code}, {_host(use_base)})")
         except (TushareTransport, OSError, ValueError) as e:   # requests 异常 (含 socket 超时) 继承 OSError
             text = _redact(str(e), token)
             last = e if isinstance(e, TushareError) else TushareTransport(f"{api}: {text}", api)
@@ -1221,16 +1264,10 @@ def _query_page(api: str, fields: str, retries: int, deadline_sec: float, p: dic
                 _note_backup_ok()           # 备用答了 JSON (参数错 / 超频 / 其它业务错误码也算) → 备用两个连续计数清零;
                                             # 「不认这把 key」与「无权限 / 没这个接口」算备用失败 (下面)
             if isinstance(err, (TushareNoPermission, TushareBadParams)):
-                if role == "backup" and isinstance(err, TushareNoPermission):
-                    # 备用无权限 / 没这个接口 (15000 档比主站少): 在备用上重试没用, 但算一次备用失败 —— 连续满 3 次就试探主站,
-                    # 主站回来了本次调用就在主站重来 (主站有权限); 回不来才把 NoPermission 抛给调用方 (卡 TS-FALLBACK-3)
-                    last = err
-                    restart = _note_backup_failure(token, base, backup, f"{api} code={code} (备用无权限或没这个接口)")
-                    if restart:
-                        log.warning("tushare %s 在备用无权限 (%s), 主站已回来, 本次在主站重来: %s", api, _host(use_base), err)
-                if not restart:
-                    log.warning("tushare %s 永久性失败, 不重试: %s", api, err)
-                    raise err
+                # 永久性, 一次就抛 (与网关 HTTP 403 同一个出口 _permanent_failure, 卡 FAILOVER-2): 备用无权限 / 没这个接口 (15000 档比主站少) 在备用上
+                # 重试没用, 但算一次备用失败 —— 连续满 3 次就试探主站, 主站回来了本次调用就在主站重来 (主站有权限); 回不来才抛给调用方 (卡 TS-FALLBACK-3)
+                last = err
+                restart = _permanent_failure(api, err, role, use_base, token, base, backup, f"{api} code={code} (备用无权限或没这个接口)", "永久性失败")
             else:
                 last = err
                 log.warning("tushare %s 失败 %d/%d (%s): %s", api, attempt, budget, _host(use_base), err)
@@ -1336,6 +1373,7 @@ def _open_days(df) -> list:
 # ---------------------------------------------------------------- 命令行: 备用站真验收 (卡 TS-FALLBACK-2; 10-17 TS-FALLBACK-3 加日期核对)
 PROBE_DAILY_FIELDS = "ts_code,trade_date,open,high,low,close,vol,amount"   # 与 ashare.market.fetch_bars_by_date 同字
 PROBE_DAILY_MIN_RATIO = 0.9     # 备用 daily 行数与「与主站重合的代码数」都要 ≥ 主站的这个比例才算可用 (与 pricestore 未就绪守卫 0.9 同一个数)
+PROBE_NAMECHANGE_FIELDS = "ts_code,name,start_date"   # --probe-backup 的信息性 namechange 备用直调只取这几列 (卡 FAILOVER-2; 只看备用有没有这个接口)
 
 
 def _direct_query(url: str, token: str, api: str, fields: str, params: dict) -> pd.DataFrame:
@@ -1414,6 +1452,9 @@ def probe_backup(out=print, today=None) -> int:
     错配 trade_date 的备用站, 切过去生产会按所问日期写错价格库; 第二个日子 P 专抓「一律回最新一天」的镜像 —— 它在 D 上与正确
     镜像完全一样)。退出码 0 = 备用可用 / 1 = 备用不可用 / 2 = 判不了 (没 token / 没配备用 / 主站本身失败或回包日期不对 / 验收时
     就切了)。只打 host、行数、代码数、耗时; token 永不打印 (异常文本也先抹)。
+    ③ **信息性** (2026-10-28 卡 FAILOVER-2, 不改退出码): 备用直调一次 namechange (只取 PROBE_NAMECHANGE_FIELDS 几列, 按本站上限分页) —— 403 /
+    无权限 → 打印「备用不提供 namechange (HTTP 403) — 月刷只能靠主站」; 成功 → 打印行数; 别的失败打一行原因。10-28 实录 datahubco 对 namechange
+    回 HTTP 403 而主站能服务, 月刷 (failover_once) 会按 NoPermission 换回主站, 这里只是让 GM 加键时就看到。
     加键之前先验: PowerShell `$env:TUSHARE_BASE_URL_BACKUP='<备用完整 POST 地址>'` 再跑本命令 (credentials 认环境变量)。"""
     import datetime as _dt
     token, base, backup = credentials(refresh=True)
@@ -1426,7 +1467,8 @@ def probe_backup(out=print, today=None) -> int:
         return 2
     today = today or _dt.date.today()
     start, end = today - _dt.timedelta(days=21), today + _dt.timedelta(days=7)
-    out(f"主站 {_host(base)} / 备用 {_host(backup)}; 日历窗口 {start}..{end}; 共 6 次调用 (主站 3 走生产路径, 备用 3 直调)")
+    out(f"主站 {_host(base)} / 备用 {_host(backup)}; 日历窗口 {start}..{end}; 共 6 次调用 (主站 3 走生产路径, 备用 3 直调)"
+        " + 1 次信息性 namechange 备用直调 (只看备用有没有这个接口, 不影响退出码)")
     out(f"硬期限执行器: {_warm_pool()}")
     t0 = time.time()
     try:
@@ -1511,6 +1553,16 @@ def probe_backup(out=print, today=None) -> int:
             bad.append(f"daily {d} 缺列 {missing}")
         if not ok_date:
             bad.append(f"daily {d} 回包日期与所问不符 (备用无视或错配 trade_date, 生产会按所问日期写错价格库)")
+    # 信息性 (卡 FAILOVER-2): 备用有没有 namechange —— 不进 bad, 不改退出码
+    t0 = time.time()
+    try:
+        df_n = _direct_query(backup, token, "namechange", PROBE_NAMECHANGE_FIELDS, {})
+        out(f"备用 namechange (信息性, 不影响退出码): {len(df_n)} 行 {time.time() - t0:.1f}s" + _pages_note(df_n))
+    except TushareNoPermission as e:
+        why = "HTTP 403" if e.code == 403 else f"code={e.code} {_redact(str(e), token)[:60]}"
+        out(f"备用不提供 namechange ({why}) — 月刷只能靠主站 (信息性, 不影响退出码; 月刷的单次调用备用站重试会按 NoPermission 换站)")
+    except Exception as e:          # noqa: BLE001
+        out(f"备用 namechange 失败: {type(e).__name__}: {_redact(str(e), token)[:120]} (信息性, 不影响退出码)")
     if bad:
         out(f"结论 (rc 1): 备用 {_host(backup)} 不可用 —— " + "; ".join(bad) + "; 不要加键 / 加了就去掉")
         return 1
@@ -1526,7 +1578,7 @@ def main(argv=None) -> int:
                                  description="Tushare 客户端自检 (只打 host / 行数 / 耗时; token 永不打印)")
     ap.add_argument("--probe-backup", action="store_true",
                     help="备用基址真验收: 6 次调用 (主站 trade_cal + 两个开市日的 daily 走生产路径, 备用同三项直调; 核日历 / 行数 / "
-                         "代码重合 / 回包日期); 退出码 0 可用 / 1 不可用 / 2 判不了")
+                         "代码重合 / 回包日期) + 1 次信息性 namechange 备用直调 (不影响退出码); 退出码 0 可用 / 1 不可用 / 2 判不了")
     ap.add_argument("--state", action="store_true", help="打印本进程的切换状态与进程池回退状态 (不联网)")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")

@@ -9,7 +9,8 @@ index_daily 升序 / trade_cal 转 ISO / 硬期限走 datasource 的**进程级*
 备用基址自动切换 (文末 pytest 风格: 主站 3 次传输层失败 / token 失效立即切 / 业务错误不切 /
 硬期限超时单独计阈值 6 / HTTP 429 按超频退避不计 / 备用三连败试探主站回切 / 每 20 次调用或 10 分钟试探主站 /
 一次调用最多两轮 / 没配备用键分类顺序与异常类型同 7b92bb6 版 (逐字节钉住) / unknown_api·invalid_params 不重试 /
-镜像回显的 token 进不了日志 / --probe-backup 真验收; 基址由主进程选好传给 _post_json; 不写任何 token) /
+镜像回显的 token 进不了日志 / --probe-backup 真验收 (10-28 卡 FAILOVER-2 另加 1 次信息性 namechange 备用直调, 不改退出码; 网关 HTTP 403 →
+TushareNoPermission 的主体用例在 tests/test_http403_nopermission.py); 基址由主进程选好传给 _post_json; 不写任何 token) /
 分页 (2026-10-24 卡 TS-PAGINATE: 恰满本站单页上限才带 offset 续页, has_more, 合并去重, 调用方自己翻页不插手, --probe-backup 的备用直调同样分页;
 10-25 卡 TS-PAGINATE-2: 所有页钉在第一页那个站、切换/回切只在 query() 之间生效、截断一律抛 TushareTruncated、页上限按 host 配 {host: n};
 同日 TS-PAGINATE-3: 续页与已拿到的行重复 = 行序不稳, 也抛 TushareTruncated) /
@@ -1111,14 +1112,17 @@ def _daily_rows(n, day="20261013", distinct=None):
 
 _D, _P2 = "2026-10-13", "2026-09-28"        # _CAL 窗口里最近开市日 D, 与往前 PROBE_SECOND_DAY_BACK=5 个开市日的 P (10-13 ← 10-12, 10-09, 09-30, 09-29, 09-28)
 _CAL_SPEC = _ok(["cal_date", "is_open"], _CAL)
+_NC_SPEC = _ok(["ts_code", "name", "start_date"], [["000001.SZ", "平安银行", "19910403"], ["600000.SH", "浦发银行", "19991110"]])   # 信息性 namechange 备用直调的回包
 
 
 def _probe_script(backup_daily_d=None, backup_daily_p=None, n_p=5000, n_p2=4990, n_b=4600):
-    """6 次调用的标准剧本: 主站 trade_cal / daily D / daily P 走生产路径, 备用 trade_cal / daily D / daily P 直调。"""
+    """6 次调用的标准剧本: 主站 trade_cal / daily D / daily P 走生产路径, 备用 trade_cal / daily D / daily P 直调;
+    第 7 项 = 末尾那次信息性 namechange 备用直调 (卡 FAILOVER-2, 不改退出码)。"""
     return [_CAL_SPEC, _ok(_DAILY_COLS, _daily_rows(n_p, "20261013")), _ok(_DAILY_COLS, _daily_rows(n_p2, "20260928")),
             _ok(["cal_date", "is_open"], _CAL),
             backup_daily_d if backup_daily_d is not None else _ok(_DAILY_COLS, _daily_rows(n_b, "20261013")),
-            backup_daily_p if backup_daily_p is not None else _ok(_DAILY_COLS, _daily_rows(n_b, "20260928"))]
+            backup_daily_p if backup_daily_p is not None else _ok(_DAILY_COLS, _daily_rows(n_b, "20260928")),
+            _NC_SPEC]
 
 
 def _probe_setup(monkeypatch, script, backup=BACKUP, page_limit=6000):
@@ -1145,9 +1149,10 @@ def test_probe_backup_six_calls_and_pass_verdict(monkeypatch):
     rc = tc.probe_backup(out=lines.append, today=_TODAY)
     text = "\n".join(lines)
     assert rc == 0, text
-    assert _urls(s) == [PRIMARY] * 3 + [BACKUP] * 3
+    assert _urls(s) == [PRIMARY] * 3 + [BACKUP] * 4                 # 6 次验收调用 + 末尾 1 次信息性 namechange 备用直调 (卡 FAILOVER-2)
     apis = [c["json"]["api_name"] for c in s.calls]
-    assert apis == ["trade_cal", "daily", "daily", "trade_cal", "daily", "daily"]
+    assert apis == ["trade_cal", "daily", "daily", "trade_cal", "daily", "daily", "namechange"]
+    assert s.calls[6]["json"]["params"] == {} and s.calls[6]["json"]["fields"] == tc.PROBE_NAMECHANGE_FIELDS
     assert s.calls[0]["json"]["params"] == {"exchange": "SSE", "start_date": "20260922", "end_date": "20261020", "is_open": "1"}
     assert s.calls[3]["json"]["params"] == s.calls[0]["json"]["params"]
     assert s.calls[1]["json"]["params"] == {"trade_date": "20261013"} == s.calls[4]["json"]["params"]
@@ -1157,6 +1162,7 @@ def test_probe_backup_six_calls_and_pass_verdict(monkeypatch):
     assert all(not _is_probe(c) for c in s.calls)               # 验收不触发主站试探 (状态一直在主站)
     assert naps == [] and tc.failover_state()["active"] is False
     assert "共 6 次调用" in text and "结论 (rc 0): 备用 backup.invalid 可用" in text and f"日历一致 {len(_OPEN)} 天" in text
+    assert "备用 namechange (信息性, 不影响退出码): 2 行" in text and lines[-1].startswith("结论 (rc 0)")
     assert f"daily {_D} 4600/5000 行" in text and f"daily {_P2} 4600/4990 行" in text and "两天回包日期都对" in text
     assert "切换状态 active=False" in text and f"主站 daily {_D}: 5000 行, 5000 个代码" in text
     assert TOKEN not in text and "/tushare/sdk" not in text and "/api/tushare" not in text
@@ -1166,7 +1172,7 @@ def test_probe_backup_second_day_falls_back_to_earliest_when_window_is_short(mon
     """窗口里过去开市日 ≤ 5 天 (长假后 / 刚开市) → 第二个核对日取窗口里最早的过去开市日 (仍 ≠ D); 不足 2 天 → rc 2。"""
     today = _dt.date(2026, 9, 24)                               # _CAL 里 ≤ 09-24 的开市日只有 09-22/23/24 → D=24, P=22
     script = [_CAL_SPEC, _ok(_DAILY_COLS, _daily_rows(100, "20260924")), _ok(_DAILY_COLS, _daily_rows(100, "20260922")),
-              _CAL_SPEC, _ok(_DAILY_COLS, _daily_rows(100, "20260924")), _ok(_DAILY_COLS, _daily_rows(100, "20260922"))]
+              _CAL_SPEC, _ok(_DAILY_COLS, _daily_rows(100, "20260924")), _ok(_DAILY_COLS, _daily_rows(100, "20260922")), _NC_SPEC]
     s, naps, lines = _probe_setup(monkeypatch, script)
     assert tc.probe_backup(out=lines.append, today=today) == 0, "\n".join(lines)
     assert s.calls[2]["json"]["params"] == {"trade_date": "20260922"} == s.calls[5]["json"]["params"]
@@ -1178,21 +1184,25 @@ def test_probe_backup_second_day_falls_back_to_earliest_when_window_is_short(mon
 def test_probe_backup_fails_when_backup_rejects_key_or_disagrees(monkeypatch):
     """备用不认这把 key (2002) / 日历不一致 / daily 行数不够 / 打不通 → rc 1, 结论点名原因与日子; 主站那三项照常; 直调不重试。"""
     s, naps, lines = _probe_setup(monkeypatch, _probe_script(n_p=100, n_p2=100)[:3] + [
-        _err("token已过期", code=2002), _err("抱歉，您没有接口访问权限", code=40203), _err("抱歉，您没有接口访问权限", code=40203)])
+        _err("token已过期", code=2002), _err("抱歉，您没有接口访问权限", code=40203), _err("抱歉，您没有接口访问权限", code=40203),
+        FakeResp({}, status=403)])
     rc = tc.probe_backup(out=lines.append, today=_TODAY)
     text = "\n".join(lines)
-    assert rc == 1 and _urls(s) == [PRIMARY] * 3 + [BACKUP] * 3 and naps == []    # 直调不重试
+    assert rc == 1 and _urls(s) == [PRIMARY] * 3 + [BACKUP] * 4 and naps == []    # 直调不重试 (第 7 次 = 信息性 namechange, 403 也不重试)
+    assert "备用不提供 namechange (HTTP 403) — 月刷只能靠主站" in text
     assert "结论 (rc 1): 备用 backup.invalid 不可用" in text and TOKEN not in text
     assert "trade_cal 打不通或不认这把 key" in text
     assert f"daily {_D} 打不通或不认这把 key" in text and f"daily {_P2} 打不通或不认这把 key" in text
     s, naps, lines = _probe_setup(monkeypatch, _probe_script(n_p=100, n_p2=100)[:3] + [
-        _ok(["cal_date", "is_open"], _CAL[:-2]), _ok(_DAILY_COLS, _daily_rows(80, "20261013")), _ok(_DAILY_COLS, _daily_rows(100, "20260928"))])
+        _ok(["cal_date", "is_open"], _CAL[:-2]), _ok(_DAILY_COLS, _daily_rows(80, "20261013")), _ok(_DAILY_COLS, _daily_rows(100, "20260928")),
+        _NC_SPEC])
     rc = tc.probe_backup(out=lines.append, today=_TODAY)
     text = "\n".join(lines)
     assert rc == 1 and "日历与主站不一致" in text and f"daily {_D} 行数 80 < 主站 100 × 0.9" in text
     assert f"daily {_P2} 行数" not in text and f"daily {_P2} 与主站重合代码" not in text     # P 那天没毛病就不点名
     s, naps, lines = _probe_setup(monkeypatch, _probe_script(n_p=100, n_p2=100)[:3] + [
-        OSError("Connection refused"), _ok(["ts_code", "close"], [["600000.SH", 1.0]] * 100), _ok(_DAILY_COLS, _daily_rows(100, "20260928"))])
+        OSError("Connection refused"), _ok(["ts_code", "close"], [["600000.SH", 1.0]] * 100), _ok(_DAILY_COLS, _daily_rows(100, "20260928")),
+        _NC_SPEC])
     rc = tc.probe_backup(out=lines.append, today=_TODAY)
     text = "\n".join(lines)
     assert rc == 1 and "备用 trade_cal 失败: OSError" in text and "缺列" in text and "回包日期" not in text   # 没 trade_date 列只报缺列
@@ -1296,6 +1306,43 @@ def test_probe_backup_primary_zero_rows_or_wrong_date_cannot_judge(monkeypatch):
     s, naps, lines = _probe_setup(monkeypatch, [_CAL_SPEC, _ok(_DAILY_COLS, _daily_rows(5000, "20261013")), _ok(_DAILY_COLS, [])])
     rc = tc.probe_backup(out=lines.append, today=_TODAY)
     assert rc == 2 and f"主站 daily {_P2} 0 行" in lines[-1] and _urls(s) == [PRIMARY] * 3
+
+
+def test_probe_backup_namechange_check_is_informational_only(monkeypatch):
+    """卡 FAILOVER-2 (10-28 实录: datahubco 对 namechange 回 HTTP 403 而主站能服务): --probe-backup 末尾备用直调一次 namechange (只取
+    PROBE_NAMECHANGE_FIELDS 几列, 直调不重试, **不改退出码**): 403 → 打印「备用不提供 namechange (HTTP 403) — 月刷只能靠主站」而 rc 仍 0; JSON 无权限
+    同句带 code; 成功 → 行数 (按本站上限分页也标「[分页 N 页]」); 别的失败只打一行原因; 结论行永远在最后一行; rc 1 的验收照样打这行。"""
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script()[:6] + [FakeResp({}, status=403)])
+    rc = tc.probe_backup(out=lines.append, today=_TODAY)
+    text = "\n".join(lines)
+    assert rc == 0, text
+    assert _urls(s) == [PRIMARY] * 3 + [BACKUP] * 4 and naps == [] and tc.failover_state()["active"] is False
+    nc = s.calls[6]["json"]
+    assert nc["api_name"] == "namechange" and nc["fields"] == tc.PROBE_NAMECHANGE_FIELDS and nc["params"] == {} and nc["token"] == TOKEN
+    assert "备用不提供 namechange (HTTP 403) — 月刷只能靠主站" in text and "+ 1 次信息性 namechange 备用直调" in text
+    assert lines[-1].startswith("结论 (rc 0): 备用 backup.invalid 可用") and TOKEN not in text and "/api/tushare" not in text
+    # JSON 无权限 (15000 档没这个接口): 同一句, 带 code
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script()[:6] + [_err("[unknown_api] 接口不存在或未开放", code=404)])
+    assert tc.probe_backup(out=lines.append, today=_TODAY) == 0
+    assert any(ln.startswith("备用不提供 namechange (code=404 ") and "月刷只能靠主站" in ln for ln in lines) and lines[-1].startswith("结论 (rc 0)")
+    # 成功: 行数; 备用按本站上限分页 (备用上限 2: 2 行 + 1 行 = 2 页 3 行; 主站 6000 不翻)
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script()[:6] + [_NC_SPEC, _ok(["ts_code", "name", "start_date"], [["600519.SH", "贵州茅台", "20010827"]])],
+                                  page_limit={"backup.invalid": 2, "*": 6000})
+    rc = tc.probe_backup(out=lines.append, today=_TODAY)
+    text = "\n".join(lines)
+    assert rc == 0, text
+    assert len(s.calls) == 8 and s.calls[7]["json"]["params"] == {"offset": 2}
+    assert "备用 namechange (信息性, 不影响退出码): 3 行" in text and "[分页 2 页]" in text
+    # 别的失败 (连接错): 一行原因, rc 仍 0
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script()[:6] + [OSError("Connection refused")])
+    assert tc.probe_backup(out=lines.append, today=_TODAY) == 0
+    assert any(ln.startswith("备用 namechange 失败: OSError: Connection refused") and "不影响退出码" in ln for ln in lines)
+    # 验收本身 rc 1 (备用 daily 行数不够) 时照样打 namechange 行, 结论仍在最后
+    s, naps, lines = _probe_setup(monkeypatch, _probe_script(backup_daily_d=_ok(_DAILY_COLS, _daily_rows(80, "20261013"))))
+    rc = tc.probe_backup(out=lines.append, today=_TODAY)
+    text = "\n".join(lines)
+    assert rc == 1 and "备用 namechange (信息性, 不影响退出码): 2 行" in text and lines[-1].startswith("结论 (rc 1)")
+    assert "namechange" not in lines[-1]
 
 
 def test_probe_call_thread_deadline_returns_raises_and_times_out():
@@ -1899,19 +1946,19 @@ def test_probe_backup_passes_when_backup_needs_two_pages_per_day(monkeypatch):
     full_d, full_p = _daily_rows(5559, "20261013"), _daily_rows(5559, "20260928")
     script = [_CAL_SPEC, _ok(_DAILY_COLS, full_d), _ok(_DAILY_COLS, full_p), _ok(["cal_date", "is_open"], _CAL),
               _ok(_DAILY_COLS, full_d[:5000]), _ok(_DAILY_COLS, full_d[5000:]),
-              _ok(_DAILY_COLS, full_p[:5000]), _ok(_DAILY_COLS, full_p[5000:])]
+              _ok(_DAILY_COLS, full_p[:5000]), _ok(_DAILY_COLS, full_p[5000:]), _NC_SPEC]
     s, naps, lines = _probe_setup(monkeypatch, script, page_limit=None)
     rc = tc.probe_backup(out=lines.append, today=_TODAY)
     text = "\n".join(lines)
     assert rc == 0, text
-    assert _urls(s) == [PRIMARY] * 3 + [BACKUP] * 5 and len(s.calls) == 8
-    assert [c["json"]["params"].get("offset") for c in s.calls] == [None, None, None, None, None, 5000, None, 5000]
+    assert _urls(s) == [PRIMARY] * 3 + [BACKUP] * 6 and len(s.calls) == 9        # + 末尾 1 次信息性 namechange (2 行 < 5000, 不翻页)
+    assert [c["json"]["params"].get("offset") for c in s.calls] == [None, None, None, None, None, 5000, None, 5000, None]
     assert f"备用 daily {_D}: 5559 行 (100% of 主站), 与主站重合代码 5559/5559" in text and text.count("[分页 2 页]") == 2
     assert f"daily {_D} 5559/5559 行" in text and f"daily {_P2} 5559/5559 行" in text and "结论 (rc 0)" in text
     assert "硬期限执行器: 直调" in text and TOKEN not in text and naps == []
     # 对照: 备用只给第一页、第二页 0 行 (镜像认 offset 但真的只有 5000 只) → 89.9% → rc 1
     script = [_CAL_SPEC, _ok(_DAILY_COLS, full_d), _ok(_DAILY_COLS, full_p), _ok(["cal_date", "is_open"], _CAL),
-              _ok(_DAILY_COLS, full_d[:5000]), _ok(_DAILY_COLS, []), _ok(_DAILY_COLS, full_p[:5000]), _ok(_DAILY_COLS, [])]
+              _ok(_DAILY_COLS, full_d[:5000]), _ok(_DAILY_COLS, []), _ok(_DAILY_COLS, full_p[:5000]), _ok(_DAILY_COLS, []), _NC_SPEC]
     s, naps, lines = _probe_setup(monkeypatch, script, page_limit=None)
     assert tc.probe_backup(out=lines.append, today=_TODAY) == 1 and f"daily {_D} 行数 5000 < 主站 5559 × 0.9" in "\n".join(lines)
 
@@ -1971,11 +2018,11 @@ def test_probe_backup_truncated_backup_page_is_a_failure(monkeypatch):
     full_d, full_p = _daily_rows(5559, "20261013"), _daily_rows(5559, "20260928")
     script = [_CAL_SPEC, _ok(_DAILY_COLS, full_d), _ok(_DAILY_COLS, full_p), _ok(["cal_date", "is_open"], _CAL),
               _ok(_DAILY_COLS, full_d[:5000]), FakeResp({}, status=502),
-              _ok(_DAILY_COLS, full_p[:5000]), _ok(_DAILY_COLS, full_p[5000:])]
+              _ok(_DAILY_COLS, full_p[:5000]), _ok(_DAILY_COLS, full_p[5000:]), _NC_SPEC]
     s, naps, lines = _probe_setup(monkeypatch, script, page_limit=None)
     rc = tc.probe_backup(out=lines.append, today=_TODAY)
     text = "\n".join(lines)
-    assert rc == 1 and len(s.calls) == 8 and naps == []
+    assert rc == 1 and len(s.calls) == 9 and naps == []                        # 8 + 末尾 1 次信息性 namechange
     assert f"备用 daily {_D} 失败: TushareTruncated" in text and "已拿到 5000 行 1 页" in text and f"daily {_D} 打不通或不认这把 key" in text
     assert text.count("[分页 2 页]") == 1 and f"备用 daily {_P2}: 5559 行 (100% of 主站)" in text and TOKEN not in text
 
@@ -2148,7 +2195,7 @@ def test_probe_backup_warms_the_pool_first_and_reports_fallback(monkeypatch):
         tc.USE_PROCESS_DEADLINE = False
     text = "\n".join(lines)
     assert rc == 0, text
-    assert hits == [("_pool_ping", tc.POOL_WARMUP_SEC)] and len(s.calls) == 6
+    assert hits == [("_pool_ping", tc.POOL_WARMUP_SEC)] and len(s.calls) == 7     # 6 + 末尾 1 次信息性 namechange
     assert "硬期限执行器: 线程版硬期限 (进程池不可用: PermissionError" in text and TOKEN not in text
     assert tc.pool_state()["disabled"] is True
     _stub_datasource(monkeypatch, lambda fn, a, k, dl: fn(*a, **k))
